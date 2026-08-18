@@ -288,6 +288,39 @@ impl FrontendCommandSender {
         self.enqueue_background(DirectRequest::Frame(frame))
     }
 
+    /// Moves a prepared upload directly into the core from a background worker.
+    pub fn upload_background(
+        &self,
+        begin_request: RequestId,
+        finish_request: RequestId,
+        upload: local_rpc::bulk::BeginUpload,
+        source: UploadSource,
+    ) -> Result<(), FrontendSendError> {
+        local_rpc::frame::validate_client(&ClientFrame::BeginUpload {
+            request_id: begin_request,
+            upload: upload.clone(),
+        })
+        .map_err(FrontendSendError::Invalid)?;
+        local_rpc::frame::validate_client(&ClientFrame::FinishUpload {
+            request_id: finish_request,
+            finished: local_rpc::bulk::BulkFinished {
+                transfer_id: upload.transfer_id,
+            },
+        })
+        .map_err(FrontendSendError::Invalid)?;
+        if begin_request == finish_request {
+            return Err(FrontendSendError::Invalid(
+                "upload request ids must be distinct".into(),
+            ));
+        }
+        self.enqueue_background(DirectRequest::Upload {
+            begin_request,
+            finish_request,
+            upload,
+            source,
+        })
+    }
+
     pub fn disconnect(&self) -> Result<(), FrontendSendError> {
         self.enqueue(DirectRequest::Detach)
     }
@@ -353,6 +386,28 @@ impl FrontendClient {
 pub enum AttachmentBody {
     File(File),
     Memory(Arc<Vec<u8>>),
+}
+
+/// An upload source already owned by an in-process frontend.
+#[derive(Debug)]
+pub enum UploadSource {
+    File {
+        file: File,
+        original_path: Option<PathBuf>,
+    },
+    Memory(Arc<Vec<u8>>),
+}
+
+impl UploadSource {
+    pub(crate) fn byte_len(&self) -> Result<u64, String> {
+        match self {
+            Self::File { file, .. } => file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .map_err(|error| error.to_string()),
+            Self::Memory(bytes) => Ok(bytes.len() as u64),
+        }
+    }
 }
 
 /// A semantic delivery from the core, including resources that have no wire
@@ -431,6 +486,12 @@ impl Error for StartupError {}
 
 pub(crate) enum DirectRequest {
     Frame(ClientFrame),
+    Upload {
+        begin_request: RequestId,
+        finish_request: RequestId,
+        upload: local_rpc::bulk::BeginUpload,
+        source: UploadSource,
+    },
     AttachmentConsumed(BulkTransferId),
     Detach,
 }
@@ -456,11 +517,13 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
     use local_rpc::{
-        frame::{ClientFrame, DaemonFrame},
-        model::RequestId,
+        bulk::BeginUpload,
+        frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
+        ids::RoomId,
+        model::{BulkTransferId, RequestId},
     };
 
     use super::{CoreBuilder, FrontendEvent, SetupDownloadMode, Startup};
@@ -537,6 +600,35 @@ mod tests {
                 })
                 .is_err()
         );
+        frontend
+            .sender()
+            .upload_background(
+                RequestId(2),
+                RequestId(3),
+                BeginUpload {
+                    transfer_id: BulkTransferId(1),
+                    room_id: RoomId(1),
+                    file_name: "owned.bin".into(),
+                    byte_len: 4,
+                },
+                super::UploadSource::Memory(Arc::new(vec![1, 2, 3])),
+            )
+            .unwrap();
+        loop {
+            let FrontendEvent::Frame(DaemonFrame::RequestResult(result)) =
+                frontend.recv_timeout(Duration::from_secs(2)).unwrap()
+            else {
+                continue;
+            };
+            if result.request_id == RequestId(2) {
+                assert_eq!(result.operation, Operation::BeginUpload);
+                assert!(matches!(
+                    result.outcome,
+                    RequestOutcome::Rejected { code: 422, .. }
+                ));
+                break;
+            }
+        }
         core.shutdown().unwrap();
     }
 

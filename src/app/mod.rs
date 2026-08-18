@@ -2934,6 +2934,8 @@ impl App {
                                 name_override: Some(name),
                                 delete_after_open: true,
                                 inline_bytes: None,
+                                opened_file: None,
+                                shared_bytes: None,
                             },
                         },
                         true,
@@ -8107,6 +8109,8 @@ impl App {
             name_override: Some(name.clone()),
             delete_after_open: source.is_staged(),
             inline_bytes: None,
+            opened_file: None,
+            shared_bytes: None,
         };
         self.send_network_command(NetworkCommand::UploadFile { room_id, request }, true);
         self.set_status(format!("queued upload {name}"));

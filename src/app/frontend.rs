@@ -1321,6 +1321,8 @@ impl App {
             name_override: Some(name),
             delete_after_open: true,
             inline_bytes: None,
+            opened_file: None,
+            shared_bytes: None,
         };
         if self.send_network_command(
             NetworkCommand::UploadFile {
@@ -1332,6 +1334,42 @@ impl App {
             Ok(())
         } else {
             let _ = std::fs::remove_file(path);
+            Err("not connected".into())
+        }
+    }
+
+    #[cfg(feature = "embedded-client")]
+    pub(crate) fn queue_direct_upload(
+        &mut self,
+        room_id: RoomId,
+        source: crate::embedded::UploadSource,
+        name: String,
+    ) -> Result<(), String> {
+        if self.network.is_none() || self.room.room_meta(room_id).is_none() {
+            return Err("upload room is no longer available".into());
+        }
+        let request = match source {
+            crate::embedded::UploadSource::File {
+                file,
+                original_path,
+            } => crate::client_net::UploadFileRequest::from_open_file(
+                name,
+                original_path.unwrap_or_default(),
+                file,
+            ),
+            crate::embedded::UploadSource::Memory(bytes) => {
+                crate::client_net::UploadFileRequest::from_shared_bytes(name, bytes)
+            }
+        };
+        if self.send_network_command(
+            NetworkCommand::UploadFile {
+                room_id: Some(room_id),
+                request,
+            },
+            true,
+        ) {
+            Ok(())
+        } else {
             Err("not connected".into())
         }
     }

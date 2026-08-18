@@ -3,7 +3,7 @@ use hashbrown::{HashMap, HashSet};
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
@@ -404,6 +404,8 @@ pub struct UploadFileRequest {
     pub name_override: Option<String>,
     pub delete_after_open: bool,
     pub inline_bytes: Option<Vec<u8>>,
+    pub opened_file: Option<File>,
+    pub shared_bytes: Option<Arc<Vec<u8>>>,
 }
 
 impl UploadFileRequest {
@@ -415,6 +417,8 @@ impl UploadFileRequest {
             name_override: None,
             delete_after_open: false,
             inline_bytes: None,
+            opened_file: None,
+            shared_bytes: None,
         }
     }
 
@@ -424,6 +428,32 @@ impl UploadFileRequest {
             name_override: Some(name),
             delete_after_open: false,
             inline_bytes: Some(bytes),
+            opened_file: None,
+            shared_bytes: None,
+        }
+    }
+
+    #[cfg(feature = "embedded-client")]
+    pub fn from_open_file(name: String, path: PathBuf, file: File) -> Self {
+        Self {
+            path,
+            name_override: Some(name),
+            delete_after_open: false,
+            inline_bytes: None,
+            opened_file: Some(file),
+            shared_bytes: None,
+        }
+    }
+
+    #[cfg(feature = "embedded-client")]
+    pub fn from_shared_bytes(name: String, bytes: Arc<Vec<u8>>) -> Self {
+        Self {
+            path: PathBuf::new(),
+            name_override: Some(name),
+            delete_after_open: false,
+            inline_bytes: None,
+            opened_file: None,
+            shared_bytes: Some(bytes),
         }
     }
 
@@ -2641,7 +2671,7 @@ struct OutgoingUpload {
     size: u64,
     file: Option<File>,
     /// Caller-owned bytes for an upload that never touched the filesystem.
-    source_bytes: Option<Vec<u8>>,
+    source_bytes: Option<Arc<Vec<u8>>>,
     /// Source path retained for durable encrypted-upload recovery. A staged
     /// source is deleted with its durable intent unless it becomes the local
     /// frontend fallback.
@@ -2809,7 +2839,7 @@ enum PendingUploadSource {
     Disk(PendingDiskUploadSource),
     Memory {
         store: crate::receive_store::DownloadStore,
-        bytes: Vec<u8>,
+        bytes: Arc<Vec<u8>>,
         requested_name: String,
     },
 }
@@ -2837,6 +2867,7 @@ impl PendingUploadSource {
                 let reservation = store.reserve(bytes.len() as u64).ok_or_else(|| {
                     format!("could not reserve memory for local upload {requested_name}")
                 })?;
+                let bytes = Arc::try_unwrap(bytes).unwrap_or_else(|bytes| (*bytes).clone());
                 let name = store
                     .insert_reserved(reservation, &requested_name, bytes)
                     .ok_or_else(|| {
@@ -3405,6 +3436,8 @@ impl WorkerState<'_> {
                 name_override: Some(announcement.name.clone()),
                 delete_after_open: false,
                 inline_bytes: None,
+                opened_file: None,
+                shared_bytes: None,
             },
         };
         let mut upload = self.prepare_file_upload(Some(intent.room_id), request)?;
@@ -4041,25 +4074,42 @@ impl WorkerState<'_> {
             name_override,
             delete_after_open,
             inline_bytes,
+            opened_file,
+            shared_bytes,
         } = request;
         let limit = self.config.max_upload_bytes;
-        let (size, name, mut file, source_bytes) = match inline_bytes {
-            Some(bytes) => {
+        let source_bytes = match (inline_bytes, shared_bytes) {
+            (Some(_), Some(_)) => return Err("upload has multiple in-memory sources".into()),
+            (Some(bytes), None) => Some(Arc::new(bytes)),
+            (None, bytes) => bytes,
+        };
+        let opened_source = opened_file.is_some();
+        if source_bytes.is_some() && opened_file.is_some() {
+            return Err("upload has both file and in-memory sources".into());
+        }
+        let (size, name, mut file, source_bytes) = if let Some(bytes) = source_bytes {
                 let size = bytes.len() as u64;
                 let name = upload_username(name_override, &path)?;
                 (size, name, None, Some(bytes))
+        } else if let Some(file) = opened_file {
+            let metadata = file
+                .metadata()
+                .map_err(|error| format!("failed to inspect opened upload: {error}"))?;
+            if !metadata.is_file() {
+                return Err("opened upload source is not a file".into());
             }
-            None => {
-                let metadata = fs::metadata(&path)
-                    .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-                if !metadata.is_file() {
-                    return Err(format!("upload path is not a file: {}", path.display()));
-                }
-                let name = upload_username(name_override, &path)?;
-                let file = open_upload_source(&path, false)
-                    .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-                (metadata.len(), name, Some(file), None)
+            let name = upload_username(name_override, &path)?;
+            (metadata.len(), name, Some(file), None)
+        } else {
+            let metadata = fs::metadata(&path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+            if !metadata.is_file() {
+                return Err(format!("upload path is not a file: {}", path.display()));
             }
+            let name = upload_username(name_override, &path)?;
+            let file = open_upload_source(&path, false)
+                .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+            (metadata.len(), name, Some(file), None)
         };
         if size > limit {
             return Err(format!(
@@ -4092,7 +4142,7 @@ impl WorkerState<'_> {
                             .map_err(|error| {
                                 format!(
                                     "failed to read compression probe for {}: {error}",
-                                    path.display()
+                                    name
                                 )
                             })?;
                     }
@@ -4146,6 +4196,9 @@ impl WorkerState<'_> {
         let seal = if self.room_requires_mls(room_id) {
             let digest = match source_bytes.as_ref() {
                 Some(bytes) => bytes_sha256(bytes),
+                None if opened_source => file_sha256_opened(
+                    file.as_mut().expect("opened upload retains its file"),
+                )?,
                 None => file_sha256(&path)?,
             };
             self.prepare_upload_seal(room_id, body.encoding(), digest)?
@@ -4166,7 +4219,11 @@ impl WorkerState<'_> {
                 delete_after_open,
             ),
         };
-        let dimensions = video_source_dimensions(&name, source_bytes.as_deref(), &path);
+        let dimensions = video_source_dimensions(
+            &name,
+            source_bytes.as_ref().map(|bytes| bytes.as_slice()),
+            &path,
+        );
         Ok(OutgoingUpload {
             transfer_id,
             server_metadata: None,
@@ -4255,7 +4312,10 @@ impl WorkerState<'_> {
             announcement,
             source_path: chatt_platform::os_str_to_bytes(upload.source_path.as_os_str()),
             delete_after_upload: upload.delete_source_when_done,
-            source_bytes: upload.source_bytes.clone(),
+            source_bytes: upload
+                .source_bytes
+                .as_ref()
+                .map(|bytes| bytes.as_ref().clone()),
         }))
     }
 
@@ -4695,6 +4755,7 @@ impl WorkerState<'_> {
                 transfer_id: meta.transfer_id,
             });
         }
+        upload.source_bytes = None;
         self.finish_local_copy(&mut upload);
         self.finish_durable_file_upload(&upload)?;
         Ok(true)
@@ -6713,6 +6774,31 @@ fn file_sha256(path: &Path) -> Result<[u8; 32], String> {
     Ok(context.finish().as_ref().try_into().unwrap())
 }
 
+fn file_sha256_opened(file: &mut File) -> Result<[u8; 32], String> {
+    let original = file
+        .stream_position()
+        .map_err(|error| format!("failed to inspect opened upload position: {error}"))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind opened upload: {error}"))?;
+    let result = (|| {
+        let mut context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("failed to hash opened upload: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            context.update(&buffer[..read]);
+        }
+        Ok(context.finish().as_ref().try_into().unwrap())
+    })();
+    file.seek(SeekFrom::Start(original))
+        .map_err(|error| format!("failed to restore opened upload position: {error}"))?;
+    result
+}
+
 fn bytes_sha256(bytes: &[u8]) -> [u8; 32] {
     aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes)
         .as_ref()
@@ -8575,7 +8661,7 @@ mod tests {
             name: "message.md".to_string(),
             size: data.len() as u64,
             file: None,
-            source_bytes: Some(data.clone()),
+            source_bytes: Some(Arc::new(data.clone())),
             source_path: PathBuf::new(),
             delete_source_when_done: false,
             source_offset: 0,

@@ -34,6 +34,8 @@ use parking_lot::Mutex;
 
 #[cfg(all(unix, feature = "embedded-client"))]
 use crate::embedded::{AttachmentBody, DirectRequest, EmbeddedReady, FrontendEvent};
+#[cfg(all(unix, feature = "embedded-client"))]
+use crate::app::frontend::RpcCommandEffect;
 
 #[cfg(unix)]
 use crate::attach;
@@ -690,6 +692,11 @@ impl RpcClientSender {
         true
     }
 
+    #[cfg(feature = "embedded-client")]
+    fn cancel_request(&self, request_id: local_rpc::model::RequestId) -> bool {
+        self.outstanding.lock().remove(&request_id)
+    }
+
     fn complete_request(&self, frame: &DaemonFrame) {
         let request_id = match frame {
             DaemonFrame::RequestResult(result) => Some(result.request_id),
@@ -1272,6 +1279,23 @@ fn handle_direct_frontend_requests(
         };
         let frame = match request {
             DirectRequest::Frame(frame) => frame,
+            DirectRequest::Upload {
+                begin_request,
+                finish_request,
+                upload,
+                source,
+            } => {
+                handle_direct_upload(
+                    app,
+                    clients,
+                    client_id,
+                    begin_request,
+                    finish_request,
+                    upload,
+                    source,
+                );
+                continue;
+            }
             DirectRequest::AttachmentConsumed(transfer_id) => {
                 if let Some(client) = clients.get(&client_id) {
                     client.sender.cancel_bulk(transfer_id);
@@ -1322,6 +1346,99 @@ fn handle_direct_frontend_requests(
         }
         broadcast_rpc_snapshots(app, clients, instance_id);
     }
+}
+
+#[cfg(all(unix, feature = "embedded-client"))]
+fn handle_direct_upload(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    client_id: ClientId,
+    begin_request: local_rpc::model::RequestId,
+    finish_request: local_rpc::model::RequestId,
+    upload: local_rpc::bulk::BeginUpload,
+    source: crate::embedded::UploadSource,
+) {
+    let Some(sender) = clients.get(&client_id).map(|client| client.sender.clone()) else {
+        return;
+    };
+    if !sender.begin_request(begin_request) || !sender.begin_request(finish_request) {
+        sender.abort();
+        return;
+    }
+    let reject_begin = |sender: &RpcClientSender, code, message: String| {
+        sender.send_or_abort(&DaemonFrame::RequestResult(
+            local_rpc::frame::RequestResult {
+                request_id: begin_request,
+                operation: local_rpc::frame::Operation::BeginUpload,
+                outcome: local_rpc::frame::RequestOutcome::Rejected { code, message },
+            },
+        ));
+        sender.cancel_request(finish_request);
+    };
+    let source_len = match source.byte_len() {
+        Ok(byte_len) => byte_len,
+        Err(message) => {
+            reject_begin(&sender, 500, message);
+            return;
+        }
+    };
+    if source_len != upload.byte_len {
+        reject_begin(
+            &sender,
+            422,
+            "upload source length does not match its declaration".into(),
+        );
+        return;
+    }
+    if !sender.begin_bulk(upload.transfer_id) {
+        reject_begin(&sender, 429, "too many active uploads".into());
+        return;
+    }
+
+    let transfer_id = upload.transfer_id;
+    let effect = app.handle_rpc_frame(
+        client_id,
+        local_rpc::frame::ClientFrame::BeginUpload {
+            request_id: begin_request,
+            upload,
+        },
+    );
+    let upload = match effect {
+        RpcCommandEffect::BeginUpload { upload, .. } => upload,
+        RpcCommandEffect::Reply(result) => {
+            sender.cancel_bulk(transfer_id);
+            sender.send_or_abort(&DaemonFrame::RequestResult(result));
+            sender.cancel_request(finish_request);
+            return;
+        }
+        _ => {
+            sender.cancel_bulk(transfer_id);
+            sender.abort();
+            return;
+        }
+    };
+    if !sender.send_or_abort(&DaemonFrame::RequestResult(
+        local_rpc::frame::RequestResult {
+            request_id: begin_request,
+            operation: local_rpc::frame::Operation::BeginUpload,
+            outcome: local_rpc::frame::RequestOutcome::Accepted,
+        },
+    )) {
+        sender.cancel_bulk(upload.transfer_id);
+        return;
+    }
+    let outcome = match app.queue_direct_upload(upload.room_id, source, upload.file_name) {
+        Ok(()) => local_rpc::frame::RequestOutcome::Accepted,
+        Err(message) => local_rpc::frame::RequestOutcome::Rejected { code: 503, message },
+    };
+    sender.cancel_bulk(upload.transfer_id);
+    sender.send_or_abort(&DaemonFrame::RequestResult(
+        local_rpc::frame::RequestResult {
+            request_id: finish_request,
+            operation: local_rpc::frame::Operation::FinishUpload,
+            outcome,
+        },
+    ));
 }
 
 #[cfg(all(unix, feature = "embedded-client"))]
