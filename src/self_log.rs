@@ -165,6 +165,55 @@ impl ClientLogState {
 
 static CLIENT_LOGS: OnceLock<Arc<Mutex<ClientLogState>>> = OnceLock::new();
 
+fn client_log_state() -> Arc<Mutex<ClientLogState>> {
+    CLIENT_LOGS
+        .get_or_init(|| Arc::new(Mutex::new(ClientLogState::new())))
+        .clone()
+}
+
+fn ingest_records(state: &Arc<Mutex<ClientLogState>>, bytes: &[u8]) {
+    let Ok(mut state) = state.lock() else {
+        return;
+    };
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let Some(len) = kvlog::encoding::log_len(&bytes[offset..]) else {
+            break;
+        };
+        if offset + len > bytes.len() {
+            break;
+        }
+        state.push(&bytes[offset..offset + len]);
+        offset += len;
+    }
+}
+
+/// A cloneable destination for a collector owned by an embedding executable.
+///
+/// Embedded clients must install exactly one process-global kvlog collector.
+/// They feed each complete collector batch here so local control and bug
+/// reports observe the same bounded recent-log ring as the native Chatt client.
+#[derive(Clone)]
+pub struct ExternalLogSink {
+    state: Arc<Mutex<ClientLogState>>,
+}
+
+impl ExternalLogSink {
+    /// Adds every complete kvlog record in `bytes` to the recent-log ring.
+    /// A truncated trailing record is ignored.
+    pub fn ingest(&self, bytes: &[u8]) {
+        ingest_records(&self.state, bytes);
+    }
+}
+
+/// Returns the sink used by Chatt's local-control and bug-report paths without
+/// installing a collector or a panic hook.
+pub fn external_log_sink() -> ExternalLogSink {
+    ExternalLogSink {
+        state: client_log_state(),
+    }
+}
+
 /// Installs the global closure collector that fills the in-memory ring.
 ///
 /// When `logfile` is `Some`, the same records are also appended to that file in
@@ -173,8 +222,7 @@ static CLIENT_LOGS: OnceLock<Arc<Mutex<ClientLogState>>> = OnceLock::new();
 /// that dumps the last few records to stderr. The returned guard must be held
 /// for the lifetime of the process.
 pub fn init_client_logging(logfile: Option<&str>) -> LoggerGuard {
-    let state = Arc::new(Mutex::new(ClientLogState::new()));
-    CLIENT_LOGS.set(state.clone()).ok();
+    let state = client_log_state();
 
     install_panic_hook(state.clone());
 
@@ -189,19 +237,7 @@ pub fn init_client_logging(logfile: Option<&str>) -> LoggerGuard {
     let state_for_collector = state;
     kvlog::collector::init_closure_logger(move |log_buffer: &mut LogBuffer| {
         let bytes = log_buffer.as_bytes();
-        if let Ok(mut state) = state_for_collector.lock() {
-            let mut offset = 0;
-            while offset < bytes.len() {
-                let Some(len) = kvlog::encoding::log_len(&bytes[offset..]) else {
-                    break;
-                };
-                if offset + len > bytes.len() {
-                    break;
-                }
-                state.push(&bytes[offset..offset + len]);
-                offset += len;
-            }
-        }
+        ingest_records(&state_for_collector, bytes);
         if let Some(file) = &mut file {
             let _ = file.write_all(bytes);
         }
@@ -415,6 +451,25 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(state.snapshot_from(0, &mut out), 100 * 24);
         assert_eq!(extract_payloads(&out).len(), 42);
+    }
+
+    #[test]
+    fn external_sink_ingests_complete_records_and_ignores_trailing_fragment() {
+        let state = Arc::new(Mutex::new(ClientLogState::new()));
+        let sink = ExternalLogSink {
+            state: state.clone(),
+        };
+        let mut batch = make_entry(b"first");
+        batch.extend_from_slice(&make_entry(b"second"));
+        batch.extend_from_slice(&[0x01, 0x02]);
+
+        sink.ingest(&batch);
+
+        let snapshot = state.lock().unwrap().buffer.snapshot();
+        assert_eq!(
+            extract_payloads(&snapshot),
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
     }
 
     #[test]

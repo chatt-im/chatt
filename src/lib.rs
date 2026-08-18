@@ -48,6 +48,11 @@ mod room_catalog;
 mod room_history;
 mod runtime;
 mod self_log;
+pub mod diagnostic_logs {
+    pub use crate::self_log::{
+        ExternalLogSink, decode_to_colored, decode_to_plain, external_log_sink,
+    };
+}
 mod settings;
 #[cfg(test)]
 mod test_temp;
