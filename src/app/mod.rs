@@ -407,6 +407,7 @@ pub(crate) struct App {
     rpc_clients: HashSet<crate::client_channel::ClientId>,
     voice_roster: frontend::VoiceRosterProjection,
     command_client: crate::client_channel::ClientId,
+    device_management_owner: Option<crate::client_channel::ClientId>,
     quit_requested: bool,
     /// Advances when configuration mirrored into attached terminal views changes.
     daemon_config_generation: u64,
@@ -1578,6 +1579,7 @@ impl App {
             rpc_clients: HashSet::new(),
             voice_roster: frontend::VoiceRosterProjection::default(),
             command_client: crate::client_channel::ClientId::PRIMARY,
+            device_management_owner: None,
             quit_requested: false,
             daemon_config_generation: 0,
             synced_daemon_config_generation: 0,
@@ -5327,27 +5329,56 @@ impl App {
                 pairing_string,
                 expires_at_ms,
             } => {
-                self.navigate_owner(NavigationEvent::ShowOverlay(Box::new(
-                    OverlaySpec::DeviceLink(device_pair::DeviceLinkDialog::new(
-                        redemption_secret_hash,
-                        pairing_string,
-                        expires_at_ms,
-                        self.config.ui.default_bindings,
-                    )),
-                )));
+                let owner = self
+                    .device_management_owner
+                    .unwrap_or(self.command_client);
+                self.send_to(
+                    owner,
+                    TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
+                        OverlaySpec::DeviceLink(device_pair::DeviceLinkDialog::new(
+                            redemption_secret_hash,
+                            pairing_string,
+                            expires_at_ms,
+                            self.config.ui.default_bindings,
+                        )),
+                    ))),
+                );
                 self.set_status("one-time device link created");
             }
             NetworkEvent::DeviceLinkRedeemed {
                 device_id,
                 device_name,
             } => {
-                let _ = device_id;
-                self.navigate_owner(NavigationEvent::CloseOverlay);
+                let owner = self
+                    .device_management_owner
+                    .take()
+                    .unwrap_or(self.command_client);
+                self.send_to(owner, TerminalEvent::Navigation(NavigationEvent::CloseOverlay));
+                self.send_to(
+                    owner,
+                    TerminalEvent::DeviceLinked(local_rpc::management::DeviceSummary {
+                        device_id,
+                        name: device_name.clone(),
+                        local: false,
+                    }),
+                );
                 self.set_status(format!("device linked: {device_name}"));
             }
             NetworkEvent::DeviceLinkCanceled => {
-                self.navigate_owner(NavigationEvent::CloseOverlay);
+                let owner = self
+                    .device_management_owner
+                    .take()
+                    .unwrap_or(self.command_client);
+                self.send_to(owner, TerminalEvent::Navigation(NavigationEvent::CloseOverlay));
+                self.send_to(owner, TerminalEvent::DeviceLinkCanceled);
                 self.set_status("device link canceled");
+            }
+            NetworkEvent::E2eDevicesListed { devices } => {
+                let owner = self
+                    .device_management_owner
+                    .take()
+                    .unwrap_or(self.command_client);
+                self.send_to(owner, TerminalEvent::DevicesListed(devices));
             }
             NetworkEvent::ReconnectScheduled { retry_in, reason } => {
                 self.room.network_disconnected = true;
@@ -5649,6 +5680,71 @@ impl App {
         ));
     }
 
+    pub(crate) fn management_server_catalog(
+        &self,
+    ) -> Vec<local_rpc::management::ServerCatalogEntry> {
+        self.config
+            .servers
+            .iter()
+            .map(|server| local_rpc::management::ServerCatalogEntry {
+                server_id: server.id,
+                label: server.label.clone(),
+                username: server.username.clone(),
+                tcp_addr: server.tcp_addr.clone(),
+                require_transport_encryption: server.require_transport_encryption,
+                active: self.room.active_server_id == Some(server.id),
+            })
+            .collect()
+    }
+
+    pub(crate) fn management_server_draft(
+        &self,
+        server_id: ServerId,
+    ) -> Option<ServerEditDraft> {
+        self.config
+            .server_by_id(server_id)
+            .map(|server| ServerEditDraft::from_server(server, &self.config))
+    }
+
+    pub(crate) fn management_list_devices(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+    ) {
+        self.device_management_owner = Some(owner);
+        self.send_network_command(NetworkCommand::ListE2eDevices, true);
+    }
+
+    pub(crate) fn management_create_device_link(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+    ) {
+        self.device_management_owner = Some(owner);
+        self.send_network_command(NetworkCommand::CreateDeviceLink, true);
+    }
+
+    pub(crate) fn management_cancel_device_link(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        redemption_secret_hash: Vec<u8>,
+    ) {
+        self.device_management_owner = Some(owner);
+        self.send_network_command(
+            NetworkCommand::CancelDeviceLink {
+                redemption_secret_hash,
+            },
+            true,
+        );
+    }
+
+    pub(crate) fn management_revoke_device(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        device_id: rpc::ids::DeviceId,
+    ) {
+        self.device_management_owner = Some(owner);
+        self.send_network_command(NetworkCommand::RevokeE2eDevice { device_id }, true);
+    }
+
     /// Commits one editor submission and answers the submitting editor with a
     /// typed result. Every navigation belongs to that mode; the core's only
     /// side effects here are the durable commit and, on request, a join.
@@ -5941,6 +6037,9 @@ impl App {
         }
         self.open_e2e_reviews.remove(&client_id);
         self.rpc_identity.retire(client_id);
+        if self.device_management_owner == Some(client_id) {
+            self.device_management_owner = None;
+        }
         for clients in self.pending_identity_review.values_mut() {
             clients.retain(|pending| *pending != client_id);
         }
@@ -9534,6 +9633,7 @@ fn network_event_kind(event: &NetworkEvent) -> &'static str {
         NetworkEvent::DeviceLinkCreated { .. } => "device_link_created",
         NetworkEvent::DeviceLinkRedeemed { .. } => "device_link_redeemed",
         NetworkEvent::DeviceLinkCanceled => "device_link_canceled",
+        NetworkEvent::E2eDevicesListed { .. } => "e2e_devices_listed",
         NetworkEvent::E2ePeerPinProposed { .. } => "e2e_peer_pin_proposed",
         NetworkEvent::E2ePeerPinMatched { .. } => "e2e_peer_pin_matched",
         NetworkEvent::VoiceStarted { .. } => "voice_started",

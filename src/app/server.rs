@@ -268,6 +268,66 @@ impl ServerEditDraft {
         }
     }
 
+    pub(crate) fn management_document(
+        &self,
+        draft_id: local_rpc::management::ServerDraftId,
+    ) -> local_rpc::management::ServerDraft {
+        let download = match self.download_choice {
+            DownloadChoice::Inherit => local_rpc::management::DownloadOverride::Inherit,
+            DownloadChoice::Off => local_rpc::management::DownloadOverride::Off,
+            DownloadChoice::Memory => local_rpc::management::DownloadOverride::Memory,
+            DownloadChoice::Persistent => local_rpc::management::DownloadOverride::Persistent,
+        };
+        local_rpc::management::ServerDraft {
+            draft_id,
+            server_id: self.server_id(),
+            is_new: self.new_server().is_some(),
+            title: self.title(),
+            label: self.label.clone(),
+            username: self.username.clone(),
+            tcp_addr: self.tcp_addr.clone(),
+            udp_addr: self.udp_addr.clone(),
+            udp_probe_addr: self.udp_probe_addr.clone(),
+            require_transport_encryption: self.require_transport_encryption,
+            can_allow_plaintext: self.show_transport_encryption_setting,
+            credential_present: !self.token.is_empty(),
+            server_identity: self.server_public_key.clone(),
+            download,
+            download_path: self.download_path.clone(),
+            receive_limit_mb: self.receive_limit.clone(),
+            history_enabled: self.history_choice.to_option(),
+            history_location: self.history_location.clone(),
+        }
+    }
+
+    pub(crate) fn apply_management_document(
+        &mut self,
+        document: &local_rpc::management::ServerDraft,
+    ) -> Result<(), String> {
+        if document.server_id != self.server_id()
+            || document.is_new != self.new_server().is_some()
+        {
+            return Err("server draft no longer names the same entry".into());
+        }
+        self.label = document.label.clone();
+        self.username = document.username.clone();
+        self.tcp_addr = document.tcp_addr.clone();
+        self.udp_addr = document.udp_addr.clone();
+        self.udp_probe_addr = document.udp_probe_addr.clone();
+        self.require_transport_encryption = document.require_transport_encryption;
+        self.download_choice = match document.download {
+            local_rpc::management::DownloadOverride::Inherit => DownloadChoice::Inherit,
+            local_rpc::management::DownloadOverride::Off => DownloadChoice::Off,
+            local_rpc::management::DownloadOverride::Memory => DownloadChoice::Memory,
+            local_rpc::management::DownloadOverride::Persistent => DownloadChoice::Persistent,
+        };
+        self.download_path = document.download_path.clone();
+        self.receive_limit = document.receive_limit_mb.clone();
+        self.history_choice = OverrideToggle::from_option(document.history_enabled);
+        self.history_location = document.history_location.clone();
+        self.fields().map(|_| ())
+    }
+
     /// The number of form rows the dialog body currently lays out.
     pub(crate) fn form_height(&self) -> u16 {
         20 + 2 * u16::from(self.show_transport_encryption_setting)

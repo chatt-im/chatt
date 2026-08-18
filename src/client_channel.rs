@@ -170,6 +170,9 @@ pub(crate) enum TerminalEvent {
     DevicePairingFailed {
         message: String,
     },
+    DevicesListed(Vec<local_rpc::management::DeviceSummary>),
+    DeviceLinkCanceled,
+    DeviceLinked(local_rpc::management::DeviceSummary),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

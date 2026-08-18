@@ -201,6 +201,12 @@ struct RemoteRpcClient {
     last_settings_audio_runtime: Option<local_rpc::settings::AudioRuntimeState>,
     appearance_generation: u64,
     identity_generation: u64,
+    management_channel: Arc<ClientChannel>,
+    server_drafts: HashMap<local_rpc::management::ServerDraftId, crate::app::ServerEditDraft>,
+    next_server_draft: u64,
+    pending_server_edits:
+        HashMap<local_rpc::model::RequestId, local_rpc::management::ServerDraftId>,
+    device_link_cancel: Option<Vec<u8>>,
 }
 
 #[cfg(unix)]
@@ -708,6 +714,7 @@ impl RpcClientSender {
             DaemonFrame::AttachmentSourceOpened { request_id, .. } => Some(*request_id),
             DaemonFrame::SettingsResult(result) => Some(result.result.request_id),
             DaemonFrame::IdentityResult(result) => Some(result.result.request_id),
+            DaemonFrame::Management(event) => event.request_id(),
             _ => None,
         };
         if let Some(request_id) = request_id {
@@ -738,6 +745,7 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::Appearance(_) => "appearance",
         DaemonFrame::IdentityResult(_) => "identity_result",
         DaemonFrame::IdentityEvent(_) => "identity_event",
+        DaemonFrame::Management(_) => "management",
     }
 }
 
@@ -956,6 +964,7 @@ fn run_app_inner(
             }
         }
         dirty |= ticked;
+        drain_all_management_events(&mut rpc_clients);
         broadcast_rpc_settings_events(&app, &mut rpc_clients, Instant::now());
         broadcast_rpc_appearance_events(&app, &mut rpc_clients);
         broadcast_rpc_identity_events(&mut app, &mut rpc_clients);
@@ -1547,6 +1556,8 @@ fn spawn_rpc_client(
             return Err(error.to_string());
         }
     };
+    let management_channel = Arc::new(ClientChannel::new().map_err(|error| error.to_string())?);
+    app.register_client(id, management_channel.clone());
     app.register_rpc_client(id);
     // The roster projection is skipped while nothing is attached, so the first
     // client has to build it before reading it — an attach snapshot whose roster
@@ -1607,6 +1618,11 @@ fn spawn_rpc_client(
         last_settings_audio_runtime: None,
         appearance_generation: 0,
         identity_generation: 0,
+        management_channel,
+        server_drafts: HashMap::new(),
+        next_server_draft: 0,
+        pending_server_edits: HashMap::new(),
+        device_link_cancel: None,
     })
 }
 
@@ -1632,6 +1648,8 @@ fn spawn_direct_frontend(
         active_bulk: Arc::new(Mutex::new(HashSet::new())),
         outstanding: Arc::new(Mutex::new(HashSet::new())),
     };
+    let management_channel = Arc::new(ClientChannel::new().map_err(|error| error.to_string())?);
+    app.register_client(id, management_channel.clone());
     app.register_rpc_client(id);
     app.refresh_voice_roster(Instant::now());
     let snapshot = app.rpc_snapshot(id);
@@ -1680,6 +1698,11 @@ fn spawn_direct_frontend(
         last_settings_audio_runtime: None,
         appearance_generation: 0,
         identity_generation: 0,
+        management_channel,
+        server_drafts: HashMap::new(),
+        next_server_draft: 0,
+        pending_server_edits: HashMap::new(),
+        device_link_cancel: None,
     })
 }
 
@@ -2297,6 +2320,14 @@ fn handle_rpc_command(
     instance_id: DaemonInstanceId,
 ) {
     match frame {
+        local_rpc::frame::ClientFrame::Management {
+            request_id,
+            command,
+        } => {
+            handle_management_command(app, clients, id, request_id, command);
+            drain_management_events(clients, id);
+            return;
+        }
         local_rpc::frame::ClientFrame::Appearance {
             request_id,
             command,
@@ -2669,6 +2700,509 @@ fn handle_rpc_command(
             handle_rpc_effect(app, client, id, effect, instance_id);
             return;
         }
+    }
+}
+
+#[cfg(unix)]
+fn handle_management_command(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    command: local_rpc::management::ManagementCommand,
+) {
+    use local_rpc::management::{ManagementCommand, ManagementEvent};
+
+    match command {
+        ManagementCommand::OpenServerCatalog => {
+            send_management_event(
+                clients,
+                id,
+                ManagementEvent::ServerCatalog {
+                    request_id,
+                    servers: app.management_server_catalog(),
+                },
+            );
+        }
+        ManagementCommand::EditServer { server_id } => {
+            let Some(draft) = app.management_server_draft(server_id) else {
+                send_management_rejection(
+                    clients,
+                    id,
+                    request_id,
+                    404,
+                    "server is no longer configured",
+                );
+                return;
+            };
+            let Some(client) = clients.get_mut(&id) else {
+                return;
+            };
+            client.next_server_draft = client.next_server_draft.wrapping_add(1).max(1);
+            let draft_id = local_rpc::management::ServerDraftId(client.next_server_draft);
+            let document = draft.management_document(draft_id);
+            client.server_drafts.insert(draft_id, draft);
+            client.sender.send_or_abort(&DaemonFrame::Management(
+                ManagementEvent::ServerDraft {
+                    request_id: Some(request_id),
+                    draft: document,
+                    diagnostics: Vec::new(),
+                },
+            ));
+        }
+        ManagementCommand::SaveServer { draft, join } => {
+            let draft_id = draft.draft_id;
+            let Some(mut stored) = clients
+                .get_mut(&id)
+                .and_then(|client| client.server_drafts.remove(&draft_id))
+            else {
+                send_management_rejection(
+                    clients,
+                    id,
+                    request_id,
+                    409,
+                    "server draft is no longer open",
+                );
+                return;
+            };
+            if let Err(message) = stored.apply_management_document(&draft) {
+                let document = stored.management_document(draft_id);
+                if let Some(client) = clients.get_mut(&id) {
+                    client.server_drafts.insert(draft_id, stored);
+                }
+                send_management_event(
+                    clients,
+                    id,
+                    ManagementEvent::ServerEditResult {
+                        result: local_rpc::frame::RequestResult {
+                            request_id,
+                            operation: local_rpc::frame::Operation::Management,
+                            outcome: local_rpc::frame::RequestOutcome::Rejected {
+                                code: 422,
+                                message: message.clone(),
+                            },
+                        },
+                        outcome: local_rpc::management::ServerEditOutcome::Rejected,
+                        draft: Some(document),
+                        diagnostics: vec![local_rpc::management::FieldDiagnostic {
+                            field: "server".into(),
+                            message,
+                        }],
+                    },
+                );
+                return;
+            }
+            if let Some(client) = clients.get_mut(&id) {
+                let submission = stored.submission();
+                client.server_drafts.insert(draft_id, stored);
+                client.pending_server_edits.insert(request_id, draft_id);
+                app.handle_client_command(
+                    id,
+                    CoreCommand::SubmitServerEdit {
+                        request_id: request_id.0,
+                        draft: submission,
+                        join,
+                    },
+                );
+            }
+        }
+        ManagementCommand::DeleteServer { server_id } => {
+            app.handle_client_command(id, CoreCommand::DeleteServer { server_id });
+            send_management_event(
+                clients,
+                id,
+                ManagementEvent::ServerCatalog {
+                    request_id,
+                    servers: app.management_server_catalog(),
+                },
+            );
+        }
+        ManagementCommand::Pair {
+            input,
+            device_name,
+            overwrite_existing_device,
+        } => {
+            app.handle_client_command(
+                id,
+                CoreCommand::SubmitDevicePair {
+                    pairing_string: input,
+                    device_name,
+                    overwrite_existing: overwrite_existing_device,
+                },
+            );
+            send_management_acceptance(clients, id, request_id);
+        }
+        ManagementCommand::SubmitPairingPassword { password } => {
+            app.handle_client_command(id, CoreCommand::SubmitPairPassword(password));
+            send_management_acceptance(clients, id, request_id);
+        }
+        ManagementCommand::ResolvePlaintext { target, accept } => {
+            let command = match (target, accept) {
+                (local_rpc::management::PlaintextPromptTarget::Pairing, true) => {
+                    CoreCommand::AcceptPairingPlaintext
+                }
+                (local_rpc::management::PlaintextPromptTarget::Pairing, false) => {
+                    CoreCommand::CancelPairing
+                }
+                (
+                    local_rpc::management::PlaintextPromptTarget::Join { attempt_id },
+                    true,
+                ) => CoreCommand::AcceptTransportEncryption { attempt_id },
+                (
+                    local_rpc::management::PlaintextPromptTarget::Join { attempt_id },
+                    false,
+                ) => CoreCommand::CancelTransportEncryption { attempt_id },
+            };
+            app.handle_client_command(id, command);
+            send_management_acceptance(clients, id, request_id);
+        }
+        ManagementCommand::CancelPairing => {
+            app.handle_client_command(id, CoreCommand::CancelPairing);
+            send_management_acceptance(clients, id, request_id);
+        }
+        ManagementCommand::RetryJoin { attempt_id } => {
+            app.handle_client_command(id, CoreCommand::RetryJoin { attempt_id });
+            send_management_acceptance(clients, id, request_id);
+        }
+        ManagementCommand::CancelJoin { attempt_id } => {
+            app.handle_client_command(id, CoreCommand::CancelJoin { attempt_id });
+            send_management_acceptance(clients, id, request_id);
+        }
+        ManagementCommand::ListDevices => {
+            app.management_list_devices(id);
+            send_management_acceptance(clients, id, request_id);
+        }
+        ManagementCommand::CreateDeviceLink => {
+            app.management_create_device_link(id);
+            send_management_acceptance(clients, id, request_id);
+        }
+        ManagementCommand::CancelDeviceLink => {
+            let cancel = clients
+                .get_mut(&id)
+                .and_then(|client| client.device_link_cancel.take());
+            if let Some(redemption_secret_hash) = cancel {
+                app.management_cancel_device_link(id, redemption_secret_hash);
+                send_management_acceptance(clients, id, request_id);
+            } else {
+                send_management_rejection(
+                    clients,
+                    id,
+                    request_id,
+                    404,
+                    "no active device link",
+                );
+            }
+        }
+        ManagementCommand::RevokeDevice { device_id } => {
+            app.management_revoke_device(id, device_id);
+            send_management_acceptance(clients, id, request_id);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn send_management_acceptance(
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+) {
+    if let Some(client) = clients.get(&id) {
+        client.sender.send_or_abort(&DaemonFrame::RequestResult(
+            local_rpc::frame::RequestResult {
+                request_id,
+                operation: local_rpc::frame::Operation::Management,
+                outcome: local_rpc::frame::RequestOutcome::Accepted,
+            },
+        ));
+    }
+}
+
+#[cfg(unix)]
+fn send_management_rejection(
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    code: u16,
+    message: &str,
+) {
+    if let Some(client) = clients.get(&id) {
+        client.sender.send_or_abort(&DaemonFrame::RequestResult(
+            local_rpc::frame::RequestResult {
+                request_id,
+                operation: local_rpc::frame::Operation::Management,
+                outcome: local_rpc::frame::RequestOutcome::Rejected {
+                    code,
+                    message: message.into(),
+                },
+            },
+        ));
+    }
+}
+
+#[cfg(unix)]
+fn send_management_event(
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    event: local_rpc::management::ManagementEvent,
+) {
+    if let Some(client) = clients.get(&id) {
+        client
+            .sender
+            .send_or_abort(&DaemonFrame::Management(event));
+    }
+}
+
+#[cfg(unix)]
+fn drain_management_events(
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+) {
+    let Some(client) = clients.get_mut(&id) else {
+        return;
+    };
+    let events = client.management_channel.drain_events();
+    for event in events {
+        let mapped = match event {
+            crate::client_channel::TerminalEvent::Navigation(
+                crate::client_channel::NavigationEvent::OpenScreen(screen)
+                | crate::client_channel::NavigationEvent::ReplaceScreen(screen),
+            ) => match *screen {
+                crate::client_channel::ScreenSpec::ServerEditor(draft) => {
+                    client.next_server_draft = client.next_server_draft.wrapping_add(1).max(1);
+                    let draft_id =
+                        local_rpc::management::ServerDraftId(client.next_server_draft);
+                    let document = draft.management_document(draft_id);
+                    client.server_drafts.insert(draft_id, draft);
+                    Some(local_rpc::management::ManagementEvent::ServerDraft {
+                        request_id: None,
+                        draft: document,
+                        diagnostics: Vec::new(),
+                    })
+                }
+                crate::client_channel::ScreenSpec::Joining(join) => Some(
+                    local_rpc::management::ManagementEvent::Join(management_join_state(join)),
+                ),
+                _ => None,
+            },
+            crate::client_channel::TerminalEvent::Navigation(
+                crate::client_channel::NavigationEvent::ShowOverlay(overlay)
+                | crate::client_channel::NavigationEvent::ReplaceOverlay(overlay),
+            ) => match *overlay {
+                crate::client_channel::OverlaySpec::TransportEncryptionWarning {
+                    label,
+                    target,
+                } => {
+                    let target = match target {
+                        crate::client_channel::TransportWarningTarget::Pairing => {
+                            local_rpc::management::PlaintextPromptTarget::Pairing
+                        }
+                        crate::client_channel::TransportWarningTarget::Join { attempt_id } => {
+                            local_rpc::management::PlaintextPromptTarget::Join { attempt_id }
+                        }
+                    };
+                    Some(
+                        local_rpc::management::ManagementEvent::PlaintextConsentRequired {
+                            label,
+                            target,
+                        },
+                    )
+                }
+                crate::client_channel::OverlaySpec::DeviceLink(dialog) => {
+                    client.device_link_cancel = Some(dialog.redemption_secret_hash().to_vec());
+                    Some(local_rpc::management::ManagementEvent::DeviceLink {
+                        pairing_string: dialog.pairing_string().to_owned(),
+                        expires_at_ms: dialog.expires_at_ms(),
+                    })
+                }
+                crate::client_channel::OverlaySpec::PairingPassword { retry } => Some(
+                    local_rpc::management::ManagementEvent::PairingPasswordRequired { retry },
+                ),
+                _ => None,
+            },
+            crate::client_channel::TerminalEvent::ServerEditResult {
+                request_id,
+                outcome,
+            } => {
+                let request_id = local_rpc::model::RequestId(request_id);
+                let draft_id = client.pending_server_edits.remove(&request_id);
+                let (outcome, code, message, replacement, join) = match outcome {
+                    crate::client_channel::ServerEditOutcome::Rejected => (
+                        local_rpc::management::ServerEditOutcome::Rejected,
+                        Some(422),
+                        "server settings were rejected",
+                        None,
+                        None,
+                    ),
+                    crate::client_channel::ServerEditOutcome::Retry(draft) => (
+                        local_rpc::management::ServerEditOutcome::Rejected,
+                        Some(409),
+                        "pairing requires corrected server settings",
+                        Some(*draft),
+                        None,
+                    ),
+                    crate::client_channel::ServerEditOutcome::Conflict(draft) => (
+                        local_rpc::management::ServerEditOutcome::ReloadedConflict,
+                        Some(409),
+                        "server changed elsewhere and was reloaded",
+                        Some(*draft),
+                        None,
+                    ),
+                    crate::client_channel::ServerEditOutcome::Missing => (
+                        local_rpc::management::ServerEditOutcome::Missing,
+                        Some(404),
+                        "server is no longer configured",
+                        None,
+                        None,
+                    ),
+                    crate::client_channel::ServerEditOutcome::Saved => (
+                        local_rpc::management::ServerEditOutcome::Saved,
+                        None,
+                        "",
+                        None,
+                        None,
+                    ),
+                    crate::client_channel::ServerEditOutcome::JoinStarted(join) => (
+                        local_rpc::management::ServerEditOutcome::SavedAndJoining,
+                        None,
+                        "",
+                        None,
+                        Some(join),
+                    ),
+                    crate::client_channel::ServerEditOutcome::SavedButJoinFailed(draft) => (
+                        local_rpc::management::ServerEditOutcome::SavedButJoinFailed,
+                        Some(503),
+                        "server was saved but joining could not start",
+                        Some(*draft),
+                        None,
+                    ),
+                };
+                let document = match (draft_id, replacement) {
+                    (Some(draft_id), Some(draft)) => {
+                        let document = draft.management_document(draft_id);
+                        client.server_drafts.insert(draft_id, draft);
+                        Some(document)
+                    }
+                    (Some(draft_id), None) if code.is_some() => client
+                        .server_drafts
+                        .get(&draft_id)
+                        .map(|draft| draft.management_document(draft_id)),
+                    (Some(draft_id), None) => {
+                        client.server_drafts.remove(&draft_id);
+                        None
+                    }
+                    (None, _) => None,
+                };
+                let result = local_rpc::frame::RequestResult {
+                    request_id,
+                    operation: local_rpc::frame::Operation::Management,
+                    outcome: match code {
+                        Some(code) => local_rpc::frame::RequestOutcome::Rejected {
+                            code,
+                            message: message.into(),
+                        },
+                        None => local_rpc::frame::RequestOutcome::Accepted,
+                    },
+                };
+                client.sender.send_or_abort(&DaemonFrame::Management(
+                    local_rpc::management::ManagementEvent::ServerEditResult {
+                        result,
+                        outcome,
+                        draft: document,
+                        diagnostics: Vec::new(),
+                    },
+                ));
+                if let Some(join) = join {
+                    client.sender.send_or_abort(&DaemonFrame::Management(
+                        local_rpc::management::ManagementEvent::Join(management_join_state(join)),
+                    ));
+                }
+                None
+            }
+            crate::client_channel::TerminalEvent::JoinUpdate(join) => Some(
+                local_rpc::management::ManagementEvent::Join(management_join_state(join)),
+            ),
+            crate::client_channel::TerminalEvent::PairingPasswordChallenge { retry } => Some(
+                local_rpc::management::ManagementEvent::PairingPasswordRequired { retry },
+            ),
+            crate::client_channel::TerminalEvent::PairingFailed(message) => {
+                Some(local_rpc::management::ManagementEvent::PairingFailed { message })
+            }
+            crate::client_channel::TerminalEvent::DevicePairingIdentityExists { message } => Some(
+                local_rpc::management::ManagementEvent::PairingIdentityExists { message },
+            ),
+            crate::client_channel::TerminalEvent::DevicePairingFailed { message } => {
+                Some(local_rpc::management::ManagementEvent::PairingFailed { message })
+            }
+            crate::client_channel::TerminalEvent::DevicesListed(devices) => Some(
+                local_rpc::management::ManagementEvent::Devices {
+                    request_id: None,
+                    devices,
+                },
+            ),
+            crate::client_channel::TerminalEvent::DeviceLinkCanceled => {
+                client.device_link_cancel = None;
+                Some(local_rpc::management::ManagementEvent::DeviceLinkCanceled)
+            }
+            crate::client_channel::TerminalEvent::DeviceLinked(device) => {
+                client.device_link_cancel = None;
+                Some(local_rpc::management::ManagementEvent::DeviceLinked { device })
+            }
+            crate::client_channel::TerminalEvent::Status(message)
+            | crate::client_channel::TerminalEvent::TransientStatus(message) => Some(
+                local_rpc::management::ManagementEvent::Status {
+                    message,
+                    error: false,
+                },
+            ),
+            crate::client_channel::TerminalEvent::Error(message) => Some(
+                local_rpc::management::ManagementEvent::Status {
+                    message,
+                    error: true,
+                },
+            ),
+            _ => None,
+        };
+        if let Some(event) = mapped {
+            client
+                .sender
+                .send_or_abort(&DaemonFrame::Management(event));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn drain_all_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>) {
+    let ids = clients.keys().copied().collect::<Vec<_>>();
+    for id in ids {
+        drain_management_events(clients, id);
+    }
+}
+
+#[cfg(unix)]
+fn management_join_state(
+    join: crate::client_channel::JoinView,
+) -> local_rpc::management::JoinState {
+    let phase = match join.phase {
+        crate::client_channel::JoinPhaseView::Connecting => {
+            local_rpc::management::JoinPhase::Connecting
+        }
+        crate::client_channel::JoinPhaseView::Authenticating => {
+            local_rpc::management::JoinPhase::Authenticating
+        }
+        crate::client_channel::JoinPhaseView::RepairingCredentials => {
+            local_rpc::management::JoinPhase::RepairingCredentials
+        }
+        crate::client_channel::JoinPhaseView::AwaitingConsent => {
+            local_rpc::management::JoinPhase::AwaitingPlaintextConsent
+        }
+        crate::client_channel::JoinPhaseView::Failed { message, retryable } => {
+            local_rpc::management::JoinPhase::Failed { message, retryable }
+        }
+    };
+    local_rpc::management::JoinState {
+        attempt_id: join.attempt_id,
+        server_label: join.server_label,
+        phase,
     }
 }
 

@@ -9,10 +9,11 @@ pub mod attachment_stream;
 pub mod bulk;
 pub mod frame;
 pub mod identity;
+pub mod management;
 pub mod ids {
     //! Resource identifiers visible to native renderers.
 
-    pub use chatt_ids::{FileTransferId, MessageId, RoomId, StreamId, UserId};
+    pub use chatt_ids::{DeviceId, FileTransferId, MessageId, RoomId, ServerId, StreamId, UserId};
 }
 pub mod model;
 pub mod settings;
@@ -79,3 +80,5 @@ pub const MAX_SETTINGS_CHANGES: usize = 256;
 pub const MAX_APPEARANCE_BYTES: usize = 64 * 1024;
 pub const MAX_IDENTITY_WORDS: usize = 32;
 pub const MAX_IDENTITY_KEY_GROUPS: usize = 32;
+pub const MAX_MANAGEMENT_DIAGNOSTICS: usize = 32;
+pub const MAX_DEVICES: usize = 256;

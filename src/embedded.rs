@@ -523,6 +523,7 @@ mod tests {
         bulk::BeginUpload,
         frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
         ids::RoomId,
+        management::{ManagementCommand, ManagementEvent},
         model::{BulkTransferId, RequestId},
     };
 
@@ -571,6 +572,28 @@ mod tests {
                     request_id: RequestId(1),
                     nonce: 42,
                 }) => break,
+                _ => {}
+            }
+        }
+
+        frontend
+            .sender()
+            .send(ClientFrame::Management {
+                request_id: RequestId(2),
+                command: ManagementCommand::OpenServerCatalog,
+            })
+            .unwrap();
+        loop {
+            match frontend.recv_timeout(Duration::from_secs(2)).unwrap() {
+                FrontendEvent::Frame(DaemonFrame::Management(
+                    ManagementEvent::ServerCatalog {
+                        request_id: RequestId(2),
+                        servers,
+                    },
+                )) => {
+                    assert!(servers.is_empty());
+                    break;
+                }
                 _ => {}
             }
         }

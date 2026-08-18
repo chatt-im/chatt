@@ -741,6 +741,9 @@ pub enum NetworkEvent {
         device_name: String,
     },
     DeviceLinkCanceled,
+    E2eDevicesListed {
+        devices: Vec<local_rpc::management::DeviceSummary>,
+    },
     /// A typed MLS delivery response for the MLS runtime boundary.
     Mls(ServerControl),
     /// One chunk of server-retained history for a room.

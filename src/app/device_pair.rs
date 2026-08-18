@@ -495,6 +495,14 @@ impl DeviceLinkDialog {
         &self.redemption_secret_hash
     }
 
+    pub(crate) fn pairing_string(&self) -> &str {
+        &self.pairing_string
+    }
+
+    pub(crate) fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+
     fn activate(&mut self, button: Option<DeviceLinkButton>) -> Option<DeviceLinkButton> {
         match button {
             Some(DeviceLinkButton::GenerateNew) if !self.generate_armed => {

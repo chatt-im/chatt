@@ -7,6 +7,7 @@ use super::{
     appearance::{AppearanceCommand, AppearanceEvent},
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished},
     identity::{IdentityCommand, IdentityEvent, IdentityResult},
+    management::{ManagementCommand, ManagementEvent},
     model::{
         AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
         CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, LiveShareViewStatus,
@@ -193,6 +194,7 @@ pub enum Operation {
     VerifyIdentity,
     ForgetIdentity,
     CloseIdentity,
+    Management,
 }
 
 impl Encode for Operation {
@@ -237,6 +239,7 @@ impl Encode for Operation {
             Self::VerifyIdentity => "verify-identity",
             Self::ForgetIdentity => "forget-identity",
             Self::CloseIdentity => "close-identity",
+            Self::Management => "management",
         };
         value.encode_log_value_into(output);
     }
@@ -501,6 +504,10 @@ pub enum ClientFrame {
         request_id: RequestId,
         command: IdentityCommand,
     },
+    Management {
+        request_id: RequestId,
+        command: ManagementCommand,
+    },
 }
 
 impl ClientFrame {
@@ -535,6 +542,7 @@ impl ClientFrame {
             | Self::Settings { request_id, .. }
             | Self::Appearance { request_id, .. }
             | Self::Identity { request_id, .. } => Some(*request_id),
+            Self::Management { request_id, .. } => Some(*request_id),
             Self::UploadChunk(_) => None,
         }
     }
@@ -600,6 +608,7 @@ pub enum DaemonFrame {
     Appearance(AppearanceEvent),
     IdentityResult(IdentityResult),
     IdentityEvent(IdentityEvent),
+    Management(ManagementEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -926,6 +935,7 @@ pub fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         ClientFrame::Settings { command, .. } => command.validate()?,
         ClientFrame::Appearance { command, .. } => command.validate()?,
         ClientFrame::Identity { command, .. } => command.validate()?,
+        ClientFrame::Management { command, .. } => command.validate()?,
         _ => {}
     }
     Ok(())
@@ -1067,6 +1077,7 @@ pub fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::Appearance(event) => event.validate(),
         DaemonFrame::IdentityResult(result) => result.validate(),
         DaemonFrame::IdentityEvent(event) => event.validate(),
+        DaemonFrame::Management(event) => event.validate(),
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
         | DaemonFrame::LiveShareStatus { .. }

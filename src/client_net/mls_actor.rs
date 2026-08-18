@@ -1780,24 +1780,22 @@ impl Actor {
                     .installation
                     .as_ref()
                     .ok_or_else(|| "the MLS installation is unavailable".to_string())?;
+                let local_device = installation.bootstrap.device_id;
                 let devices = installation
                     .bootstrap
                     .own_roster
                     .body
                     .active_devices
                     .iter()
-                    .map(|certificate| {
-                        format!(
-                            "{} ({})",
-                            certificate.body.device_name,
-                            encode_hex(&certificate.body.device_id.0)
-                        )
+                    .map(|certificate| local_rpc::management::DeviceSummary {
+                        device_id: certificate.body.device_id,
+                        name: certificate.body.device_name.clone(),
+                        local: certificate.body.device_id == local_device,
                     })
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                let _ = self.events.send(NetworkEvent::Error(format!(
-                    "MLS account devices: {devices}"
-                )));
+                    .collect();
+                let _ = self
+                    .events
+                    .send(NetworkEvent::E2eDevicesListed { devices });
                 Ok(())
             }
             Command::CreateDeviceLink => {
