@@ -1727,6 +1727,39 @@ impl Config {
         }
     }
 
+    /// Loads configuration for a library host without writing diagnostics to
+    /// stderr. The host owns presentation and logging in an embedded process.
+    #[cfg(feature = "embedded-client")]
+    pub(crate) fn load_for_embedded(path: Option<&str>) -> Result<AppConfigLoad, String> {
+        let config_path = resolve_config_path(path)
+            .ok_or_else(|| "HOME is not set; cannot determine config path".to_string())?;
+        match fs::read_to_string(&config_path) {
+            Ok(content) => {
+                let outcome = Self::collect_content(
+                    content,
+                    config_path.display().to_string(),
+                    Some(config_path),
+                )?;
+                let errors = outcome.diagnostics.iter().filter(|diag| diag.error).count();
+                match outcome.config {
+                    Some(config) if errors == 0 => Ok(AppConfigLoad::Existing(config)),
+                    _ => Err(config_diagnostics::render_to_string(
+                        &outcome.source,
+                        &outcome.content,
+                        &outcome.diagnostics,
+                        false,
+                    )),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut config = Config::default();
+                config.config_path = Some(config_path);
+                Ok(AppConfigLoad::Missing(config))
+            }
+            Err(error) => Err(format!("failed to read {}: {error}", config_path.display())),
+        }
+    }
+
     /// Reloads and validates the config for a running client, returning any
     /// diagnostics as the error string instead of rendering them to stderr.
     ///

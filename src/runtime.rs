@@ -32,6 +32,9 @@ use local_rpc::frame::{DaemonFrame, NegotiatedLimits, StateDelta, StateEvent, We
 #[cfg(unix)]
 use parking_lot::Mutex;
 
+#[cfg(all(unix, feature = "embedded-client"))]
+use crate::embedded::{AttachmentBody, DirectRequest, EmbeddedReady, FrontendEvent};
+
 #[cfg(unix)]
 use crate::attach;
 use crate::{
@@ -179,10 +182,12 @@ struct RemoteClient {
 #[cfg(unix)]
 struct RemoteRpcClient {
     sender: RpcClientSender,
-    control: Arc<UnixStream>,
+    control: Option<Arc<UnixStream>>,
     events: EventSender,
     reader_thread: Option<JoinHandle<()>>,
     writer_thread: Option<JoinHandle<()>>,
+    #[cfg(feature = "embedded-client")]
+    direct_commands: Option<std::sync::mpsc::Receiver<DirectRequest>>,
     next_event_seq: u64,
     uploads: Arc<Mutex<HashMap<local_rpc::model::BulkTransferId, RpcUpload>>>,
     pending_history: Option<RpcHistoryRequest>,
@@ -395,10 +400,197 @@ impl RpcAttachmentStream {
 #[derive(Clone)]
 #[cfg(unix)]
 struct RpcClientSender {
-    outbound: Arc<RpcOutboundQueue>,
-    control: Arc<UnixStream>,
+    sink: Arc<dyn FrontendSink>,
     active_bulk: Arc<Mutex<HashSet<local_rpc::model::BulkTransferId>>>,
     outstanding: Arc<Mutex<HashSet<local_rpc::model::RequestId>>>,
+}
+
+#[cfg(unix)]
+trait FrontendSink: Send + Sync {
+    fn send_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String>;
+    fn start_bulk(
+        &self,
+        transfer_id: local_rpc::model::BulkTransferId,
+        descriptor: local_rpc::model::AttachmentDescriptor,
+        source: crate::receive_store::Source,
+    ) -> Result<(), String>;
+    fn shutdown(&self);
+    fn abort(&self);
+}
+
+#[cfg(unix)]
+struct UnixFrontendSink {
+    outbound: Arc<RpcOutboundQueue>,
+    control: Arc<UnixStream>,
+}
+
+#[cfg(unix)]
+impl FrontendSink for UnixFrontendSink {
+    fn send_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String> {
+        let mut state = self.outbound.state.lock();
+        if state.closed {
+            return Err("RPC client writer stopped".into());
+        }
+        let offset = state.bytes.len();
+        local_rpc::frame::encode_daemon_framed_append(frame, &mut state.bytes)?;
+        if state.bytes.len() > local_rpc::MAX_QUEUED_BYTES {
+            state.bytes.truncate(offset);
+            return Err("RPC client outbound queue is full".into());
+        }
+        if !fds.is_empty() {
+            let length = state.bytes.len() - offset;
+            state
+                .control
+                .push((offset, RpcOutboundControl::Descriptors { length, fds }));
+        }
+        drop(state);
+        self.outbound.ready.notify_one();
+        Ok(())
+    }
+
+    fn start_bulk(
+        &self,
+        transfer_id: local_rpc::model::BulkTransferId,
+        descriptor: local_rpc::model::AttachmentDescriptor,
+        source: crate::receive_store::Source,
+    ) -> Result<(), String> {
+        let mut state = self.outbound.state.lock();
+        if state.closed {
+            return Err("RPC client writer cannot start attachment transfer".into());
+        }
+        let at = state.bytes.len();
+        state.control.push((
+            at,
+            RpcOutboundControl::StartBulk {
+                transfer_id,
+                descriptor,
+                source,
+            },
+        ));
+        drop(state);
+        self.outbound.ready.notify_one();
+        Ok(())
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.outbound.state.lock();
+        let at = state.bytes.len();
+        state.control.push((at, RpcOutboundControl::Shutdown));
+        drop(state);
+        self.outbound.ready.notify_one();
+    }
+
+    fn abort(&self) {
+        let _ = self.control.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(all(unix, feature = "embedded-client"))]
+struct DirectFrontendSink {
+    events: std::sync::mpsc::SyncSender<FrontendEvent>,
+    core_events: EventSender,
+    client_id: ClientId,
+}
+
+#[cfg(all(unix, feature = "embedded-client"))]
+impl DirectFrontendSink {
+    fn try_send(&self, event: FrontendEvent) -> Result<(), String> {
+        self.events.try_send(event).map_err(|error| match error {
+            std::sync::mpsc::TrySendError::Full(_) => {
+                "embedded frontend event queue is full".to_string()
+            }
+            std::sync::mpsc::TrySendError::Disconnected(_) => {
+                "embedded frontend detached".to_string()
+            }
+        })
+    }
+}
+
+#[cfg(all(unix, feature = "embedded-client"))]
+impl FrontendSink for DirectFrontendSink {
+    fn send_frame(&self, frame: &DaemonFrame, mut fds: Vec<OwnedFd>) -> Result<(), String> {
+        local_rpc::frame::validate_daemon(frame)?;
+        match frame {
+            DaemonFrame::LiveShareOpened {
+                request_id,
+                stream_id,
+                generation,
+                status,
+            } => {
+                if fds.len() != 1 {
+                    return Err("live share event carries an invalid descriptor count".into());
+                }
+                self.try_send(FrontendEvent::LiveShareOpened {
+                    request_id: *request_id,
+                    stream_id: *stream_id,
+                    generation: *generation,
+                    status: *status,
+                    stream: UnixStream::from(fds.pop().expect("checked descriptor")),
+                })
+            }
+            DaemonFrame::AttachmentSourceOpened {
+                request_id,
+                room_id,
+                attachment_id,
+                byte_len,
+                transport,
+            } => {
+                if fds.len() != 1 {
+                    return Err(
+                        "attachment source event carries an invalid descriptor count".into(),
+                    );
+                }
+                self.try_send(FrontendEvent::AttachmentSourceOpened {
+                    request_id: *request_id,
+                    room_id: *room_id,
+                    attachment_id: *attachment_id,
+                    byte_len: *byte_len,
+                    transport: *transport,
+                    fd: fds.pop().expect("checked descriptor"),
+                })
+            }
+            _ if !fds.is_empty() => {
+                Err("embedded frontend frame carries unexpected descriptors".into())
+            }
+            _ => self.try_send(FrontendEvent::Frame(frame.clone())),
+        }
+    }
+
+    fn start_bulk(
+        &self,
+        transfer_id: local_rpc::model::BulkTransferId,
+        descriptor: local_rpc::model::AttachmentDescriptor,
+        source: crate::receive_store::Source,
+    ) -> Result<(), String> {
+        let body = match source {
+            crate::receive_store::Source::Memory { bytes, .. } => {
+                if bytes.len() as u64 != descriptor.byte_len {
+                    return Err("attachment length changed before direct delivery".into());
+                }
+                AttachmentBody::Memory(bytes)
+            }
+            crate::receive_store::Source::Disk(path) => {
+                let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+                if file.metadata().map_err(|error| error.to_string())?.len()
+                    != descriptor.byte_len
+                {
+                    return Err("attachment length changed before direct delivery".into());
+                }
+                AttachmentBody::File(file)
+            }
+        };
+        self.try_send(FrontendEvent::AttachmentBody {
+            transfer_id,
+            descriptor,
+            body,
+        })
+    }
+
+    fn shutdown(&self) {}
+
+    fn abort(&self) {
+        let _ = self.core_events.send(AppEvent::RpcClientExited(self.client_id));
+    }
 }
 
 #[cfg(unix)]
@@ -426,10 +618,6 @@ impl RpcClientSender {
     }
 
     fn send_with_fds(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String> {
-        self.queue_frame(frame, fds)
-    }
-
-    fn queue_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String> {
         let expected_fds = match frame {
             DaemonFrame::LiveShareOpened { .. } | DaemonFrame::AttachmentSourceOpened { .. } => 1,
             _ => 0,
@@ -437,24 +625,7 @@ impl RpcClientSender {
         if fds.len() != expected_fds {
             return Err("daemon frame carries an invalid descriptor count".into());
         }
-        let mut state = self.outbound.state.lock();
-        if state.closed {
-            return Err("RPC client writer stopped".into());
-        }
-        let offset = state.bytes.len();
-        local_rpc::frame::encode_daemon_framed_append(frame, &mut state.bytes)?;
-        if state.bytes.len() > local_rpc::MAX_QUEUED_BYTES {
-            state.bytes.truncate(offset);
-            return Err("RPC client outbound queue is full".into());
-        }
-        if !fds.is_empty() {
-            let length = state.bytes.len() - offset;
-            state
-                .control
-                .push((offset, RpcOutboundControl::Descriptors { length, fds }));
-        }
-        drop(state);
-        self.outbound.ready.notify_one();
+        self.sink.send_frame(frame, fds)?;
         self.complete_request(frame);
         Ok(())
     }
@@ -465,36 +636,19 @@ impl RpcClientSender {
         descriptor: local_rpc::model::AttachmentDescriptor,
         source: crate::receive_store::Source,
     ) -> Result<(), String> {
-        let mut state = self.outbound.state.lock();
-        if state.closed {
-            drop(state);
+        if let Err(error) = self.sink.start_bulk(transfer_id, descriptor, source) {
             self.cancel_bulk(transfer_id);
-            return Err("RPC client writer cannot start attachment transfer".into());
+            return Err(error);
         }
-        let at = state.bytes.len();
-        state.control.push((
-            at,
-            RpcOutboundControl::StartBulk {
-                transfer_id,
-                descriptor,
-                source,
-            },
-        ));
-        drop(state);
-        self.outbound.ready.notify_one();
         Ok(())
     }
 
     fn shutdown(&self) {
-        let mut state = self.outbound.state.lock();
-        let at = state.bytes.len();
-        state.control.push((at, RpcOutboundControl::Shutdown));
-        drop(state);
-        self.outbound.ready.notify_one();
+        self.sink.shutdown();
     }
 
     fn abort(&self) {
-        let _ = self.control.shutdown(std::net::Shutdown::Both);
+        self.sink.abort();
     }
 
     fn send_or_abort(&self, frame: &DaemonFrame) -> bool {
@@ -591,14 +745,14 @@ pub(crate) fn run_app(
     config: Config,
     pending_join: Option<PendingJoin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_app_inner(config, pending_join, false, false)
+    run_app_inner(config, pending_join, false, RuntimeMode::Terminal)
 }
 
 pub(crate) fn run_app_with_welcome(
     config: Config,
     pending_join: Option<PendingJoin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_app_inner(config, pending_join, true, false)
+    run_app_inner(config, pending_join, true, RuntimeMode::Terminal)
 }
 
 /// Runs the core with no terminal, serving whatever attaches over the local
@@ -606,20 +760,44 @@ pub(crate) fn run_app_with_welcome(
 /// from.
 #[cfg(unix)]
 pub(crate) fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    run_app_inner(config, None, false, true)
+    run_app_inner(config, None, false, RuntimeMode::Daemon)
+}
+
+enum RuntimeMode {
+    Terminal,
+    Daemon,
+    #[cfg(all(unix, feature = "embedded-client"))]
+    Embedded(crate::embedded::DirectBootstrap),
+}
+
+#[cfg(all(unix, feature = "embedded-client"))]
+pub(crate) fn run_embedded(
+    config: Config,
+    bootstrap: crate::embedded::DirectBootstrap,
+    instance: chatt_platform::instance::InstanceLock,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _instance = instance;
+    run_app_inner(config, None, false, RuntimeMode::Embedded(bootstrap))
 }
 
 fn run_app_inner(
     config: Config,
     mut pending_join: Option<PendingJoin>,
     show_welcome: bool,
-    headless: bool,
+    mode: RuntimeMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    install_panic_hook();
-    polling::initialize_global_waker(GlobalWakerConfig {
-        resize: !headless,
-        termination: true,
-    })?;
+    let headless = !matches!(&mode, RuntimeMode::Terminal);
+    #[cfg(all(unix, feature = "embedded-client"))]
+    let embedded = matches!(&mode, RuntimeMode::Embedded(_));
+    #[cfg(not(all(unix, feature = "embedded-client")))]
+    let embedded = false;
+    if !embedded {
+        install_panic_hook();
+        polling::initialize_global_waker(GlobalWakerConfig {
+            resize: !headless,
+            termination: true,
+        })?;
+    }
 
     let startup_pending = if show_welcome {
         None
@@ -684,6 +862,35 @@ fn run_app_inner(
     let mut clients = HashMap::<ClientId, RemoteClient>::new();
     let mut rpc_clients = HashMap::<ClientId, RemoteRpcClient>::new();
     let daemon_instance = daemon_instance_id();
+    #[cfg(all(unix, feature = "embedded-client"))]
+    if let RuntimeMode::Embedded(bootstrap) = mode {
+        let id = ClientId(next_client_id as u32);
+        next_client_id += 1;
+        let ready = bootstrap.ready.clone();
+        app.acquire_core_state();
+        let attached = spawn_direct_frontend(
+            &mut app,
+            id,
+            bootstrap,
+            event_sender.clone(),
+            daemon_instance,
+        );
+        app.release_core_state();
+        match attached {
+            Ok(client) => {
+                rpc_clients.insert(id, client);
+                let _ = ready.send(Ok(EmbeddedReady {
+                    events: event_sender.clone(),
+                    client_id: id,
+                }));
+                kvlog::info!("embedded frontend attached", client_id = id.0);
+            }
+            Err(error) => {
+                let _ = ready.send(Err(error.clone()));
+                return Err(error.into());
+            }
+        }
+    }
     // Zero so the first iteration ticks immediately and derives the real
     // timeout from app state.
     let mut wait_timeout = Duration::ZERO;
@@ -746,7 +953,9 @@ fn run_app_inner(
         broadcast_rpc_appearance_events(&app, &mut rpc_clients);
         broadcast_rpc_identity_events(&mut app, &mut rpc_clients);
 
-        let quit = (!headless && app.take_quit_requested()) || polling::termination_requested();
+        let quit = (!headless && app.take_quit_requested())
+            || (embedded && app.take_quit_requested())
+            || (!embedded && polling::termination_requested());
         wait_timeout = app.next_tick_timeout(Instant::now());
         app.release_core_state();
 
@@ -757,6 +966,7 @@ fn run_app_inner(
             wake_remote(client, dirty);
         }
         if quit {
+            kvlog::info!("core runtime stopping", embedded);
             break;
         }
     }
@@ -779,10 +989,12 @@ fn run_app_inner(
         notify_rpc_shutdown(&mut client, daemon_instance);
         shutdown_rpc(&mut client);
     }
+    kvlog::info!("core frontend shutdown complete", embedded);
     let render_result = render_thread.map(JoinHandle::join);
     // App::drop persists the room catalog and tears down audio through the
     // core wrappers, so restore their guards before returning from runtime.
     app.acquire_core_state();
+    kvlog::info!("core runtime state reacquired", embedded);
     match render_result {
         None | Some(Ok(Ok(Ok(())))) => Ok(()),
         Some(Ok(Ok(Err(error)))) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
@@ -955,6 +1167,19 @@ fn handle_runtime_event(
                 broadcast_rpc_snapshots(app, rpc_clients, daemon_instance);
             }
         }
+        #[cfg(all(unix, feature = "embedded-client"))]
+        AppEvent::EmbeddedFrontendWake(client_id) => {
+            handle_direct_frontend_requests(
+                app,
+                rpc_clients,
+                client_id,
+                daemon_instance,
+            );
+        }
+        #[cfg(all(unix, feature = "embedded-client"))]
+        AppEvent::EmbeddedCoreShutdown => {
+            app.request_quit();
+        }
         #[cfg(unix)]
         AppEvent::RpcClientExited(id) => {
             app.retire_client(id);
@@ -1025,6 +1250,98 @@ fn handle_runtime_event(
     }
 }
 
+#[cfg(all(unix, feature = "embedded-client"))]
+fn handle_direct_frontend_requests(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    client_id: ClientId,
+    instance_id: DaemonInstanceId,
+) {
+    loop {
+        let request = match clients
+            .get(&client_id)
+            .and_then(|client| client.direct_commands.as_ref())
+            .map(std::sync::mpsc::Receiver::try_recv)
+        {
+            Some(Ok(request)) => request,
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => return,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) | None => {
+                retire_direct_frontend(app, clients, client_id);
+                return;
+            }
+        };
+        let frame = match request {
+            DirectRequest::Frame(frame) => frame,
+            DirectRequest::AttachmentConsumed(transfer_id) => {
+                if let Some(client) = clients.get(&client_id) {
+                    client.sender.cancel_bulk(transfer_id);
+                }
+                continue;
+            }
+            DirectRequest::Detach => {
+                retire_direct_frontend(app, clients, client_id);
+                return;
+            }
+        };
+        if local_rpc::frame::validate_client(&frame).is_err()
+            || frame.request_id().is_some_and(|request_id| {
+                !clients
+                    .get(&client_id)
+                    .is_some_and(|client| client.sender.begin_request(request_id))
+            })
+        {
+            if let Some(client) = clients.get(&client_id) {
+                client.sender.abort();
+            }
+            return;
+        }
+        if let local_rpc::frame::ClientFrame::SelectServer { request_id, label } = &frame
+            && !(app.network.is_some()
+                && app
+                    .config
+                    .server(label)
+                    .ok()
+                    .is_some_and(|server| Some(server.id) == app.room.active_server_id))
+            && rpc_upload_staging_active(clients)
+        {
+            send_rpc_rejection(
+                clients,
+                client_id,
+                *request_id,
+                local_rpc::frame::Operation::SelectServer,
+                409,
+                crate::app::SERVER_SWITCH_TRANSFER_BLOCKED,
+            );
+            continue;
+        }
+        let disconnect = matches!(frame, local_rpc::frame::ClientFrame::Disconnect { .. });
+        handle_rpc_command(app, clients, client_id, frame, instance_id);
+        if disconnect {
+            retire_direct_frontend(app, clients, client_id);
+            return;
+        }
+        broadcast_rpc_snapshots(app, clients, instance_id);
+    }
+}
+
+#[cfg(all(unix, feature = "embedded-client"))]
+fn retire_direct_frontend(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+) {
+    app.retire_client(id);
+    if let Some(mut client) = clients.remove(&id) {
+        let live_streams = client.live_viewers.keys().copied().collect::<Vec<_>>();
+        client.live_viewers.clear();
+        for stream_id in live_streams {
+            app.stop_rpc_live_share(stream_id);
+        }
+        shutdown_rpc(&mut client);
+        kvlog::info!("embedded frontend detached", client_id = id.0);
+    }
+}
+
 /// Whether an event can move any field of [`StateSnapshot`].
 ///
 /// Broadcasting rebuilds a whole snapshot per attached client just to diff it,
@@ -1080,8 +1397,10 @@ fn spawn_rpc_client(
     let control = Arc::new(stream);
     let active_bulk = Arc::new(Mutex::new(HashSet::new()));
     let sender = RpcClientSender {
-        outbound: outbound.clone(),
-        control: control.clone(),
+        sink: Arc::new(UnixFrontendSink {
+            outbound: outbound.clone(),
+            control: control.clone(),
+        }),
         active_bulk: active_bulk.clone(),
         outstanding: Arc::new(Mutex::new(HashSet::new())),
     };
@@ -1154,12 +1473,87 @@ fn spawn_rpc_client(
     }
     Ok(RemoteRpcClient {
         sender,
-        control,
+        control: Some(control),
         events,
         reader_thread: Some(reader_thread),
         writer_thread: Some(writer_thread),
+        #[cfg(feature = "embedded-client")]
+        direct_commands: None,
         next_event_seq: 2,
         uploads,
+        pending_history: None,
+        last_snapshot: retained_snapshot,
+        live_viewers: HashMap::new(),
+        attachment_streams: HashMap::new(),
+        settings_device_generation: 0,
+        next_settings_audio_event_at: Instant::now(),
+        last_settings_audio_runtime: None,
+        appearance_generation: 0,
+        identity_generation: 0,
+    })
+}
+
+#[cfg(all(unix, feature = "embedded-client"))]
+fn spawn_direct_frontend(
+    app: &mut App,
+    id: ClientId,
+    bootstrap: crate::embedded::DirectBootstrap,
+    events: EventSender,
+    instance_id: DaemonInstanceId,
+) -> Result<RemoteRpcClient, String> {
+    let crate::embedded::DirectBootstrap {
+        commands,
+        events: frontend_events,
+        ready: _,
+    } = bootstrap;
+    let sender = RpcClientSender {
+        sink: Arc::new(DirectFrontendSink {
+            events: frontend_events,
+            core_events: events.clone(),
+            client_id: id,
+        }),
+        active_bulk: Arc::new(Mutex::new(HashSet::new())),
+        outstanding: Arc::new(Mutex::new(HashSet::new())),
+    };
+    app.register_rpc_client(id);
+    app.refresh_voice_roster(Instant::now());
+    let snapshot = app.rpc_snapshot(id);
+    let mut limits = NegotiatedLimits::default();
+    limits.upload_bytes = app.config.files.max_upload_bytes();
+    let welcome = Welcome {
+        version: local_rpc::PROTOCOL_MAX_VERSION,
+        instance_id,
+        daemon_build: env!("CARGO_PKG_VERSION").into(),
+        connection: snapshot.connection,
+        active_server: snapshot.active_server.clone(),
+        first_event_seq: 1,
+        limits,
+        commands: crate::app::commands::frontend_command_catalog(),
+    };
+    if let Err(error) = sender.send(&DaemonFrame::Welcome(welcome)) {
+        app.retire_client(id);
+        return Err(error);
+    }
+    let mut retained_snapshot = match sender.send_snapshot(instance_id, 1, snapshot) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            app.retire_client(id);
+            return Err(error);
+        }
+    };
+    if let Some(room) = retained_snapshot.room.as_mut() {
+        room.messages.clear();
+        room.system_messages.clear();
+    }
+    Ok(RemoteRpcClient {
+        sender,
+        control: None,
+        events,
+        reader_thread: None,
+        writer_thread: None,
+        direct_commands: Some(commands),
+        next_event_seq: 2,
+        uploads: Arc::new(Mutex::new(HashMap::new())),
         pending_history: None,
         last_snapshot: retained_snapshot,
         live_viewers: HashMap::new(),
@@ -1364,7 +1758,7 @@ fn broadcast_rpc_snapshots(
     }
     for id in failed {
         if let Some(client) = clients.get(&id) {
-            let _ = client.control.shutdown(std::net::Shutdown::Both);
+            client.sender.abort();
         }
     }
 }
@@ -1398,7 +1792,7 @@ fn broadcast_rpc_voice_roster(
     }
     for id in failed {
         if let Some(client) = clients.get(&id) {
-            let _ = client.control.shutdown(std::net::Shutdown::Both);
+            client.sender.abort();
         }
     }
 }
@@ -1518,7 +1912,7 @@ fn project_rpc_history_change(
     }
     for id in failed {
         if let Some(client) = clients.get(&id) {
-            let _ = client.control.shutdown(std::net::Shutdown::Both);
+            client.sender.abort();
         }
     }
 }
@@ -2868,7 +3262,9 @@ fn shutdown_rpc(client: &mut RemoteRpcClient) {
         }
     }
     client.sender.shutdown();
-    let _ = client.control.shutdown(std::net::Shutdown::Both);
+    if let Some(control) = &client.control {
+        let _ = control.shutdown(std::net::Shutdown::Both);
+    }
     if let Some(thread) = client.reader_thread.take() {
         let _ = thread.join();
     }
@@ -3183,8 +3579,10 @@ mod tests {
         let outbound = Arc::new(super::RpcOutboundQueue::default());
         outbound.state.lock().bytes = vec![0; local_rpc::MAX_QUEUED_BYTES];
         let sender = super::RpcClientSender {
-            outbound,
-            control: Arc::new(UnixStream::pair().unwrap().0),
+            sink: Arc::new(super::UnixFrontendSink {
+                outbound,
+                control: Arc::new(UnixStream::pair().unwrap().0),
+            }),
             active_bulk: Arc::new(Mutex::new(std::collections::HashSet::new())),
             outstanding: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
@@ -3267,8 +3665,10 @@ mod tests {
         let transfer_id = local_rpc::model::BulkTransferId(7);
         let active_bulk = Arc::new(Mutex::new(std::collections::HashSet::from([transfer_id])));
         let sender = super::RpcClientSender {
-            outbound: outbound.clone(),
-            control,
+            sink: Arc::new(super::UnixFrontendSink {
+                outbound: outbound.clone(),
+                control,
+            }),
             active_bulk: active_bulk.clone(),
             outstanding: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
@@ -3434,8 +3834,10 @@ mod tests {
         let transfer_id = local_rpc::model::BulkTransferId(8);
         let active_bulk = Arc::new(Mutex::new(std::collections::HashSet::from([transfer_id])));
         let sender = super::RpcClientSender {
-            outbound: outbound.clone(),
-            control,
+            sink: Arc::new(super::UnixFrontendSink {
+                outbound: outbound.clone(),
+                control,
+            }),
             active_bulk: active_bulk.clone(),
             outstanding: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };

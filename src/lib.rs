@@ -28,6 +28,8 @@ mod config_diagnostics;
 mod device_link;
 mod e2e;
 mod e2e_identity;
+#[cfg(all(feature = "embedded-client", unix))]
+pub mod embedded;
 mod file_compression;
 mod fuzzy;
 mod local_control;

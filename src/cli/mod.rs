@@ -913,7 +913,7 @@ fn run_daemon_app(config_path: Option<&str>) -> Result<(), Box<dyn std::error::E
 /// processes that must agree on this name are separate program runs, possibly
 /// of binaries built by different Rust versions, and `DefaultHasher`'s output
 /// is explicitly not stable across releases.
-fn client_instance_name(config_path: Option<&str>) -> String {
+pub(crate) fn client_instance_name(config_path: Option<&str>) -> String {
     use aws_lc_rs::digest;
 
     let path = match config_path {

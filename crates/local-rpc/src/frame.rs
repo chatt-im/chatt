@@ -837,7 +837,11 @@ fn bounded_decode<T: for<'a> jsony::FromBinary<'a>>(bytes: &[u8]) -> Result<T, S
     jsony::from_binary(bytes).map_err(|error| error.to_string())
 }
 
-fn validate_client(frame: &ClientFrame) -> Result<(), String> {
+/// Validates a renderer request independently of any wire encoding.
+///
+/// Direct frontends must pass through the same limits and identity checks as
+/// values decoded by the Unix transport.
+pub fn validate_client(frame: &ClientFrame) -> Result<(), String> {
     let request_id = frame.request_id();
     if let ClientFrame::UploadChunk(chunk) = frame {
         chunk.validate()?;
@@ -927,7 +931,8 @@ fn validate_client(frame: &ClientFrame) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
+/// Validates a core event independently of any wire encoding.
+pub fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
     match frame {
         DaemonFrame::Snapshot {
             instance_id,
