@@ -10,6 +10,7 @@ use super::{
     identity::{IdentityCommand, IdentityEvent, IdentityResult},
     management::{ManagementCommand, ManagementEvent},
     publishing::{PublishingCommand, PublishingEvent},
+    room_settings::{RoomSettingsCommand, RoomSettingsEvent},
     model::{
         AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
         CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, LiveShareViewStatus,
@@ -199,6 +200,7 @@ pub enum Operation {
     Management,
     Publishing,
     Directory,
+    RoomSettings,
 }
 
 impl Encode for Operation {
@@ -246,6 +248,7 @@ impl Encode for Operation {
             Self::Management => "management",
             Self::Publishing => "publishing",
             Self::Directory => "directory",
+            Self::RoomSettings => "room-settings",
         };
         value.encode_log_value_into(output);
     }
@@ -522,6 +525,10 @@ pub enum ClientFrame {
         request_id: RequestId,
         command: DirectoryCommand,
     },
+    RoomSettings {
+        request_id: RequestId,
+        command: RoomSettingsCommand,
+    },
 }
 
 impl ClientFrame {
@@ -558,7 +565,8 @@ impl ClientFrame {
             | Self::Identity { request_id, .. } => Some(*request_id),
             Self::Management { request_id, .. }
             | Self::Publishing { request_id, .. }
-            | Self::Directory { request_id, .. } => Some(*request_id),
+            | Self::Directory { request_id, .. }
+            | Self::RoomSettings { request_id, .. } => Some(*request_id),
             Self::UploadChunk(_) => None,
         }
     }
@@ -627,6 +635,7 @@ pub enum DaemonFrame {
     Management(ManagementEvent),
     Publishing(PublishingEvent),
     Directory(DirectoryEvent),
+    RoomSettings(RoomSettingsEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -956,6 +965,7 @@ pub fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         ClientFrame::Management { command, .. } => command.validate()?,
         ClientFrame::Publishing { command, .. } => command.validate()?,
         ClientFrame::Directory { command, .. } => command.validate()?,
+        ClientFrame::RoomSettings { command, .. } => command.validate()?,
         _ => {}
     }
     Ok(())
@@ -1100,6 +1110,7 @@ pub fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::Management(event) => event.validate(),
         DaemonFrame::Publishing(event) => event.validate(),
         DaemonFrame::Directory(event) => event.validate(),
+        DaemonFrame::RoomSettings(event) => event.validate(),
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
         | DaemonFrame::LiveShareStatus { .. }

@@ -12,6 +12,7 @@ pub mod frame;
 pub mod identity;
 pub mod management;
 pub mod publishing;
+pub mod room_settings;
 pub mod ids {
     //! Resource identifiers visible to native renderers.
 

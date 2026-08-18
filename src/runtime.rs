@@ -718,6 +718,7 @@ impl RpcClientSender {
             DaemonFrame::Management(event) => event.request_id(),
             DaemonFrame::Publishing(event) => event.request_id,
             DaemonFrame::Directory(event) => event.request_id(),
+            DaemonFrame::RoomSettings(event) => Some(event.request_id()),
             _ => None,
         };
         if let Some(request_id) = request_id {
@@ -751,6 +752,7 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::Management(_) => "management",
         DaemonFrame::Publishing(_) => "publishing",
         DaemonFrame::Directory(_) => "directory",
+        DaemonFrame::RoomSettings(_) => "room_settings",
     }
 }
 
@@ -2328,6 +2330,13 @@ fn handle_rpc_command(
     instance_id: DaemonInstanceId,
 ) {
     match frame {
+        local_rpc::frame::ClientFrame::RoomSettings {
+            request_id,
+            command,
+        } => {
+            handle_room_settings_command(app, clients, id, request_id, command);
+            return;
+        }
         local_rpc::frame::ClientFrame::Directory {
             request_id,
             command,
@@ -2732,6 +2741,52 @@ fn handle_rpc_command(
             handle_rpc_effect(app, client, id, effect, instance_id);
             return;
         }
+    }
+}
+
+#[cfg(unix)]
+fn handle_room_settings_command(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    command: local_rpc::room_settings::RoomSettingsCommand,
+) {
+    use local_rpc::room_settings::RoomSettingsCommand;
+
+    let result = match command {
+        RoomSettingsCommand::Open { room_id } => {
+            app.rpc_open_room_settings(request_id, room_id)
+        }
+        RoomSettingsCommand::Reload { server_id, room_id } => {
+            app.rpc_reload_room_settings(request_id, server_id, room_id)
+        }
+        RoomSettingsCommand::Save {
+            server_id,
+            room_id,
+            expected_revision,
+            values,
+        } => app.rpc_save_room_settings(
+            request_id,
+            server_id,
+            room_id,
+            expected_revision,
+            values,
+        ),
+    };
+    if let Some(client) = clients.get(&id) {
+        match result {
+            Ok(event) => client
+                .sender
+                .send_or_abort(&DaemonFrame::RoomSettings(event)),
+            Err(message) => client.sender.send_or_abort(&DaemonFrame::RequestResult(
+                local_rpc::frame::RequestResult {
+                    request_id,
+                    operation: local_rpc::frame::Operation::RoomSettings,
+                    outcome: local_rpc::frame::RequestOutcome::Rejected { code: 422, message },
+                },
+            )),
+        };
     }
 }
 

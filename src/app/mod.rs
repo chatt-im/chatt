@@ -13,6 +13,7 @@ pub(crate) mod room;
 pub(crate) mod room_settings;
 mod rpc_identity;
 mod rpc_settings;
+mod rpc_room_settings;
 pub(crate) mod server;
 mod server_catalog;
 mod shared;
