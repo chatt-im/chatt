@@ -192,6 +192,11 @@ managed = false
 allow_multiple = true
 info = "Drive the Windows dev machine; subcommands and flags pass through to scripts/win"
 
+[action.make-icon]
+cmd = ["scripts/make-icon", { var = "args" }]
+cli.forward_arguments = true
+info = "Rebuild assets/logo-framed.ico from the SVG; optional arg is the zopflipng iteration count"
+
 [action.test-mls-scenarios]
 cmd = ["cargo", "+nightly", "nextest", "run", "-p", "chatt", "--features", "nightly-test-spans", "--run-ignored", "ignored-only", "mls_live_stateful_scenario_campaign"]
 env.CARGO_TERM_COLOR = "never"

@@ -1,0 +1,63 @@
+#!/bin/sh
+# Build assets/logo-framed.ico from assets/logo-framed.svg.
+#
+# Every entry is stored as a PNG datastream rather than a BMP DIB, which is what
+# ImageMagick's ICO writer would emit below 256x256. That keeps the zopflipng
+# output and drops the file from ~110 KB to a few KB. Windows Vista and later
+# read PNG entries at every size.
+#
+# Usage: devsm make-icon [svg] [iterations]
+#   svg         source, default assets/logo-framed.svg. The .ico is written
+#               beside it under the same stem.
+#   iterations  zopflipng --iterations, default 15, which is where this artwork
+#               stops paying. The 256x256 entry sets the runtime and is already
+#               most of the file; past 15 it costs minutes for a few bytes.
+set -e
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+svg=${1:-$root/assets/logo-framed.svg}
+ico="${svg%.svg}.ico"
+sizes="16 20 24 32 40 48 64 128 256"
+iterations=${2:-15}
+
+for tool in rsvg-convert zopflipng python3; do
+	command -v "$tool" >/dev/null || { echo "make-icon: $tool not found" >&2; exit 1; }
+done
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT INT TERM
+
+for size in $sizes; do
+	rsvg-convert -w "$size" -h "$size" "$svg" -o "$work/raw_$size.png"
+done
+
+# zopflipng also picks the narrowest lossless colour type, which takes these
+# black/white/alpha renders down to a palette.
+for size in $sizes; do
+	zopflipng -y --iterations="$iterations" --filters=01234mepb \
+		"$work/raw_$size.png" "$work/opt_$size.png" >/dev/null &
+done
+wait
+
+python3 - "$ico" "$work" $sizes <<'PY'
+import struct, sys
+
+ico, work, sizes = sys.argv[1], sys.argv[2], [int(a) for a in sys.argv[3:]]
+images = [open(f"{work}/opt_{size}.png", "rb").read() for size in sizes]
+
+# ICONDIR, then one 16-byte ICONDIRENTRY per image, then the payloads.
+offset = 6 + 16 * len(images)
+header = struct.pack("<HHH", 0, 1, len(images))
+for size, data in zip(sizes, images):
+    # 0 means 256 in the single-byte width and height fields.
+    header += struct.pack(
+        "<BBBBHHII", size & 0xFF, size & 0xFF, 0, 0, 1, 32, len(data), offset
+    )
+    offset += len(data)
+
+with open(ico, "wb") as f:
+    f.write(header)
+    for data in images:
+        f.write(data)
+print(f"{ico}: {len(sizes)} entries, {offset} bytes")
+PY

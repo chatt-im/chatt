@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!-- Every axis-aligned edge is a multiple of 4, so the frame, the body and
+       the bowtie's vertical edges all land on whole pixels at 16, 32, 48, 64,
+       128 and 256. 20, 24 and 40 cannot align on this grid and antialias. -->
+
+  <!-- 1. Outer Black Shell (full bleed, tail tip at 8,64) -->
+  <path d="M0 0h64v48H32L8 64V48H0Z" fill="#000000" />
+
+  <!-- 2. White Body + Bowtie Cutouts (Even-Odd Compound Path) -->
+  <!-- The tail's white diagonal runs 30,44 -> 12,56, parallel to the shell's
+       32,48 -> 8,64, so the black border holds one weight to the tip. -->
+  <path fill-rule="evenodd" fill="#FFFFFF" d="
+    M4 4h56v40H30L12 56V44H4Z
+    M16 8L32 24 16 40Z
+    M48 8v32L32 24Z
+  " />
+</svg>
