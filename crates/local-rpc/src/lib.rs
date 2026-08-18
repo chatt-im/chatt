@@ -7,6 +7,7 @@
 pub mod appearance;
 pub mod attachment_stream;
 pub mod bulk;
+pub mod directory;
 pub mod frame;
 pub mod identity;
 pub mod management;
@@ -85,3 +86,4 @@ pub const MAX_MANAGEMENT_DIAGNOSTICS: usize = 32;
 pub const MAX_DEVICES: usize = 256;
 pub const MAX_CAPTURE_ARGS: usize = 64;
 pub const MAX_CAPTURE_COMMAND_BYTES: usize = 64 * 1024;
+pub const MAX_DIRECTORY_USERS: usize = MAX_PARTICIPANTS;

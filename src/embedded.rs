@@ -521,6 +521,7 @@ mod tests {
 
     use local_rpc::{
         bulk::BeginUpload,
+        directory::{DirectoryCommand, DirectoryEvent},
         frame::{ClientFrame, DaemonFrame, Operation, RequestOutcome},
         ids::RoomId,
         management::{ManagementCommand, ManagementEvent},
@@ -614,6 +615,26 @@ mod tests {
                 })) => {
                     assert_eq!(state.phase, PublishingPhase::Idle);
                     assert!(!state.can_start);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        frontend
+            .sender()
+            .send(ClientFrame::Directory {
+                request_id: RequestId(4),
+                command: DirectoryCommand::Open,
+            })
+            .unwrap();
+        loop {
+            match frontend.recv_timeout(Duration::from_secs(2)).unwrap() {
+                FrontendEvent::Frame(DaemonFrame::Directory(DirectoryEvent::Users {
+                    request_id: Some(RequestId(4)),
+                    users,
+                })) => {
+                    assert!(users.is_empty());
                     break;
                 }
                 _ => {}

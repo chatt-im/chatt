@@ -758,6 +758,12 @@ impl App {
                 500,
                 "publishing command bypassed runtime dispatch",
             )),
+            ClientFrame::Directory { request_id, .. } => RpcCommandEffect::Reply(rejected(
+                request_id,
+                Operation::Directory,
+                500,
+                "directory command bypassed runtime dispatch",
+            )),
             ClientFrame::RunCommand { request_id, body } => {
                 let room_id = self.room.selected_room_for(client_id);
                 match self.run_frontend_command_captured(client_id, room_id, body) {

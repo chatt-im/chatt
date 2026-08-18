@@ -2289,6 +2289,10 @@ impl RoomSession {
         self.muted_users.contains(&user_id)
     }
 
+    pub(crate) fn volume_preview(&self) -> Option<(UserId, f32)> {
+        self.volume_preview
+    }
+
     pub(crate) fn history_storage(&self) -> &HistoryStorage {
         &self.history
     }

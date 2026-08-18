@@ -6,6 +6,7 @@ use crate::ids::{FileTransferId, MessageId, RoomId, StreamId};
 use super::{
     appearance::{AppearanceCommand, AppearanceEvent},
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished},
+    directory::{DirectoryCommand, DirectoryEvent},
     identity::{IdentityCommand, IdentityEvent, IdentityResult},
     management::{ManagementCommand, ManagementEvent},
     publishing::{PublishingCommand, PublishingEvent},
@@ -197,6 +198,7 @@ pub enum Operation {
     CloseIdentity,
     Management,
     Publishing,
+    Directory,
 }
 
 impl Encode for Operation {
@@ -243,6 +245,7 @@ impl Encode for Operation {
             Self::CloseIdentity => "close-identity",
             Self::Management => "management",
             Self::Publishing => "publishing",
+            Self::Directory => "directory",
         };
         value.encode_log_value_into(output);
     }
@@ -515,6 +518,10 @@ pub enum ClientFrame {
         request_id: RequestId,
         command: PublishingCommand,
     },
+    Directory {
+        request_id: RequestId,
+        command: DirectoryCommand,
+    },
 }
 
 impl ClientFrame {
@@ -550,7 +557,8 @@ impl ClientFrame {
             | Self::Appearance { request_id, .. }
             | Self::Identity { request_id, .. } => Some(*request_id),
             Self::Management { request_id, .. }
-            | Self::Publishing { request_id, .. } => Some(*request_id),
+            | Self::Publishing { request_id, .. }
+            | Self::Directory { request_id, .. } => Some(*request_id),
             Self::UploadChunk(_) => None,
         }
     }
@@ -618,6 +626,7 @@ pub enum DaemonFrame {
     IdentityEvent(IdentityEvent),
     Management(ManagementEvent),
     Publishing(PublishingEvent),
+    Directory(DirectoryEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -946,6 +955,7 @@ pub fn validate_client(frame: &ClientFrame) -> Result<(), String> {
         ClientFrame::Identity { command, .. } => command.validate()?,
         ClientFrame::Management { command, .. } => command.validate()?,
         ClientFrame::Publishing { command, .. } => command.validate()?,
+        ClientFrame::Directory { command, .. } => command.validate()?,
         _ => {}
     }
     Ok(())
@@ -1089,6 +1099,7 @@ pub fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::IdentityEvent(event) => event.validate(),
         DaemonFrame::Management(event) => event.validate(),
         DaemonFrame::Publishing(event) => event.validate(),
+        DaemonFrame::Directory(event) => event.validate(),
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
         | DaemonFrame::LiveShareStatus { .. }

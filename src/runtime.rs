@@ -717,6 +717,7 @@ impl RpcClientSender {
             DaemonFrame::IdentityResult(result) => Some(result.result.request_id),
             DaemonFrame::Management(event) => event.request_id(),
             DaemonFrame::Publishing(event) => event.request_id,
+            DaemonFrame::Directory(event) => event.request_id(),
             _ => None,
         };
         if let Some(request_id) = request_id {
@@ -749,6 +750,7 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::IdentityEvent(_) => "identity_event",
         DaemonFrame::Management(_) => "management",
         DaemonFrame::Publishing(_) => "publishing",
+        DaemonFrame::Directory(_) => "directory",
     }
 }
 
@@ -2326,6 +2328,13 @@ fn handle_rpc_command(
     instance_id: DaemonInstanceId,
 ) {
     match frame {
+        local_rpc::frame::ClientFrame::Directory {
+            request_id,
+            command,
+        } => {
+            handle_directory_command(app, clients, id, request_id, command);
+            return;
+        }
         local_rpc::frame::ClientFrame::Publishing {
             request_id,
             command,
@@ -2723,6 +2732,91 @@ fn handle_rpc_command(
             handle_rpc_effect(app, client, id, effect, instance_id);
             return;
         }
+    }
+}
+
+#[cfg(unix)]
+fn handle_directory_command(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    command: local_rpc::directory::DirectoryCommand,
+) {
+    use local_rpc::directory::{DirectoryCommand, DirectoryEvent};
+
+    let audio_result = match command {
+        DirectoryCommand::Open => {
+            if let Some(client) = clients.get(&id) {
+                client.sender.send_or_abort(&DaemonFrame::Directory(
+                    DirectoryEvent::Users {
+                        request_id: Some(request_id),
+                        users: app.rpc_directory_users(),
+                    },
+                ));
+            }
+            return;
+        }
+        DirectoryCommand::OpenDm { user_id } => {
+            let result = app.rpc_open_dm(id, user_id);
+            send_directory_result(clients, id, request_id, result);
+            return;
+        }
+        DirectoryCommand::GetParticipantAudio { user_id } => Ok(user_id),
+        DirectoryCommand::SetParticipantMuted { user_id, muted } => app
+            .rpc_set_participant_muted(user_id, muted)
+            .map(|()| user_id),
+        DirectoryCommand::PreviewParticipantGain { user_id, gain_db } => app
+            .rpc_preview_participant_gain(id, user_id, gain_db)
+            .map(|()| user_id),
+        DirectoryCommand::CommitParticipantGain { user_id, gain_db } => app
+            .rpc_commit_participant_gain(id, user_id, gain_db)
+            .map(|()| user_id),
+        DirectoryCommand::CancelParticipantGain { user_id } => app
+            .rpc_cancel_participant_gain(id, user_id)
+            .map(|()| user_id),
+    };
+    let user_id = match audio_result {
+        Ok(user_id) => user_id,
+        Err(error) => {
+            send_directory_result(clients, id, request_id, Err(error));
+            return;
+        }
+    };
+    match app.rpc_participant_audio_state(user_id) {
+        Ok(state) => {
+            if let Some(client) = clients.get(&id) {
+                client.sender.send_or_abort(&DaemonFrame::Directory(
+                    DirectoryEvent::ParticipantAudio {
+                        request_id: Some(request_id),
+                        state,
+                    },
+                ));
+            }
+        }
+        Err(error) => send_directory_result(clients, id, request_id, Err(error)),
+    }
+}
+
+#[cfg(unix)]
+fn send_directory_result(
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    result: Result<(), String>,
+) {
+    if let Some(client) = clients.get(&id) {
+        let outcome = match result {
+            Ok(()) => local_rpc::frame::RequestOutcome::Accepted,
+            Err(message) => local_rpc::frame::RequestOutcome::Rejected { code: 422, message },
+        };
+        client.sender.send_or_abort(&DaemonFrame::RequestResult(
+            local_rpc::frame::RequestResult {
+                request_id,
+                operation: local_rpc::frame::Operation::Directory,
+                outcome,
+            },
+        ));
     }
 }
 

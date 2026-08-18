@@ -408,6 +408,7 @@ pub(crate) struct App {
     voice_roster: frontend::VoiceRosterProjection,
     command_client: crate::client_channel::ClientId,
     device_management_owner: Option<crate::client_channel::ClientId>,
+    participant_audio_owner: Option<crate::client_channel::ClientId>,
     quit_requested: bool,
     /// Advances when configuration mirrored into attached terminal views changes.
     daemon_config_generation: u64,
@@ -1580,6 +1581,7 @@ impl App {
             voice_roster: frontend::VoiceRosterProjection::default(),
             command_client: crate::client_channel::ClientId::PRIMARY,
             device_management_owner: None,
+            participant_audio_owner: None,
             quit_requested: false,
             daemon_config_generation: 0,
             synced_daemon_config_generation: 0,
@@ -5794,6 +5796,159 @@ impl App {
         }
     }
 
+    pub(crate) fn rpc_directory_users(&self) -> Vec<local_rpc::directory::DirectoryUser> {
+        self.room
+            .user_list_rows()
+            .into_iter()
+            .map(|row| {
+                let presence = match row.presence {
+                    room::UserPresence::Online { room } => {
+                        let (voice_room_id, voice_room_name) = match room {
+                            Some((room_id, name)) => (Some(room_id), Some(name)),
+                            None => (None, None),
+                        };
+                        local_rpc::directory::DirectoryPresence::Online {
+                            voice_room_id,
+                            voice_room_name,
+                        }
+                    }
+                    room::UserPresence::AwaySeen { since } => {
+                        local_rpc::directory::DirectoryPresence::AwaySeen {
+                            away_for_ms: since.elapsed().as_millis().min(u128::from(u64::MAX))
+                                as u64,
+                        }
+                    }
+                    room::UserPresence::AwayUnseen => {
+                        local_rpc::directory::DirectoryPresence::AwayUnseen
+                    }
+                };
+                local_rpc::directory::DirectoryUser {
+                    user_id: row.user_id,
+                    name: row.name,
+                    local: row.is_local,
+                    presence,
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn rpc_open_dm(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        user_id: UserId,
+    ) -> Result<(), String> {
+        let previous = std::mem::replace(&mut self.command_client, owner);
+        let result = self.open_dm_with(user_id);
+        self.command_client = previous;
+        result
+    }
+
+    pub(crate) fn rpc_participant_audio_state(
+        &self,
+        user_id: UserId,
+    ) -> Result<local_rpc::directory::ParticipantAudioState, String> {
+        if Some(user_id) == self.user_id {
+            return Err("local participant uses the microphone and output controls".into());
+        }
+        if !self
+            .room
+            .user_list_rows()
+            .iter()
+            .any(|user| user.user_id == user_id)
+        {
+            return Err("participant is no longer in the server directory".into());
+        }
+        Ok(local_rpc::directory::ParticipantAudioState {
+            user_id,
+            muted: self.room.muted_user(user_id),
+            gain_db: self.room.effective_user_volume_db(&self.config, user_id),
+            minimum_gain_db: config::MIN_USER_VOLUME_DB,
+            maximum_gain_db: config::MAX_USER_VOLUME_DB,
+            previewing: self
+                .room
+                .volume_preview()
+                .is_some_and(|(preview_user, _)| preview_user == user_id),
+        })
+    }
+
+    pub(crate) fn rpc_set_participant_muted(
+        &mut self,
+        user_id: UserId,
+        muted: bool,
+    ) -> Result<(), String> {
+        self.rpc_participant_audio_state(user_id)?;
+        if self.room.muted_user(user_id) != muted {
+            self.toggle_user_mute(user_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rpc_preview_participant_gain(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        user_id: UserId,
+        gain_db: f32,
+    ) -> Result<(), String> {
+        self.rpc_participant_audio_state(user_id)?;
+        if self
+            .participant_audio_owner
+            .is_some_and(|current| current != owner)
+        {
+            return Err("participant volume is being edited in another client".into());
+        }
+        let gain_db = config::snap_user_volume_db(gain_db);
+        self.participant_audio_owner = Some(owner);
+        self.room.begin_volume_preview(user_id, gain_db);
+        self.apply_user_audio_control_with_volume(user_id, gain_db);
+        Ok(())
+    }
+
+    pub(crate) fn rpc_commit_participant_gain(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        user_id: UserId,
+        gain_db: f32,
+    ) -> Result<(), String> {
+        self.rpc_participant_audio_state(user_id)?;
+        if self
+            .participant_audio_owner
+            .is_some_and(|current| current != owner)
+        {
+            return Err("participant volume is being edited in another client".into());
+        }
+        let gain_db = config::snap_user_volume_db(gain_db);
+        let server_id = self.room.active_server_id.unwrap_or_default();
+        let original_db = self.config.user_volume_db(server_id, user_id);
+        self.config.set_user_volume_db(server_id, user_id, gain_db);
+        self.apply_user_audio_control_with_volume(user_id, gain_db);
+        if let Err(error) = self.config.save_runtime() {
+            self.config
+                .set_user_volume_db(server_id, user_id, original_db);
+            return Err(error.to_string());
+        }
+        self.room.clear_volume_preview();
+        self.participant_audio_owner = None;
+        Ok(())
+    }
+
+    pub(crate) fn rpc_cancel_participant_gain(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+        user_id: UserId,
+    ) -> Result<(), String> {
+        if self.participant_audio_owner != Some(owner) {
+            return Err("this client does not own the participant volume preview".into());
+        }
+        let gain_db = self.config.user_volume_db(
+            self.room.active_server_id.unwrap_or_default(),
+            user_id,
+        );
+        self.room.clear_volume_preview();
+        self.participant_audio_owner = None;
+        self.apply_user_audio_control_with_volume(user_id, gain_db);
+        Ok(())
+    }
+
     /// Commits one editor submission and answers the submitting editor with a
     /// typed result. Every navigation belongs to that mode; the core's only
     /// side effects here are the durable commit and, on request, a join.
@@ -6088,6 +6243,17 @@ impl App {
         self.rpc_identity.retire(client_id);
         if self.device_management_owner == Some(client_id) {
             self.device_management_owner = None;
+        }
+        if self.participant_audio_owner == Some(client_id) {
+            if let Some((user_id, _)) = self.room.volume_preview() {
+                let gain_db = self.config.user_volume_db(
+                    self.room.active_server_id.unwrap_or_default(),
+                    user_id,
+                );
+                self.room.clear_volume_preview();
+                self.apply_user_audio_control_with_volume(user_id, gain_db);
+            }
+            self.participant_audio_owner = None;
         }
         for clients in self.pending_identity_review.values_mut() {
             clients.retain(|pending| *pending != client_id);
