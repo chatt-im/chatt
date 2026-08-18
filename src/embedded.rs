@@ -526,6 +526,11 @@ pub enum FrontendEvent {
         transport: AttachmentSourceTransport,
         fd: OwnedFd,
     },
+    /// The core retired this frontend session while the core itself remains
+    /// available to its other work.
+    SessionEnded {
+        reason: String,
+    },
     CoreStopped {
         reason: Option<String>,
     },
@@ -880,6 +885,60 @@ mod tests {
                 nonce: 42,
             })
             .unwrap();
+        core.shutdown().unwrap();
+    }
+
+    #[test]
+    fn core_side_frontend_abort_delivers_a_terminal_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.toml");
+        let Startup::NeedsSetup(mut setup) = CoreBuilder::new()
+            .config_path(path)
+            .unwrap()
+            .load()
+            .unwrap()
+        else {
+            panic!("fresh path must require setup");
+        };
+        let defaults = setup.defaults();
+        let (mut core, frontend) = setup.save(defaults).unwrap().start().unwrap();
+        let sender = frontend.sender();
+        assert!(matches!(
+            frontend.recv_timeout(Duration::from_secs(2)).unwrap(),
+            FrontendEvent::Frame(DaemonFrame::Welcome(_))
+        ));
+        assert!(matches!(
+            frontend.recv_timeout(Duration::from_secs(2)).unwrap(),
+            FrontendEvent::Frame(DaemonFrame::Snapshot { event_seq: 1, .. })
+        ));
+
+        // Leave the bounded event queue undrained until replies force the
+        // core-side sink to retire the frontend and close its command side.
+        for nonce in 0..=super::EVENT_QUEUE_ITEMS as u64 {
+            sender
+                .send_background(ClientFrame::Ping {
+                    request_id: RequestId(nonce + 1),
+                    nonce,
+                })
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(25));
+
+        loop {
+            match frontend.recv_timeout(Duration::from_secs(2)).unwrap() {
+                FrontendEvent::SessionEnded { reason } => {
+                    assert!(!reason.is_empty());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(sender
+            .send(ClientFrame::Ping {
+                request_id: RequestId(1000),
+                nonce: 1000,
+            })
+            .is_err());
         core.shutdown().unwrap();
     }
 }

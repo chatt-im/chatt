@@ -423,6 +423,7 @@ trait FrontendSink: Send + Sync {
         descriptor: local_rpc::model::AttachmentDescriptor,
         source: crate::receive_store::Source,
     ) -> Result<(), String>;
+    fn end_session(&self, reason: &str);
     fn shutdown(&self);
     fn abort(&self);
 }
@@ -480,6 +481,8 @@ impl FrontendSink for UnixFrontendSink {
         self.outbound.ready.notify_one();
         Ok(())
     }
+
+    fn end_session(&self, _reason: &str) {}
 
     fn shutdown(&self) {
         let mut state = self.outbound.state.lock();
@@ -595,6 +598,12 @@ impl FrontendSink for DirectFrontendSink {
         })
     }
 
+    fn end_session(&self, reason: &str) {
+        let _ = self.events.send(FrontendEvent::SessionEnded {
+            reason: reason.to_owned(),
+        });
+    }
+
     fn shutdown(&self) {}
 
     fn abort(&self) {
@@ -654,6 +663,10 @@ impl RpcClientSender {
 
     fn shutdown(&self) {
         self.sink.shutdown();
+    }
+
+    fn end_session(&self, reason: &str) {
+        self.sink.end_session(reason);
     }
 
     fn abort(&self) {
@@ -1208,16 +1221,7 @@ fn handle_runtime_event(
         }
         #[cfg(unix)]
         AppEvent::RpcClientExited(id) => {
-            app.retire_client(id);
-            if let Some(mut client) = rpc_clients.remove(&id) {
-                let live_streams = client.live_viewers.keys().copied().collect::<Vec<_>>();
-                client.live_viewers.clear();
-                for stream_id in live_streams {
-                    app.stop_rpc_live_share(stream_id);
-                }
-                shutdown_rpc(&mut client);
-                kvlog::info!("daemon RPC client detached", client_id = id.0);
-            }
+            retire_rpc_frontend(app, rpc_clients, id, "frontend transport stopped");
         }
         #[cfg(unix)]
         AppEvent::AttachmentStreamWorkerExited {
@@ -1466,15 +1470,41 @@ fn retire_direct_frontend(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
 ) {
+    retire_rpc_frontend(app, clients, id, "embedded frontend detached");
+}
+
+#[cfg(unix)]
+fn retire_rpc_frontend(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    reason: &str,
+) {
     app.retire_client(id);
     if let Some(mut client) = clients.remove(&id) {
+        let embedded = {
+            #[cfg(feature = "embedded-client")]
+            {
+                client.direct_commands.take().is_some()
+            }
+            #[cfg(not(feature = "embedded-client"))]
+            {
+                false
+            }
+        };
+        client.sender.end_session(reason);
         let live_streams = client.live_viewers.keys().copied().collect::<Vec<_>>();
         client.live_viewers.clear();
         for stream_id in live_streams {
             app.stop_rpc_live_share(stream_id);
         }
         shutdown_rpc(&mut client);
-        kvlog::info!("embedded frontend detached", client_id = id.0);
+        kvlog::info!(
+            "frontend session detached",
+            client_id = id.0,
+            transport = if embedded { "embedded" } else { "daemon-rpc" },
+            reason
+        );
     }
 }
 
