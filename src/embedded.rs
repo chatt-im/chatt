@@ -8,7 +8,7 @@
 use std::{
     error::Error,
     fmt,
-    fs::File,
+    fs::{self, File},
     os::{
         fd::OwnedFd,
         unix::net::UnixStream,
@@ -67,7 +67,7 @@ impl Default for SetupOptions {
 /// A missing configuration awaiting explicit first-run choices.
 pub struct SetupDraft {
     config: Option<Config>,
-    instance: Option<chatt_platform::instance::InstanceLock>,
+    instance: Option<EmbeddedInstanceLock>,
 }
 
 impl SetupDraft {
@@ -147,13 +147,18 @@ impl CoreBuilder {
 
     pub fn load(self) -> Result<Startup, StartupError> {
         let path = self.config_path.as_deref();
-        let instance = match chatt_platform::instance::claim(&crate::cli::client_instance_name(path))
-            .map_err(|error| StartupError::Config(error.to_string()))?
-        {
-            chatt_platform::instance::Claim::Held(instance) => instance,
-            chatt_platform::instance::Claim::Taken => return Err(StartupError::AlreadyRunning),
+        let loaded = Config::load_for_embedded(path).map_err(StartupError::Config)?;
+        let config_path = match &loaded {
+            AppConfigLoad::Existing(config) | AppConfigLoad::Missing(config) => config
+                .config_path
+                .as_deref()
+                .ok_or_else(|| StartupError::Config("configuration path is unavailable".into()))?,
         };
-        match Config::load_for_embedded(path).map_err(StartupError::Config)? {
+        let instance = EmbeddedInstanceLock::claim(
+            &crate::cli::client_instance_name(path),
+            config_path,
+        )?;
+        match loaded {
             AppConfigLoad::Existing(config) => Ok(Startup::Ready(PreparedCore {
                 config,
                 instance,
@@ -171,7 +176,93 @@ impl CoreBuilder {
 /// A validated configuration which has not started worker threads yet.
 pub struct PreparedCore {
     config: Config,
-    instance: chatt_platform::instance::InstanceLock,
+    instance: EmbeddedInstanceLock,
+}
+
+pub(crate) struct EmbeddedInstanceLock {
+    _platform: chatt_platform::instance::InstanceLock,
+    #[cfg(unix)]
+    _config_file: File,
+}
+
+impl EmbeddedInstanceLock {
+    fn claim(name: &str, config_path: &std::path::Path) -> Result<Self, StartupError> {
+        let platform = match chatt_platform::instance::claim(name)
+            .map_err(|error| StartupError::Config(error.to_string()))?
+        {
+            chatt_platform::instance::Claim::Held(instance) => instance,
+            chatt_platform::instance::Claim::Taken => return Err(StartupError::AlreadyRunning),
+        };
+        #[cfg(unix)]
+        let config_file = claim_config_file(config_path)?;
+        Ok(Self {
+            _platform: platform,
+            #[cfg(unix)]
+            _config_file: config_file,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn claim_config_file(config_path: &std::path::Path) -> Result<File, StartupError> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+
+    let config_path = std::path::absolute(config_path)
+        .map_err(|error| StartupError::Config(error.to_string()))?;
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| StartupError::Config("configuration path has no parent".into()))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        StartupError::Config(format!(
+            "cannot create configuration directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let mut lock_name = config_path.as_os_str().to_os_string();
+    lock_name.push(".instance.lock");
+    let lock_path = PathBuf::from(lock_name);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .map_err(|error| {
+            StartupError::Config(format!(
+                "cannot open instance lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        StartupError::Config(format!(
+            "cannot inspect instance lock {}: {error}",
+            lock_path.display()
+        ))
+    })?;
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(StartupError::Config(format!(
+            "instance lock {} is not a private file owned by uid {uid}",
+            lock_path.display()
+        )));
+    }
+    // SAFETY: flock operates on the live descriptor retained from setup until
+    // the embedded runtime has shut down and released all config-owned state.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(StartupError::AlreadyRunning);
+        }
+        return Err(StartupError::Config(format!(
+            "cannot claim instance lock {}: {error}",
+            lock_path.display()
+        )));
+    }
+    Ok(file)
 }
 
 impl PreparedCore {
@@ -529,7 +620,7 @@ mod tests {
         publishing::{PublishingCommand, PublishingEvent, PublishingPhase},
     };
 
-    use super::{CoreBuilder, FrontendEvent, SetupDownloadMode, Startup};
+    use super::{CoreBuilder, FrontendEvent, SetupDownloadMode, Startup, StartupError};
 
     #[test]
     fn first_run_can_save_and_start_a_typed_frontend() {
@@ -720,6 +811,75 @@ mod tests {
         let prepared = setup.save(defaults).unwrap();
         assert!(path.is_file());
         let (mut core, _) = prepared.start().unwrap();
+        core.shutdown().unwrap();
+    }
+
+    #[test]
+    fn config_claim_is_exclusive_and_core_drop_releases_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.toml");
+        let Startup::NeedsSetup(mut setup) = CoreBuilder::new()
+            .config_path(&path)
+            .unwrap()
+            .load()
+            .unwrap()
+        else {
+            panic!("fresh path must require setup");
+        };
+        assert!(matches!(
+            CoreBuilder::new()
+                .config_path(&path)
+                .unwrap()
+                .load(),
+            Err(StartupError::AlreadyRunning)
+        ));
+
+        let defaults = setup.defaults();
+        let (core, frontend) = setup.save(defaults).unwrap().start().unwrap();
+        drop(frontend);
+        drop(core);
+
+        assert!(matches!(
+            CoreBuilder::new()
+                .config_path(path)
+                .unwrap()
+                .load()
+                .unwrap(),
+            Startup::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn frontend_detachment_does_not_abort_embedded_core() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.toml");
+        let Startup::NeedsSetup(mut setup) = CoreBuilder::new()
+            .config_path(path)
+            .unwrap()
+            .load()
+            .unwrap()
+        else {
+            panic!("fresh path must require setup");
+        };
+        let defaults = setup.defaults();
+        let (mut core, frontend) = setup.save(defaults).unwrap().start().unwrap();
+        let sender = frontend.sender();
+        assert!(matches!(
+            frontend.recv_timeout(Duration::from_secs(2)).unwrap(),
+            FrontendEvent::Frame(DaemonFrame::Welcome(_))
+        ));
+        assert!(matches!(
+            frontend.recv_timeout(Duration::from_secs(2)).unwrap(),
+            FrontendEvent::Frame(DaemonFrame::Snapshot { event_seq: 1, .. })
+        ));
+
+        drop(frontend);
+        sender
+            .send(ClientFrame::Ping {
+                request_id: RequestId(1),
+                nonce: 42,
+            })
+            .unwrap();
         core.shutdown().unwrap();
     }
 }

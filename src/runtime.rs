@@ -798,7 +798,7 @@ enum RuntimeMode {
 pub(crate) fn run_embedded(
     config: Config,
     bootstrap: crate::embedded::DirectBootstrap,
-    instance: chatt_platform::instance::InstanceLock,
+    instance: crate::embedded::EmbeddedInstanceLock,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _instance = instance;
     run_app_inner(config, None, false, RuntimeMode::Embedded(bootstrap))
