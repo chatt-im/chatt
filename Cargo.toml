@@ -60,6 +60,20 @@ zeroize = { version = "1.9", features = ["derive"] }
 # half of `src/local_control.rs`.
 sendfd = "0.4.4"
 
+[target.'cfg(windows)'.dependencies]
+# The Win32 clipboard, used only by `src/clipboard_windows.rs`. Windows has no
+# clipboard helper process to shell out to the way X11 and Wayland do.
+windows-sys = { version = "0.61", features = [
+    # HANDLE/HGLOBAL, and GlobalFree.
+    "Win32_Foundation",
+    # Open/Close/Empty/Get/SetClipboardData, RegisterClipboardFormatW.
+    "Win32_System_DataExchange",
+    # GlobalAlloc/GlobalLock/GlobalUnlock/GlobalSize.
+    "Win32_System_Memory",
+    # The CF_* clipboard format constants.
+    "Win32_System_Ole",
+] }
+
 [features]
 default = ["audio-realtime", "mimalloc-allocator", "embed-web"]
 pipewire = ["cpal/pipewire"]

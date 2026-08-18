@@ -31,6 +31,15 @@
 //! survive (the process is reparented to init, which reaps it when it eventually
 //! exits). Waiting is not an option either — a selection owner never exits on
 //! its own, so it would hang quit.
+//!
+//! ## Windows
+//!
+//! There is no helper to run: the write goes straight to the Win32 clipboard
+//! through [`crate::clipboard_windows`], and the system keeps the text after
+//! this process exits, so none of the ownership machinery above applies. The
+//! primary selection is an X11 concept with no Windows counterpart, so a copy
+//! to it writes nothing there; only its OSC 52 escape is emitted, which is free
+//! and covers a terminal that honors it.
 
 use std::{
     io::{self, Write},
@@ -73,6 +82,13 @@ impl Clipboard {
         let out = osc52_copy(selection, text);
         if let Err(error) = term.write_all(&out) {
             kvlog::warn!("OSC 52 clipboard write failed", selection = ?selection, error = %error);
+        }
+
+        #[cfg(windows)]
+        if matches!(selection, ClipboardSelection::Clipboard) {
+            if let Err(error) = crate::clipboard_windows::set_text(text) {
+                kvlog::warn!("clipboard write failed", error = %error);
+            }
         }
 
         self.reap_owner(selection);

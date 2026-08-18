@@ -21,6 +21,8 @@ mod client_channel;
 mod client_net;
 mod clipboard;
 mod clipboard_paste;
+#[cfg(windows)]
+mod clipboard_windows;
 mod config;
 mod config_diagnostics;
 mod device_link;

@@ -7,13 +7,14 @@
 //!
 //! [`classify`] turns raw clipboard access ([`ClipboardBackend`]) into a
 //! [`PastePayload`]. Real clipboard access shells out to platform helpers
-//! (`wl-paste`, `xclip`, `xsel`, `pbpaste`, `pngpaste`); tests inject a fake
-//! backend to exercise the classification rules without a real clipboard.
+//! (`wl-paste`, `xclip`, `xsel`, `pbpaste`, `pngpaste`), or calls the Win32
+//! clipboard directly on Windows; tests inject a fake backend to exercise the
+//! classification rules without a real clipboard.
 
-use std::{
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-};
+use std::path::{Path, PathBuf};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::process::{Command, Stdio};
 
 /// The result of reading the clipboard for a paste action.
 #[derive(Debug)]
@@ -306,6 +307,7 @@ struct PlatformBackend;
 
 /// Runs `program args`, returning captured stdout when it exits successfully.
 /// A missing program or a non-zero exit yields `None`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_helper(program: &str, args: &[&str]) -> Option<Vec<u8>> {
     let output = Command::new(program)
         .args(args)
@@ -460,7 +462,28 @@ impl ClipboardBackend for PlatformBackend {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows has the clipboard in the API rather than behind a helper process,
+/// so every capability is a call into [`crate::clipboard_windows`].
+#[cfg(windows)]
+impl ClipboardBackend for PlatformBackend {
+    fn text(&self) -> Option<String> {
+        crate::clipboard_windows::text()
+    }
+
+    fn file_uris(&self) -> Vec<PathBuf> {
+        crate::clipboard_windows::file_paths()
+    }
+
+    fn image_mimes(&self) -> Vec<String> {
+        crate::clipboard_windows::image_mimes()
+    }
+
+    fn image_bytes(&self, mime: &str) -> Option<Vec<u8>> {
+        crate::clipboard_windows::image_bytes(mime)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl ClipboardBackend for PlatformBackend {
     fn text(&self) -> Option<String> {
         None
