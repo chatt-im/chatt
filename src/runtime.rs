@@ -207,6 +207,7 @@ struct RemoteRpcClient {
     pending_server_edits:
         HashMap<local_rpc::model::RequestId, local_rpc::management::ServerDraftId>,
     device_link_cancel: Option<Vec<u8>>,
+    last_publishing_state: Option<local_rpc::publishing::PublishingState>,
 }
 
 #[cfg(unix)]
@@ -715,6 +716,7 @@ impl RpcClientSender {
             DaemonFrame::SettingsResult(result) => Some(result.result.request_id),
             DaemonFrame::IdentityResult(result) => Some(result.result.request_id),
             DaemonFrame::Management(event) => event.request_id(),
+            DaemonFrame::Publishing(event) => event.request_id,
             _ => None,
         };
         if let Some(request_id) = request_id {
@@ -746,6 +748,7 @@ fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
         DaemonFrame::IdentityResult(_) => "identity_result",
         DaemonFrame::IdentityEvent(_) => "identity_event",
         DaemonFrame::Management(_) => "management",
+        DaemonFrame::Publishing(_) => "publishing",
     }
 }
 
@@ -965,6 +968,7 @@ fn run_app_inner(
         }
         dirty |= ticked;
         drain_all_management_events(&mut rpc_clients);
+        broadcast_rpc_publishing_events(&app, &mut rpc_clients);
         broadcast_rpc_settings_events(&app, &mut rpc_clients, Instant::now());
         broadcast_rpc_appearance_events(&app, &mut rpc_clients);
         broadcast_rpc_identity_events(&mut app, &mut rpc_clients);
@@ -1623,6 +1627,7 @@ fn spawn_rpc_client(
         next_server_draft: 0,
         pending_server_edits: HashMap::new(),
         device_link_cancel: None,
+        last_publishing_state: None,
     })
 }
 
@@ -1703,6 +1708,7 @@ fn spawn_direct_frontend(
         next_server_draft: 0,
         pending_server_edits: HashMap::new(),
         device_link_cancel: None,
+        last_publishing_state: None,
     })
 }
 
@@ -2320,6 +2326,23 @@ fn handle_rpc_command(
     instance_id: DaemonInstanceId,
 ) {
     match frame {
+        local_rpc::frame::ClientFrame::Publishing {
+            request_id,
+            command,
+        } => {
+            app.handle_rpc_publishing(command);
+            let state = app.rpc_publishing_state();
+            if let Some(client) = clients.get_mut(&id) {
+                client.last_publishing_state = Some(state.clone());
+                client.sender.send_or_abort(&DaemonFrame::Publishing(
+                    local_rpc::publishing::PublishingEvent {
+                        request_id: Some(request_id),
+                        state,
+                    },
+                ));
+            }
+            return;
+        }
         local_rpc::frame::ClientFrame::Management {
             request_id,
             command,
@@ -3203,6 +3226,27 @@ fn management_join_state(
         attempt_id: join.attempt_id,
         server_label: join.server_label,
         phase,
+    }
+}
+
+#[cfg(unix)]
+fn broadcast_rpc_publishing_events(
+    app: &App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+) {
+    let state = app.rpc_publishing_state();
+    for client in clients.values_mut() {
+        if client.last_publishing_state.as_ref() == Some(&state) {
+            continue;
+        }
+        if client.sender.send_or_abort(&DaemonFrame::Publishing(
+            local_rpc::publishing::PublishingEvent {
+                request_id: None,
+                state: state.clone(),
+            },
+        )) {
+            client.last_publishing_state = Some(state.clone());
+        }
     }
 }
 

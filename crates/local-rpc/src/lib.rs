@@ -10,6 +10,7 @@ pub mod bulk;
 pub mod frame;
 pub mod identity;
 pub mod management;
+pub mod publishing;
 pub mod ids {
     //! Resource identifiers visible to native renderers.
 
@@ -82,3 +83,5 @@ pub const MAX_IDENTITY_WORDS: usize = 32;
 pub const MAX_IDENTITY_KEY_GROUPS: usize = 32;
 pub const MAX_MANAGEMENT_DIAGNOSTICS: usize = 32;
 pub const MAX_DEVICES: usize = 256;
+pub const MAX_CAPTURE_ARGS: usize = 64;
+pub const MAX_CAPTURE_COMMAND_BYTES: usize = 64 * 1024;

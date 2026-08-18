@@ -5745,6 +5745,55 @@ impl App {
         self.send_network_command(NetworkCommand::RevokeE2eDevice { device_id }, true);
     }
 
+    pub(crate) fn rpc_publishing_state(&self) -> local_rpc::publishing::PublishingState {
+        let status = &self.room.screencast_status;
+        let phase = match status.phase {
+            ScreencastPhase::Idle => local_rpc::publishing::PublishingPhase::Idle,
+            ScreencastPhase::Off => local_rpc::publishing::PublishingPhase::Off,
+            ScreencastPhase::Starting => local_rpc::publishing::PublishingPhase::Starting,
+            ScreencastPhase::Live => local_rpc::publishing::PublishingPhase::Live,
+            ScreencastPhase::Failed => local_rpc::publishing::PublishingPhase::Failed,
+        };
+        local_rpc::publishing::PublishingState {
+            phase,
+            stream_id: status.stream_id,
+            codec: status.codec.clone(),
+            coded_width: status.coded_width,
+            coded_height: status.coded_height,
+            total_bytes: status.total_bytes,
+            total_frames: status.total_frames,
+            rolling_bytes_per_sec: status.rolling_bytes_per_sec,
+            can_start: self.room.voice_room.is_some()
+                && self.network.is_some()
+                && self.video_transport.is_some(),
+            can_restart: self.cached_screencast_start.is_some(),
+            last_issue: status
+                .last_issue
+                .as_ref()
+                .map(|issue| issue.reason.clone()),
+        }
+    }
+
+    pub(crate) fn handle_rpc_publishing(
+        &mut self,
+        command: local_rpc::publishing::PublishingCommand,
+    ) {
+        match command {
+            local_rpc::publishing::PublishingCommand::Open => {}
+            local_rpc::publishing::PublishingCommand::Start {
+                codec,
+                capture_argv,
+            } => self.handle_screencast_command(local_control::ScreencastCommand::Start {
+                argv: capture_argv,
+                hevc: codec == local_rpc::publishing::PublishCodec::Hevc,
+            }),
+            local_rpc::publishing::PublishingCommand::Stop => {
+                self.handle_screencast_command(local_control::ScreencastCommand::Stop)
+            }
+            local_rpc::publishing::PublishingCommand::Restart => self.restart_cached_screencast(),
+        }
+    }
+
     /// Commits one editor submission and answers the submitting editor with a
     /// typed result. Every navigation belongs to that mode; the core's only
     /// side effects here are the durable commit and, on request, a join.

@@ -525,6 +525,7 @@ mod tests {
         ids::RoomId,
         management::{ManagementCommand, ManagementEvent},
         model::{BulkTransferId, RequestId},
+        publishing::{PublishingCommand, PublishingEvent, PublishingPhase},
     };
 
     use super::{CoreBuilder, FrontendEvent, SetupDownloadMode, Startup};
@@ -592,6 +593,27 @@ mod tests {
                     },
                 )) => {
                     assert!(servers.is_empty());
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        frontend
+            .sender()
+            .send(ClientFrame::Publishing {
+                request_id: RequestId(3),
+                command: PublishingCommand::Open,
+            })
+            .unwrap();
+        loop {
+            match frontend.recv_timeout(Duration::from_secs(2)).unwrap() {
+                FrontendEvent::Frame(DaemonFrame::Publishing(PublishingEvent {
+                    request_id: Some(RequestId(3)),
+                    state,
+                })) => {
+                    assert_eq!(state.phase, PublishingPhase::Idle);
+                    assert!(!state.can_start);
                     break;
                 }
                 _ => {}
