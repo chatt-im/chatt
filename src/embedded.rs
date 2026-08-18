@@ -66,13 +66,13 @@ impl Default for SetupOptions {
 
 /// A missing configuration awaiting explicit first-run choices.
 pub struct SetupDraft {
-    config: Config,
-    instance: chatt_platform::instance::InstanceLock,
+    config: Option<Config>,
+    instance: Option<chatt_platform::instance::InstanceLock>,
 }
 
 impl SetupDraft {
     pub fn config_path(&self) -> Option<&std::path::Path> {
-        self.config.config_path.as_deref()
+        self.config.as_ref()?.config_path.as_deref()
     }
 
     pub fn defaults(&self) -> SetupOptions {
@@ -80,28 +80,40 @@ impl SetupDraft {
     }
 
     /// Validates and atomically persists the first-run choices.
-    pub fn save(mut self, options: SetupOptions) -> Result<PreparedCore, StartupError> {
+    pub fn save(&mut self, options: SetupOptions) -> Result<PreparedCore, StartupError> {
         if let Some(reason) = crate::settings::download_path_error(
             options.download_mode == SetupDownloadMode::Persistent,
             &options.download_path,
         ) {
             return Err(StartupError::Setup(reason));
         }
-        self.config.p2p.enabled = options.p2p_enabled;
-        self.config.files.download = match options.download_mode {
+        let config = self
+            .config
+            .as_mut()
+            .ok_or_else(|| StartupError::Setup("first-run setup was already completed".into()))?;
+        config.p2p.enabled = options.p2p_enabled;
+        config.files.download = match options.download_mode {
             SetupDownloadMode::Off => crate::config::DownloadMode::Off,
             SetupDownloadMode::Memory => crate::config::DownloadMode::Memory,
             SetupDownloadMode::Persistent => crate::config::DownloadMode::Persistent,
         };
         if options.download_mode == SetupDownloadMode::Persistent {
-            self.config.files.download_dir = options.download_path.trim().to_owned();
+            config.files.download_dir = options.download_path.trim().to_owned();
         }
-        self.config.history.enabled = options.history_enabled;
-        let path = self.config.save_runtime().map_err(StartupError::Setup)?;
-        self.config.config_path = Some(path);
+        config.history.enabled = options.history_enabled;
+        let path = config.save_runtime().map_err(StartupError::Setup)?;
+        config.config_path = Some(path);
+        let instance = self
+            .instance
+            .take()
+            .ok_or_else(|| StartupError::Setup("first-run setup was already completed".into()))?;
+        let config = self
+            .config
+            .take()
+            .ok_or_else(|| StartupError::Setup("first-run setup was already completed".into()))?;
         Ok(PreparedCore {
-            config: self.config,
-            instance: self.instance,
+            config,
+            instance,
         })
     }
 }
@@ -147,7 +159,10 @@ impl CoreBuilder {
                 instance,
             })),
             AppConfigLoad::Missing(config) => {
-                Ok(Startup::NeedsSetup(SetupDraft { config, instance }))
+                Ok(Startup::NeedsSetup(SetupDraft {
+                    config: Some(config),
+                    instance: Some(instance),
+                }))
             }
         }
     }
@@ -448,7 +463,7 @@ mod tests {
         model::RequestId,
     };
 
-    use super::{CoreBuilder, FrontendEvent, Startup};
+    use super::{CoreBuilder, FrontendEvent, SetupDownloadMode, Startup};
 
     #[test]
     fn first_run_can_save_and_start_a_typed_frontend() {
@@ -459,11 +474,14 @@ mod tests {
             .unwrap()
             .load()
             .unwrap();
-        let Startup::NeedsSetup(setup) = startup else {
+        let Startup::NeedsSetup(mut setup) = startup else {
             panic!("fresh path must require setup");
         };
         assert_eq!(setup.config_path(), Some(path.as_path()));
         let defaults = setup.defaults();
+        assert!(!defaults.p2p_enabled);
+        assert_eq!(defaults.download_mode, SetupDownloadMode::Memory);
+        assert!(!defaults.history_enabled);
         let prepared = setup.save(defaults).unwrap();
         assert!(path.is_file());
 
@@ -500,7 +518,7 @@ mod tests {
     fn direct_requests_use_wire_independent_validation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("client.toml");
-        let Startup::NeedsSetup(setup) = CoreBuilder::new()
+        let Startup::NeedsSetup(mut setup) = CoreBuilder::new()
             .config_path(path)
             .unwrap()
             .load()
@@ -519,6 +537,31 @@ mod tests {
                 })
                 .is_err()
         );
+        core.shutdown().unwrap();
+    }
+
+    #[test]
+    fn rejected_first_run_choices_can_be_corrected_without_losing_the_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.toml");
+        let Startup::NeedsSetup(mut setup) = CoreBuilder::new()
+            .config_path(&path)
+            .unwrap()
+            .load()
+            .unwrap()
+        else {
+            panic!("fresh path must require setup");
+        };
+        let mut invalid = setup.defaults();
+        invalid.download_mode = SetupDownloadMode::Persistent;
+        invalid.download_path.clear();
+        assert!(setup.save(invalid).is_err());
+        assert!(!path.exists());
+
+        let defaults = setup.defaults();
+        let prepared = setup.save(defaults).unwrap();
+        assert!(path.is_file());
+        let (mut core, _) = prepared.start().unwrap();
         core.shutdown().unwrap();
     }
 }
