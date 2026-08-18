@@ -7,6 +7,7 @@
 pub mod appearance;
 pub mod attachment_stream;
 pub mod bulk;
+pub mod bulk_delete;
 pub mod directory;
 pub mod frame;
 pub mod identity;

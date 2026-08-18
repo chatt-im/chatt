@@ -6,6 +6,7 @@ use crate::ids::{FileTransferId, MessageId, RoomId, StreamId};
 use super::{
     appearance::{AppearanceCommand, AppearanceEvent},
     bulk::{BeginAttachmentRead, BeginUpload, BulkChunk, BulkFinished},
+    bulk_delete::BulkDeleteResult,
     directory::{DirectoryCommand, DirectoryEvent},
     identity::{IdentityCommand, IdentityEvent, IdentityResult},
     management::{ManagementCommand, ManagementEvent},
@@ -165,6 +166,7 @@ pub enum Operation {
     SendMessage,
     EditMessage,
     DeleteMessage,
+    BulkDeleteMessages,
     BeginUpload,
     FinishUpload,
     CancelUpload,
@@ -213,6 +215,7 @@ impl Encode for Operation {
             Self::SendMessage => "send-message",
             Self::EditMessage => "edit-message",
             Self::DeleteMessage => "delete-message",
+            Self::BulkDeleteMessages => "bulk-delete-messages",
             Self::BeginUpload => "begin-upload",
             Self::FinishUpload => "finish-upload",
             Self::CancelUpload => "cancel-upload",
@@ -428,6 +431,11 @@ pub enum ClientFrame {
         room_id: RoomId,
         target: MessageId,
     },
+    BulkDeleteMessages {
+        request_id: RequestId,
+        room_id: RoomId,
+        targets: Vec<MessageId>,
+    },
     BeginUpload {
         request_id: RequestId,
         upload: BeginUpload,
@@ -542,6 +550,7 @@ impl ClientFrame {
             | Self::SendMessage { request_id, .. }
             | Self::EditMessage { request_id, .. }
             | Self::DeleteMessage { request_id, .. }
+            | Self::BulkDeleteMessages { request_id, .. }
             | Self::BeginUpload { request_id, .. }
             | Self::FinishUpload { request_id, .. }
             | Self::CancelUpload { request_id, .. }
@@ -636,6 +645,7 @@ pub enum DaemonFrame {
     Publishing(PublishingEvent),
     Directory(DirectoryEvent),
     RoomSettings(RoomSettingsEvent),
+    BulkDeleteResult(BulkDeleteResult),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Jsony)]
@@ -908,6 +918,16 @@ pub fn validate_client(frame: &ClientFrame) -> Result<(), String> {
                 return Err("command body must be a single line".into());
             }
         }
+        ClientFrame::BulkDeleteMessages { targets, .. } => {
+            if targets.is_empty() || targets.len() > super::MAX_MESSAGES {
+                return Err("bulk delete target collection is invalid".into());
+            }
+            if targets.iter().any(|target| target.0 == 0)
+                || targets.windows(2).any(|ids| ids[0] >= ids[1])
+            {
+                return Err("bulk delete targets must be nonzero and strictly ordered".into());
+            }
+        }
         ClientFrame::SetOutputVolume { volume, .. } if !volume.is_finite() => {
             return Err("output volume must be finite".into());
         }
@@ -1111,6 +1131,7 @@ pub fn validate_daemon(frame: &DaemonFrame) -> Result<(), String> {
         DaemonFrame::Publishing(event) => event.validate(),
         DaemonFrame::Directory(event) => event.validate(),
         DaemonFrame::RoomSettings(event) => event.validate(),
+        DaemonFrame::BulkDeleteResult(result) => result.validate(),
         DaemonFrame::Pong { .. }
         | DaemonFrame::LiveShareOpened { .. }
         | DaemonFrame::LiveShareStatus { .. }

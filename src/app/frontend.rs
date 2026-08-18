@@ -770,6 +770,12 @@ impl App {
                 500,
                 "room settings command bypassed runtime dispatch",
             )),
+            ClientFrame::BulkDeleteMessages { request_id, .. } => RpcCommandEffect::Reply(rejected(
+                request_id,
+                Operation::BulkDeleteMessages,
+                500,
+                "bulk delete command bypassed runtime dispatch",
+            )),
             ClientFrame::RunCommand { request_id, body } => {
                 let room_id = self.room.selected_room_for(client_id);
                 match self.run_frontend_command_captured(client_id, room_id, body) {
@@ -1246,6 +1252,54 @@ impl App {
         self.room
             .resident_message(room_id, target)
             .is_some_and(|message| Some(message.sender) == self.user_id)
+    }
+
+    pub(crate) fn rpc_bulk_delete_messages(
+        &mut self,
+        client_id: ClientId,
+        request_id: RequestId,
+        room_id: RoomId,
+        targets: Vec<rpc::ids::MessageId>,
+    ) -> Result<local_rpc::bulk_delete::BulkDeleteResult, String> {
+        use local_rpc::bulk_delete::{DeleteSkipReason, SkippedMessage};
+
+        if self.room.room_meta(room_id).is_none() {
+            return Err("room is not available".into());
+        }
+        if self.network.is_none() {
+            return Err("not connected".into());
+        }
+        let mut accepted = Vec::new();
+        let mut skipped = Vec::new();
+        for message_id in targets {
+            match self.room.resident_message(room_id, message_id) {
+                None => skipped.push(SkippedMessage {
+                    message_id,
+                    reason: DeleteSkipReason::NotFound,
+                }),
+                Some(message) if Some(message.sender) != self.user_id => {
+                    skipped.push(SkippedMessage {
+                        message_id,
+                        reason: DeleteSkipReason::NotLocal,
+                    })
+                }
+                Some(_) => accepted.push(message_id),
+            }
+        }
+        if !accepted.is_empty() {
+            let previous = std::mem::replace(&mut self.command_client, client_id);
+            let queued = self.delete_chat_messages(room_id, accepted.clone());
+            self.command_client = previous;
+            if !queued {
+                return Err("message deletions could not be queued".into());
+            }
+        }
+        Ok(local_rpc::bulk_delete::BulkDeleteResult {
+            request_id,
+            room_id,
+            accepted,
+            skipped,
+        })
     }
 
     fn rpc_attachment_descriptor(

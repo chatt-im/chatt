@@ -13443,6 +13443,66 @@ mod tests {
     }
 
     #[test]
+    fn rpc_bulk_delete_accepts_only_resident_locally_authored_messages() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        app.user_id = Some(UserId(1));
+        enter_test_room(&mut app);
+        for (id, sender) in [(1, UserId(1)), (2, UserId(2))] {
+            app.room.chat_received(
+                rpc::control::ChatMessage {
+                    message_id: MessageId(id),
+                    room_id: RoomId(1),
+                    sender,
+                    sender_name: format!("user{}", sender.0),
+                    timestamp_ms: id * 1_000,
+                    body: format!("message {id}"),
+                    file_transfer_id: None,
+                    flags: rpc::control::MessageFlags::default(),
+                    target: None,
+                },
+                Some(UserId(1)),
+            );
+        }
+
+        let result = app
+            .rpc_bulk_delete_messages(
+                crate::client_channel::ClientId::PRIMARY,
+                local_rpc::model::RequestId(7),
+                RoomId(1),
+                vec![MessageId(1), MessageId(2), MessageId(3)],
+            )
+            .unwrap();
+        assert_eq!(result.accepted, vec![MessageId(1)]);
+        assert_eq!(
+            result
+                .skipped
+                .iter()
+                .map(|row| (row.message_id, row.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    MessageId(2),
+                    local_rpc::bulk_delete::DeleteSkipReason::NotLocal,
+                ),
+                (
+                    MessageId(3),
+                    local_rpc::bulk_delete::DeleteSkipReason::NotFound,
+                ),
+            ]
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::DeleteChat {
+                room_id: RoomId(1),
+                target: MessageId(1),
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn writable_web_mutations_route_through_current_room_validation() {
         let mut app = test_app();
         let (tx, rx) = mpsc::channel();
