@@ -266,6 +266,13 @@ impl FrontendCommandSender {
         self.enqueue(DirectRequest::Frame(frame))
     }
 
+    /// Sends from a background transfer worker, waiting for bounded command
+    /// capacity. GPUI callbacks should use [`Self::send`] instead.
+    pub fn send_background(&self, frame: ClientFrame) -> Result<(), FrontendSendError> {
+        local_rpc::frame::validate_client(&frame).map_err(FrontendSendError::Invalid)?;
+        self.enqueue_background(DirectRequest::Frame(frame))
+    }
+
     pub fn disconnect(&self) -> Result<(), FrontendSendError> {
         self.enqueue(DirectRequest::Detach)
     }
@@ -276,7 +283,7 @@ impl FrontendCommandSender {
         &self,
         transfer_id: BulkTransferId,
     ) -> Result<(), FrontendSendError> {
-        self.enqueue(DirectRequest::AttachmentConsumed(transfer_id))
+        self.enqueue_background(DirectRequest::AttachmentConsumed(transfer_id))
     }
 
     fn enqueue(&self, request: DirectRequest) -> Result<(), FrontendSendError> {
@@ -284,6 +291,15 @@ impl FrontendCommandSender {
             TrySendError::Full(_) => FrontendSendError::Full,
             TrySendError::Disconnected(_) => FrontendSendError::Stopped,
         })?;
+        self.wake
+            .send(AppEvent::EmbeddedFrontendWake(self.client_id))
+            .map_err(|_| FrontendSendError::Stopped)
+    }
+
+    fn enqueue_background(&self, request: DirectRequest) -> Result<(), FrontendSendError> {
+        self.commands
+            .send(request)
+            .map_err(|_| FrontendSendError::Stopped)?;
         self.wake
             .send(AppEvent::EmbeddedFrontendWake(self.client_id))
             .map_err(|_| FrontendSendError::Stopped)
