@@ -76,6 +76,11 @@ windows-sys = { version = "0.61", features = [
 
 [features]
 default = ["audio-realtime", "mimalloc-allocator", "embed-web"]
+# Production capabilities used when Chatt is linked into another frontend.
+# The embedding executable owns process-global facilities such as the allocator,
+# logger, panic hook, and signal handling, so this feature deliberately does not
+# enable either allocator feature.
+embedded-client = ["audio-realtime", "embed-web"]
 pipewire = ["cpal/pipewire"]
 audio-realtime = ["cpal/realtime"]
 audio-realtime-dbus = ["audio-realtime", "cpal/realtime-dbus"]
