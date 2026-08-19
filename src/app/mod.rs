@@ -5925,6 +5925,9 @@ impl App {
         if let Err(error) = self.config.save_runtime() {
             self.config
                 .set_user_volume_db(server_id, user_id, original_db);
+            self.room.clear_volume_preview();
+            self.participant_audio_owner = None;
+            self.apply_user_audio_control_with_volume(user_id, original_db);
             return Err(error.to_string());
         }
         self.room.clear_volume_preview();
@@ -5937,8 +5940,18 @@ impl App {
         owner: crate::client_channel::ClientId,
         user_id: UserId,
     ) -> Result<(), String> {
-        if self.participant_audio_owner != Some(owner) {
+        let Some(current_owner) = self.participant_audio_owner else {
+            return Ok(());
+        };
+        if current_owner != owner {
             return Err("this client does not own the participant volume preview".into());
+        }
+        let Some((preview_user_id, _)) = self.room.volume_preview() else {
+            self.participant_audio_owner = None;
+            return Ok(());
+        };
+        if preview_user_id != user_id {
+            return Ok(());
         }
         let gain_db = self.config.user_volume_db(
             self.room.active_server_id.unwrap_or_default(),
@@ -9942,6 +9955,20 @@ mod tests {
 
     fn test_app() -> TestApp {
         TestApp::new(Config::default(), None).expect("test app")
+    }
+
+    #[test]
+    fn canceling_an_absent_participant_gain_preview_is_idempotent() {
+        let mut app = test_app();
+
+        assert!(app
+            .rpc_cancel_participant_gain(
+                crate::client_channel::ClientId(7),
+                rpc::ids::UserId(9),
+            )
+            .is_ok());
+        assert!(app.participant_audio_owner.is_none());
+        assert!(app.room.volume_preview().is_none());
     }
 
     #[test]
