@@ -1868,7 +1868,7 @@ impl App {
                 self.request_older_history(room_id);
             }
             CoreCommand::OpenDm(user_id) => {
-                if let Err(error) = self.open_dm_with(user_id) {
+                if let Err(error) = self.open_dm_with(user_id, self.command_client) {
                     self.set_error(error);
                 }
             }
@@ -5821,10 +5821,7 @@ impl App {
         owner: crate::client_channel::ClientId,
         user_id: UserId,
     ) -> Result<(), String> {
-        let previous = std::mem::replace(&mut self.command_client, owner);
-        let result = self.open_dm_with(user_id);
-        self.command_client = previous;
-        result
+        self.open_dm_with(user_id, owner)
     }
 
     pub(crate) fn rpc_participant_audio_state(
@@ -8038,7 +8035,7 @@ impl App {
             self.set_error(format!("no user named {name}"));
             return;
         };
-        if let Err(error) = self.open_dm_with(user_id) {
+        if let Err(error) = self.open_dm_with(user_id, self.command_client) {
             self.set_error(error);
         }
     }
@@ -8256,7 +8253,7 @@ impl App {
         client: crate::client_channel::ClientId,
     ) -> Result<(), String> {
         if self.room.dm_room_for_peer(user_id).is_none() {
-            self.open_dm_with(user_id)?;
+            self.open_dm_with(user_id, client)?;
         } else {
             self.send_network_command(NetworkCommand::ReviewPeerIdentity { user_id }, true);
         }
@@ -8269,7 +8266,11 @@ impl App {
 
     /// Asks the server for the DM room with `user_id`; the view switches when
     /// `DmOpened` arrives.
-    pub(crate) fn open_dm_with(&mut self, user_id: UserId) -> Result<(), String> {
+    pub(crate) fn open_dm_with(
+        &mut self,
+        user_id: UserId,
+        owner: crate::client_channel::ClientId,
+    ) -> Result<(), String> {
         if self.network.is_none() {
             return Err("select a server before opening dms".into());
         }
@@ -8282,7 +8283,7 @@ impl App {
             self.pending_dm_clients
                 .entry(user_id)
                 .or_default()
-                .push_back(self.command_client);
+                .push_back(owner);
         }
         self.set_status(format!(
             "opening dm with {}",
@@ -11579,6 +11580,29 @@ mod tests {
         let view = view.lock();
         assert_eq!(view.viewed_room, Some(dm_id));
         assert_eq!(view.status.text(), "dm with bob");
+    }
+
+    #[test]
+    fn rpc_dm_open_records_the_explicit_owner_without_mutating_command_context() {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(tx));
+        let owner = crate::client_channel::ClientId(7);
+        let command_client = app.command_client;
+
+        app.rpc_open_dm(owner, UserId(2)).unwrap();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NetworkCommand::OpenDm(UserId(2)))
+        ));
+        assert_eq!(app.command_client, command_client);
+        assert_eq!(
+            app.pending_dm_clients
+                .get(&UserId(2))
+                .and_then(|clients| clients.front()),
+            Some(&owner)
+        );
     }
 
     #[test]
