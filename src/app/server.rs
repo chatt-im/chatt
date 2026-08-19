@@ -308,6 +308,15 @@ impl ServerEditDraft {
         {
             return Err("server draft no longer names the same entry".into());
         }
+        // `can_allow_plaintext` is advice the core sent out, not a permission a
+        // frontend may hand back. Downgrading needs the consent this entry has
+        // not recorded, so the stored draft decides.
+        if self.require_transport_encryption
+            && !document.require_transport_encryption
+            && !self.show_transport_encryption_setting
+        {
+            return Err("this server requires encrypted transport".into());
+        }
         self.label = document.label.clone();
         self.username = document.username.clone();
         self.tcp_addr = document.tcp_addr.clone();
@@ -1229,6 +1238,42 @@ mod tests {
         let plaintext = ServerEditDraft::from_server(&server, &config);
         assert!(plaintext.show_transport_encryption_setting);
         assert_eq!(plaintext.form_height(), 22);
+    }
+
+    #[test]
+    fn a_frontend_cannot_downgrade_a_server_that_requires_encryption() {
+        let config = Config::default();
+        let mut draft = ServerEditDraft::from_server(&ServerEntry::default(), &config);
+        let draft_id = local_rpc::management::ServerDraftId(1);
+        let mut document = draft.management_document(draft_id);
+        assert!(document.require_transport_encryption);
+        assert!(!document.can_allow_plaintext);
+
+        document.require_transport_encryption = false;
+        document.can_allow_plaintext = true;
+        assert_eq!(
+            draft.apply_management_document(&document),
+            Err("this server requires encrypted transport".into())
+        );
+        assert!(draft.require_transport_encryption);
+    }
+
+    #[test]
+    fn a_consented_plaintext_server_still_accepts_both_settings() {
+        let config = Config::default();
+        let mut server = ServerEntry::default();
+        server.require_transport_encryption = false;
+        let mut draft = ServerEditDraft::from_server(&server, &config);
+        let draft_id = local_rpc::management::ServerDraftId(1);
+        let mut document = draft.management_document(draft_id);
+
+        document.require_transport_encryption = true;
+        assert!(draft.apply_management_document(&document).is_ok());
+        assert!(draft.require_transport_encryption);
+
+        document.require_transport_encryption = false;
+        assert!(draft.apply_management_document(&document).is_ok());
+        assert!(!draft.require_transport_encryption);
     }
 
     #[test]

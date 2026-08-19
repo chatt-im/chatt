@@ -295,6 +295,8 @@ impl SettingsChange {
 #[jsony(Binary, version)]
 pub enum SettingsCommand {
     Open,
+    /// Reads audio device health without taking the exclusive settings lease.
+    ReadAudioHealth,
     SetAudioPreviewActive {
         session_id: SettingsSessionId,
         active: bool,
@@ -328,6 +330,7 @@ impl SettingsCommand {
     pub fn operation(&self) -> Operation {
         match self {
             Self::Open => Operation::OpenSettings,
+            Self::ReadAudioHealth => Operation::ReadAudioHealth,
             Self::SetAudioPreviewActive { .. } => Operation::SetAudioPreviewActive,
             Self::PreviewAudio { .. } => Operation::PreviewAudioSettings,
             Self::RefreshChoices { .. } => Operation::RefreshSettingsChoices,
@@ -339,7 +342,7 @@ impl SettingsCommand {
 
     pub fn validate(&self) -> Result<(), String> {
         let (session_id, changes) = match self {
-            Self::Open => return Ok(()),
+            Self::Open | Self::ReadAudioHealth => return Ok(()),
             Self::SetAudioPreviewActive { session_id, .. }
             | Self::Reload { session_id }
             | Self::Close { session_id } => (*session_id, &[][..]),
@@ -393,6 +396,7 @@ impl SettingsCommand {
 pub enum SettingsResultPayload {
     None,
     Document(SettingsDocument),
+    AudioHealth(AudioRuntimeState),
     PreviewApplied {
         session_id: SettingsSessionId,
         runtime: AudioRuntimeState,
@@ -437,6 +441,7 @@ impl SettingsResult {
         if !matches!(
             self.result.operation,
             Operation::OpenSettings
+                | Operation::ReadAudioHealth
                 | Operation::SetAudioPreviewActive
                 | Operation::PreviewAudioSettings
                 | Operation::RefreshSettingsChoices
@@ -458,6 +463,7 @@ impl SettingsResult {
                 validate_session_id(*session_id)?;
                 runtime.validate()?;
             }
+            SettingsResultPayload::AudioHealth(runtime) => runtime.validate()?,
             SettingsResultPayload::Conflict { latest } => latest.validate()?,
             SettingsResultPayload::Closed { session_id } => validate_session_id(*session_id)?,
             SettingsResultPayload::None => {}

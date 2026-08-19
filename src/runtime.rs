@@ -521,7 +521,7 @@ impl FrontendSink for UnixFrontendSink {
 
 #[cfg(all(unix, feature = "embedded-client"))]
 struct DirectFrontendSink {
-    events: std::sync::mpsc::SyncSender<FrontendEvent>,
+    events: crate::embedded::EventQueue,
     core_events: EventSender,
     client_id: ClientId,
 }
@@ -529,11 +529,11 @@ struct DirectFrontendSink {
 #[cfg(all(unix, feature = "embedded-client"))]
 impl DirectFrontendSink {
     fn try_send(&self, event: FrontendEvent) -> Result<(), SinkError> {
-        self.events.try_send(event).map_err(|error| match error {
-            std::sync::mpsc::TrySendError::Full(_) => {
+        self.events.send(event).map_err(|error| match error {
+            crate::embedded::EventQueueError::Full => {
                 SinkError::Overflow("embedded frontend event queue is full".into())
             }
-            std::sync::mpsc::TrySendError::Disconnected(_) => {
+            crate::embedded::EventQueueError::Closed => {
                 SinkError::Closed("embedded frontend detached".into())
             }
         })
@@ -622,8 +622,11 @@ impl FrontendSink for DirectFrontendSink {
         .map_err(|error| error.to_string())
     }
 
+    // Retirement is triggered by this very queue overflowing, so this uses the
+    // reserved terminal capacity: waiting for an ordinary slot would deadlock
+    // the core against a host that has stopped draining.
     fn end_session(&self, reason: &str) {
-        let _ = self.events.send(FrontendEvent::SessionEnded {
+        self.events.send_terminal(FrontendEvent::SessionEnded {
             reason: reason.to_owned(),
         });
     }
@@ -2991,7 +2994,7 @@ fn handle_directory_command(
 ) {
     use local_rpc::directory::{DirectoryCommand, DirectoryEvent};
 
-    let audio_result = match command {
+    let (user_id, audio_result) = match command {
         DirectoryCommand::Open => {
             if let Some(client) = clients.get(&id) {
                 client
@@ -3008,27 +3011,40 @@ fn handle_directory_command(
             send_directory_result(clients, id, request_id, result);
             return;
         }
-        DirectoryCommand::GetParticipantAudio { user_id } => Ok(user_id),
-        DirectoryCommand::SetParticipantMuted { user_id, muted } => app
-            .rpc_set_participant_muted(user_id, muted)
-            .map(|()| user_id),
-        DirectoryCommand::PreviewParticipantGain { user_id, gain_db } => app
-            .rpc_preview_participant_gain(id, user_id, gain_db)
-            .map(|()| user_id),
-        DirectoryCommand::CommitParticipantGain { user_id, gain_db } => app
-            .rpc_commit_participant_gain(id, user_id, gain_db)
-            .map(|()| user_id),
-        DirectoryCommand::CancelParticipantGain { user_id } => app
-            .rpc_cancel_participant_gain(id, user_id)
-            .map(|()| user_id),
-    };
-    let user_id = match audio_result {
-        Ok(user_id) => user_id,
-        Err(error) => {
-            send_directory_result(clients, id, request_id, Err(error));
-            return;
+        DirectoryCommand::GetParticipantAudio { user_id } => (user_id, Ok(())),
+        DirectoryCommand::SetParticipantMuted { user_id, muted } => {
+            (user_id, app.rpc_set_participant_muted(user_id, muted))
+        }
+        DirectoryCommand::PreviewParticipantGain { user_id, gain_db } => (
+            user_id,
+            app.rpc_preview_participant_gain(id, user_id, gain_db),
+        ),
+        DirectoryCommand::CommitParticipantGain { user_id, gain_db } => (
+            user_id,
+            app.rpc_commit_participant_gain(id, user_id, gain_db),
+        ),
+        DirectoryCommand::CancelParticipantGain { user_id } => {
+            (user_id, app.rpc_cancel_participant_gain(id, user_id))
         }
     };
+    // A refused mutation has already been rolled back here, so the frontend is
+    // handed the state it must converge on rather than a bare rejection it
+    // would have to guess the meaning of. It is unsolicited because the request
+    // it answers did not succeed.
+    if let Err(error) = audio_result {
+        if let Ok(state) = app.rpc_participant_audio_state(user_id)
+            && let Some(client) = clients.get(&id)
+        {
+            client
+                .sender
+                .send_or_abort(DaemonFrame::Directory(DirectoryEvent::ParticipantAudio {
+                    request_id: None,
+                    state,
+                }));
+        }
+        send_directory_result(clients, id, request_id, Err(error));
+        return;
+    }
     match app.rpc_participant_audio_state(user_id) {
         Ok(state) => {
             if let Some(client) = clients.get(&id) {
@@ -3237,28 +3253,32 @@ fn handle_management_command(
             app.handle_client_command(id, CoreCommand::CancelJoin { attempt_id });
             send_management_acceptance(clients, id, request_id);
         }
-        ManagementCommand::ListDevices => {
-            app.management_list_devices(id);
-            send_management_acceptance(clients, id, request_id);
-        }
-        ManagementCommand::CreateDeviceLink => {
-            app.management_create_device_link(id);
-            send_management_acceptance(clients, id, request_id);
-        }
+        ManagementCommand::ListDevices => match app.management_list_devices(id) {
+            Ok(()) => send_management_acceptance(clients, id, request_id),
+            Err(message) => send_management_rejection(clients, id, request_id, 409, &message),
+        },
+        ManagementCommand::CreateDeviceLink => match app.management_create_device_link(id) {
+            Ok(()) => send_management_acceptance(clients, id, request_id),
+            Err(message) => send_management_rejection(clients, id, request_id, 409, &message),
+        },
         ManagementCommand::CancelDeviceLink => {
             let cancel = clients
                 .get_mut(&id)
                 .and_then(|client| client.device_link_cancel.take());
-            if let Some(redemption_secret_hash) = cancel {
-                app.management_cancel_device_link(id, redemption_secret_hash);
-                send_management_acceptance(clients, id, request_id);
-            } else {
+            let Some(redemption_secret_hash) = cancel else {
                 send_management_rejection(clients, id, request_id, 404, "no active device link");
+                return;
+            };
+            match app.management_cancel_device_link(id, redemption_secret_hash) {
+                Ok(()) => send_management_acceptance(clients, id, request_id),
+                Err(message) => send_management_rejection(clients, id, request_id, 409, &message),
             }
         }
         ManagementCommand::RevokeDevice { device_id } => {
-            app.management_revoke_device(id, device_id);
-            send_management_acceptance(clients, id, request_id);
+            match app.management_revoke_device(id, device_id) {
+                Ok(()) => send_management_acceptance(clients, id, request_id),
+                Err(message) => send_management_rejection(clients, id, request_id, 409, &message),
+            }
         }
     }
 }

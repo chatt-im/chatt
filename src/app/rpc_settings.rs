@@ -150,6 +150,11 @@ impl App {
         let operation = command.operation();
         match command {
             wire::SettingsCommand::Open => self.open_rpc_settings(owner, request_id),
+            wire::SettingsCommand::ReadAudioHealth => wire::SettingsResult::accepted(
+                request_id,
+                operation,
+                wire::SettingsResultPayload::AudioHealth(self.rpc_audio_runtime()),
+            ),
             wire::SettingsCommand::SetAudioPreviewActive { session_id, active } => {
                 if let Err(result) =
                     self.require_rpc_settings_owner(owner, request_id, operation, session_id)
@@ -2030,6 +2035,36 @@ mod tests {
             wire::SettingsCommand::Close { session_id },
         );
         assert_eq!(app.config.audio.max_amplification, baseline);
+    }
+
+    #[test]
+    fn reading_audio_health_takes_no_lease_and_leaves_an_open_session_alone() {
+        let mut app = app_with_missing_config("audio-health");
+        let owner = ClientId(61);
+
+        let probed =
+            app.handle_rpc_settings(owner, RequestId(1), wire::SettingsCommand::ReadAudioHealth);
+        probed.validate().unwrap();
+        assert!(matches!(
+            probed.payload,
+            wire::SettingsResultPayload::AudioHealth(_)
+        ));
+        assert!(app.rpc_settings.is_none());
+
+        let opened = app.handle_rpc_settings(owner, RequestId(2), wire::SettingsCommand::Open);
+        let session_id = opened_session(&opened);
+        app.handle_rpc_settings(owner, RequestId(3), wire::SettingsCommand::ReadAudioHealth);
+        assert!(app.rpc_settings.is_some());
+
+        let reloaded = app.handle_rpc_settings(
+            owner,
+            RequestId(4),
+            wire::SettingsCommand::Reload { session_id },
+        );
+        assert!(matches!(
+            reloaded.result.outcome,
+            local_rpc::frame::RequestOutcome::Accepted
+        ));
     }
 
     #[test]

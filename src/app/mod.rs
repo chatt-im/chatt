@@ -408,7 +408,17 @@ pub(crate) struct App {
     rpc_clients: HashSet<crate::client_channel::ClientId>,
     voice_roster: frontend::VoiceRosterProjection,
     command_client: crate::client_channel::ClientId,
-    device_management_owner: Option<crate::client_channel::ClientId>,
+    /// Frontend that created the pending one-time device link.
+    ///
+    /// The pairing string and the redemption that follows it are secrets the
+    /// requesting frontend alone may see, and the link outlives any single
+    /// round trip, so it holds its own lease until redemption or cancellation.
+    device_link_owner: Option<crate::client_channel::ClientId>,
+    /// Frontend awaiting the device list.
+    ///
+    /// Listing and revoking are both answered by one undifferentiated
+    /// [`NetworkEvent::E2eDevicesListed`], so only one may be outstanding.
+    device_query_owner: Option<crate::client_channel::ClientId>,
     participant_audio_owner: Option<crate::client_channel::ClientId>,
     quit_requested: bool,
     /// Advances when configuration mirrored into attached terminal views changes.
@@ -1581,7 +1591,8 @@ impl App {
             rpc_clients: HashSet::new(),
             voice_roster: frontend::VoiceRosterProjection::default(),
             command_client: crate::client_channel::ClientId::PRIMARY,
-            device_management_owner: None,
+            device_link_owner: None,
+            device_query_owner: None,
             participant_audio_owner: None,
             quit_requested: false,
             daemon_config_generation: 0,
@@ -3657,6 +3668,10 @@ impl App {
         self.pending_dm_open.clear();
         self.pending_dm_clients.clear();
         self.pending_identity_review.clear();
+        // The link and any outstanding list died with the session, so holding
+        // their leases would only lock out the next frontend to ask.
+        self.device_link_owner = None;
+        self.device_query_owner = None;
         self.open_e2e_reviews.clear();
         self.rpc_identity.close_all("disconnected from the server");
         self.pending_mutation_clients.clear();
@@ -5332,7 +5347,7 @@ impl App {
                 pairing_string,
                 expires_at_ms,
             } => {
-                let owner = self.device_management_owner.unwrap_or(self.command_client);
+                let owner = self.device_link_owner.unwrap_or(self.command_client);
                 self.send_to(
                     owner,
                     TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
@@ -5350,10 +5365,7 @@ impl App {
                 device_id,
                 device_name,
             } => {
-                let owner = self
-                    .device_management_owner
-                    .take()
-                    .unwrap_or(self.command_client);
+                let owner = self.device_link_owner.take().unwrap_or(self.command_client);
                 self.send_to(
                     owner,
                     TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
@@ -5369,10 +5381,7 @@ impl App {
                 self.set_status(format!("device linked: {device_name}"));
             }
             NetworkEvent::DeviceLinkCanceled => {
-                let owner = self
-                    .device_management_owner
-                    .take()
-                    .unwrap_or(self.command_client);
+                let owner = self.device_link_owner.take().unwrap_or(self.command_client);
                 self.send_to(
                     owner,
                     TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
@@ -5382,7 +5391,7 @@ impl App {
             }
             NetworkEvent::E2eDevicesListed { devices } => {
                 let owner = self
-                    .device_management_owner
+                    .device_query_owner
                     .take()
                     .unwrap_or(self.command_client);
                 self.send_to(owner, TerminalEvent::DevicesListed(devices));
@@ -5693,37 +5702,69 @@ impl App {
             .map(|server| ServerEditDraft::from_server(server, &self.config))
     }
 
-    pub(crate) fn management_list_devices(&mut self, owner: crate::client_channel::ClientId) {
-        self.device_management_owner = Some(owner);
-        self.send_network_command(NetworkCommand::ListE2eDevices, true);
+    fn claim_device_query(&mut self, owner: crate::client_channel::ClientId) -> Result<(), String> {
+        if self
+            .device_query_owner
+            .is_some_and(|current| current != owner)
+        {
+            return Err("devices are being listed in another client".into());
+        }
+        self.device_query_owner = Some(owner);
+        Ok(())
     }
 
-    pub(crate) fn management_create_device_link(&mut self, owner: crate::client_channel::ClientId) {
-        self.device_management_owner = Some(owner);
+    fn claim_device_link(&mut self, owner: crate::client_channel::ClientId) -> Result<(), String> {
+        if self
+            .device_link_owner
+            .is_some_and(|current| current != owner)
+        {
+            return Err("a device link is already active in another client".into());
+        }
+        self.device_link_owner = Some(owner);
+        Ok(())
+    }
+
+    pub(crate) fn management_list_devices(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+    ) -> Result<(), String> {
+        self.claim_device_query(owner)?;
+        self.send_network_command(NetworkCommand::ListE2eDevices, true);
+        Ok(())
+    }
+
+    pub(crate) fn management_create_device_link(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+    ) -> Result<(), String> {
+        self.claim_device_link(owner)?;
         self.send_network_command(NetworkCommand::CreateDeviceLink, true);
+        Ok(())
     }
 
     pub(crate) fn management_cancel_device_link(
         &mut self,
         owner: crate::client_channel::ClientId,
         redemption_secret_hash: Vec<u8>,
-    ) {
-        self.device_management_owner = Some(owner);
+    ) -> Result<(), String> {
+        self.claim_device_link(owner)?;
         self.send_network_command(
             NetworkCommand::CancelDeviceLink {
                 redemption_secret_hash,
             },
             true,
         );
+        Ok(())
     }
 
     pub(crate) fn management_revoke_device(
         &mut self,
         owner: crate::client_channel::ClientId,
         device_id: rpc::ids::DeviceId,
-    ) {
-        self.device_management_owner = Some(owner);
+    ) -> Result<(), String> {
+        self.claim_device_query(owner)?;
         self.send_network_command(NetworkCommand::RevokeE2eDevice { device_id }, true);
+        Ok(())
     }
 
     pub(crate) fn rpc_publishing_state(&self) -> local_rpc::publishing::PublishingState {
@@ -6226,8 +6267,11 @@ impl App {
         }
         self.open_e2e_reviews.remove(&client_id);
         self.rpc_identity.retire(client_id);
-        if self.device_management_owner == Some(client_id) {
-            self.device_management_owner = None;
+        if self.device_link_owner == Some(client_id) {
+            self.device_link_owner = None;
+        }
+        if self.device_query_owner == Some(client_id) {
+            self.device_query_owner = None;
         }
         if self.participant_audio_owner == Some(client_id) {
             if let Some((user_id, _)) = self.room.volume_preview() {
@@ -7939,10 +7983,16 @@ impl App {
             "/identity" => self.identity_command(room_id, "/identity"),
             command if command.starts_with("/identity ") => self.identity_command(room_id, command),
             "/devices" => {
-                self.send_network_command(NetworkCommand::ListE2eDevices, true);
+                let owner = self.command_client;
+                if let Err(error) = self.management_list_devices(owner) {
+                    self.set_error(error);
+                }
             }
             "/devices link" => {
-                self.send_network_command(NetworkCommand::CreateDeviceLink, true);
+                let owner = self.command_client;
+                if let Err(error) = self.management_create_device_link(owner) {
+                    self.set_error(error);
+                }
             }
             "/devices recovery" => {
                 self.set_error(
@@ -7961,10 +8011,10 @@ impl App {
                     .map(rpc::ids::DeviceId);
                 match device_id {
                     Some(device_id) if confirmed => {
-                        self.send_network_command(
-                            NetworkCommand::RevokeE2eDevice { device_id },
-                            true,
-                        );
+                        let owner = self.command_client;
+                        if let Err(error) = self.management_revoke_device(owner, device_id) {
+                            self.set_error(error);
+                        }
                     }
                     Some(_) => self.set_error(format!(
                         "Revoking device {encoded} permanently signs it out. Run /devices revoke {encoded} CONFIRM to continue."
@@ -9944,6 +9994,52 @@ mod tests {
         );
         assert!(app.participant_audio_owner.is_none());
         assert!(app.room.volume_preview().is_none());
+    }
+
+    #[test]
+    fn device_leases_reject_a_second_frontend_and_keep_routing_to_the_first() {
+        let mut app = test_app();
+        let first = crate::client_channel::ClientId(11);
+        let second = crate::client_channel::ClientId(12);
+
+        assert!(app.management_create_device_link(first).is_ok());
+        assert!(app.management_create_device_link(second).is_err());
+        assert!(
+            app.management_cancel_device_link(second, Vec::new())
+                .is_err()
+        );
+        assert_eq!(app.device_link_owner, Some(first));
+
+        // Listing is a separate round trip, so it is not blocked by the link.
+        assert!(app.management_list_devices(second).is_ok());
+        assert!(app.management_list_devices(first).is_err());
+        assert!(
+            app.management_revoke_device(first, rpc::ids::DeviceId([0; 16]))
+                .is_err()
+        );
+        assert_eq!(app.device_query_owner, Some(second));
+
+        app.handle_network_event(NetworkEvent::E2eDevicesListed {
+            devices: Vec::new(),
+        });
+        assert_eq!(app.device_query_owner, None);
+        assert_eq!(app.device_link_owner, Some(first));
+
+        app.handle_network_event(NetworkEvent::DeviceLinkCanceled);
+        assert_eq!(app.device_link_owner, None);
+    }
+
+    #[test]
+    fn retiring_the_device_lease_owner_releases_it() {
+        let mut app = test_app();
+        let owner = crate::client_channel::ClientId(21);
+
+        assert!(app.management_create_device_link(owner).is_ok());
+        assert!(app.management_list_devices(owner).is_ok());
+        app.retire_client(owner);
+
+        assert_eq!(app.device_link_owner, None);
+        assert_eq!(app.device_query_owner, None);
     }
 
     #[test]

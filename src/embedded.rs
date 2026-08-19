@@ -19,6 +19,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::JoinHandle,
@@ -37,6 +38,8 @@ use crate::{
 
 const COMMAND_QUEUE_ITEMS: usize = 128;
 const EVENT_QUEUE_ITEMS: usize = 64;
+/// Slots held back for `SessionEnded` and `CoreStopped`, one delivery each.
+const TERMINAL_QUEUE_ITEMS: usize = 2;
 
 /// How received files are retained after first-run setup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,6 +127,49 @@ pub enum Startup {
     NeedsSetup(SetupDraft),
 }
 
+/// The core-to-frontend event stream, with capacity reserved for terminal events.
+///
+/// A frontend is retired precisely because this queue overflowed, so the
+/// terminal notification must not compete for the capacity that overflowed —
+/// blocking there deadlocks the core against a host that has stopped draining.
+/// Ordinary events are refused once [`EVENT_QUEUE_ITEMS`] are outstanding while
+/// the channel holds two further slots that only `SessionEnded` and
+/// `CoreStopped` may occupy. The counter is written by the single core thread
+/// and decremented by the single consumer, so it never underestimates what the
+/// channel holds.
+#[derive(Clone)]
+pub(crate) struct EventQueue {
+    sender: SyncSender<FrontendEvent>,
+    outstanding: Arc<AtomicUsize>,
+}
+
+pub(crate) enum EventQueueError {
+    Full,
+    Closed,
+}
+
+impl EventQueue {
+    pub(crate) fn send(&self, event: FrontendEvent) -> Result<(), EventQueueError> {
+        self.outstanding
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |outstanding| {
+                (outstanding < EVENT_QUEUE_ITEMS).then_some(outstanding + 1)
+            })
+            .map_err(|_| EventQueueError::Full)?;
+        self.sender.try_send(event).map_err(|_| {
+            self.outstanding.fetch_sub(1, Ordering::AcqRel);
+            EventQueueError::Closed
+        })
+    }
+
+    /// Delivers a session's last event into capacity no ordinary event can take.
+    pub(crate) fn send_terminal(&self, event: FrontendEvent) {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+        if self.sender.try_send(event).is_err() {
+            self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Resolves configuration and claims the state namespace used by one core.
 #[derive(Default)]
 pub struct CoreBuilder {
@@ -154,8 +200,7 @@ impl CoreBuilder {
                 .as_deref()
                 .ok_or_else(|| StartupError::Config("configuration path is unavailable".into()))?,
         };
-        let instance =
-            EmbeddedInstanceLock::claim(&crate::paths::client_instance_name(path), config_path)?;
+        let instance = EmbeddedInstanceLock::claim(config_path)?;
         match loaded {
             AppConfigLoad::Existing(config) => {
                 Ok(Startup::Ready(PreparedCore { config, instance }))
@@ -181,21 +226,45 @@ pub(crate) struct EmbeddedInstanceLock {
 }
 
 impl EmbeddedInstanceLock {
-    fn claim(name: &str, config_path: &std::path::Path) -> Result<Self, StartupError> {
-        let platform = match chatt_platform::instance::claim(name)
-            .map_err(|error| StartupError::Config(error.to_string()))?
+    // Both the platform claim and the sidecar are keyed on one canonical path,
+    // so a configuration reached through a symlink contends with itself.
+    fn claim(config_path: &std::path::Path) -> Result<Self, StartupError> {
+        let config_path = prepare_config_directory(config_path)?;
+        let platform = match chatt_platform::instance::claim(&crate::paths::client_instance_name(
+            &config_path,
+        ))
+        .map_err(|error| StartupError::Config(error.to_string()))?
         {
             chatt_platform::instance::Claim::Held(instance) => instance,
             chatt_platform::instance::Claim::Taken => return Err(StartupError::AlreadyRunning),
         };
         #[cfg(unix)]
-        let config_file = claim_config_file(config_path)?;
+        let config_file = claim_config_file(&config_path)?;
         Ok(Self {
             _platform: platform,
             #[cfg(unix)]
             _config_file: config_file,
         })
     }
+}
+
+/// Creates the configuration directory, then resolves the canonical config path.
+///
+/// Canonicalization needs the directory to exist, and first run reaches here
+/// before anything has been written.
+fn prepare_config_directory(config_path: &std::path::Path) -> Result<PathBuf, StartupError> {
+    let path = std::path::absolute(config_path)
+        .map_err(|error| StartupError::Config(error.to_string()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| StartupError::Config("configuration path has no parent".into()))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        StartupError::Config(format!(
+            "cannot create configuration directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    Ok(crate::paths::canonical_config_path(&path))
 }
 
 #[cfg(unix)]
@@ -205,17 +274,6 @@ fn claim_config_file(config_path: &std::path::Path) -> Result<File, StartupError
         unix::fs::{MetadataExt, OpenOptionsExt},
     };
 
-    let config_path = std::path::absolute(config_path)
-        .map_err(|error| StartupError::Config(error.to_string()))?;
-    let parent = config_path
-        .parent()
-        .ok_or_else(|| StartupError::Config("configuration path has no parent".into()))?;
-    fs::create_dir_all(parent).map_err(|error| {
-        StartupError::Config(format!(
-            "cannot create configuration directory {}: {error}",
-            parent.display()
-        ))
-    })?;
     let mut lock_name = config_path.as_os_str().to_os_string();
     lock_name.push(".instance.lock");
     let lock_path = PathBuf::from(lock_name);
@@ -263,9 +321,14 @@ fn claim_config_file(config_path: &std::path::Path) -> Result<File, StartupError
 impl PreparedCore {
     pub fn start(self) -> Result<(CoreHandle, FrontendClient), StartupError> {
         let (commands_tx, commands_rx) = mpsc::sync_channel(COMMAND_QUEUE_ITEMS);
-        let (events_tx, events_rx) = mpsc::sync_channel(EVENT_QUEUE_ITEMS);
+        let (events_tx, events_rx) = mpsc::sync_channel(EVENT_QUEUE_ITEMS + TERMINAL_QUEUE_ITEMS);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let lifecycle_events = events_tx.clone();
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let events = EventQueue {
+            sender: events_tx,
+            outstanding: outstanding.clone(),
+        };
+        let lifecycle_events = events.clone();
         let startup_failure = ready_tx.clone();
         let thread = std::thread::Builder::new()
             .name("chatt-embedded-core".into())
@@ -275,7 +338,7 @@ impl PreparedCore {
                         self.config,
                         DirectBootstrap {
                             commands: commands_rx,
-                            events: events_tx,
+                            events,
                             ready: ready_tx,
                         },
                         self.instance,
@@ -291,7 +354,7 @@ impl PreparedCore {
                 if let Err(reason) = &result {
                     let _ = startup_failure.try_send(Err(reason.clone()));
                 }
-                let _ = lifecycle_events.try_send(FrontendEvent::CoreStopped {
+                lifecycle_events.send_terminal(FrontendEvent::CoreStopped {
                     reason: result.as_ref().err().cloned(),
                 });
                 result
@@ -315,6 +378,7 @@ impl PreparedCore {
             FrontendClient {
                 sender,
                 events: events_rx,
+                outstanding,
             },
         ))
     }
@@ -446,6 +510,7 @@ impl FrontendCommandSender {
 pub struct FrontendClient {
     sender: FrontendCommandSender,
     events: Receiver<FrontendEvent>,
+    outstanding: Arc<AtomicUsize>,
 }
 
 impl FrontendClient {
@@ -454,18 +519,25 @@ impl FrontendClient {
     }
 
     pub fn recv(&self) -> Result<FrontendEvent, mpsc::RecvError> {
-        self.events.recv()
+        self.received(self.events.recv())
     }
 
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
     ) -> Result<FrontendEvent, mpsc::RecvTimeoutError> {
-        self.events.recv_timeout(timeout)
+        self.received(self.events.recv_timeout(timeout))
     }
 
     pub fn try_recv(&self) -> Result<FrontendEvent, TryRecvError> {
-        self.events.try_recv()
+        self.received(self.events.try_recv())
+    }
+
+    fn received<E>(&self, result: Result<FrontendEvent, E>) -> Result<FrontendEvent, E> {
+        if result.is_ok() {
+            self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        }
+        result
     }
 }
 
@@ -591,7 +663,7 @@ pub(crate) enum DirectRequest {
 
 pub(crate) struct DirectBootstrap {
     pub commands: Receiver<DirectRequest>,
-    pub events: SyncSender<FrontendEvent>,
+    pub events: EventQueue,
     pub ready: SyncSender<Result<EmbeddedReady, String>>,
 }
 
@@ -825,6 +897,39 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_path_contends_for_the_same_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let held = CoreBuilder::new()
+            .config_path(real.join("client.toml"))
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(matches!(
+            CoreBuilder::new()
+                .config_path(alias.join("client.toml"))
+                .unwrap()
+                .load(),
+            Err(StartupError::AlreadyRunning)
+        ));
+
+        drop(held);
+        assert!(matches!(
+            CoreBuilder::new()
+                .config_path(alias.join("client.toml"))
+                .unwrap()
+                .load()
+                .unwrap(),
+            Startup::NeedsSetup(_)
+        ));
+    }
+
     #[test]
     fn frontend_detachment_does_not_abort_embedded_core() {
         let directory = tempfile::tempdir().unwrap();
@@ -913,5 +1018,54 @@ mod tests {
                 .is_err()
         );
         core.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_joins_while_the_frontend_queue_stays_saturated() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.toml");
+        let Startup::NeedsSetup(mut setup) = CoreBuilder::new()
+            .config_path(path)
+            .unwrap()
+            .load()
+            .unwrap()
+        else {
+            panic!("fresh path must require setup");
+        };
+        let defaults = setup.defaults();
+        let (mut core, frontend) = setup.save(defaults).unwrap().start().unwrap();
+        let sender = frontend.sender();
+
+        for nonce in 0..=super::EVENT_QUEUE_ITEMS as u64 {
+            sender
+                .send_background(ClientFrame::Ping {
+                    request_id: RequestId(nonce + 1),
+                    nonce,
+                })
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(25));
+
+        // The host never drains, so retirement and core exit both have to fit
+        // in the reserved terminal capacity rather than wait for a reader.
+        core.shutdown().unwrap();
+
+        let mut session_ended = false;
+        let mut core_stopped = false;
+        while let Ok(event) = frontend.try_recv() {
+            match event {
+                FrontendEvent::SessionEnded { reason } => {
+                    assert!(!reason.is_empty());
+                    session_ended = true;
+                }
+                FrontendEvent::CoreStopped { reason } => {
+                    assert_eq!(reason, None);
+                    core_stopped = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(session_ended, "retirement reason must survive saturation");
+        assert!(core_stopped, "core exit must survive saturation");
     }
 }
