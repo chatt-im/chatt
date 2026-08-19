@@ -3154,6 +3154,9 @@ fn handle_management_command(
             }
         }
         ManagementCommand::DeleteServer { server_id } => {
+            // Core commands run inline. `delete_server` returns only after the
+            // config write commits or rolls back, so this is the resulting
+            // catalog rather than an optimistic pre-delete projection.
             app.handle_client_command(id, CoreCommand::DeleteServer { server_id });
             send_management_event(
                 clients,
