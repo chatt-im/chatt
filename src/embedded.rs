@@ -155,7 +155,7 @@ impl CoreBuilder {
                 .ok_or_else(|| StartupError::Config("configuration path is unavailable".into()))?,
         };
         let instance = EmbeddedInstanceLock::claim(
-            &crate::cli::client_instance_name(path),
+            &crate::paths::client_instance_name(path),
             config_path,
         )?;
         match loaded {

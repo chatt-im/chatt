@@ -901,37 +901,6 @@ fn run_daemon_app(config_path: Option<&str>) -> Result<(), Box<dyn std::error::E
     }
 }
 
-/// The name the client claims for single-instance exclusion.
-///
-/// Scoped by config path rather than by user, because two configs are two
-/// independent sets of local state and may legitimately run side by side,
-/// which is exactly what the dev loop's `alice` and `bob` do. The path is made
-/// absolute first so the same config reached from two working directories is
-/// one instance.
-///
-/// The digest is SHA-256 rather than a `Hash` implementation because the two
-/// processes that must agree on this name are separate program runs, possibly
-/// of binaries built by different Rust versions, and `DefaultHasher`'s output
-/// is explicitly not stable across releases.
-pub(crate) fn client_instance_name(config_path: Option<&str>) -> String {
-    use aws_lc_rs::digest;
-
-    let path = match config_path {
-        Some(path) => PathBuf::from(path),
-        None => crate::paths::client_config_path().unwrap_or_default(),
-    };
-    let path = std::path::absolute(&path).unwrap_or(path);
-    let digest = digest::digest(
-        &digest::SHA256,
-        &chatt_platform::os_str_to_bytes(path.as_os_str()),
-    );
-    let mut name = String::from("chatt-client-");
-    for byte in &digest.as_ref()[..8] {
-        name.push_str(&format!("{byte:02x}"));
-    }
-    name
-}
-
 /// Runs `intent` against the chatt session, whether that means attaching to a
 /// master already running one or becoming that master.
 fn run_interactive_app(
@@ -948,7 +917,9 @@ fn run_interactive_app(
     // `chatt` attaches instead of starting. Where there is no control socket,
     // nothing else stops two clients writing the same config, room catalog,
     // room history and receive store, none of which are locked.
-    let _instance = match chatt_platform::instance::claim(&client_instance_name(config_path))? {
+    let _instance = match chatt_platform::instance::claim(
+        &crate::paths::client_instance_name(config_path),
+    )? {
         chatt_platform::instance::Claim::Held(lock) => lock,
         chatt_platform::instance::Claim::Taken => {
             return Err("chatt is already running in this session".into());
