@@ -4,6 +4,12 @@
 //! frontend requests as the Unix renderer protocol, while frames and owned
 //! media resources cross bounded Rust channels without encoding or descriptor
 //! passing.
+//!
+//! The embedding host owns process-global logging and panic handling. This
+//! module does not install Chatt's standalone recent-log panic hook; a core
+//! thread panic is instead reported through [`CoreEvent::Stopped`]. Hosts that
+//! need process-wide crash reporting must install one hook covering their own
+//! threads and Chatt worker threads together.
 
 use std::{
     error::Error,
