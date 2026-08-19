@@ -1286,6 +1286,10 @@ impl App {
                 Some(_) => accepted.push(message_id),
             }
         }
+        accepted.sort_unstable();
+        accepted.dedup();
+        skipped.sort_unstable_by_key(|row| row.message_id);
+        skipped.dedup_by_key(|row| row.message_id);
         if !accepted.is_empty() {
             let previous = std::mem::replace(&mut self.command_client, client_id);
             let queued = self.delete_chat_messages(room_id, accepted.clone());

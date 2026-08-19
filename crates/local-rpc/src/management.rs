@@ -216,13 +216,13 @@ impl ServerDraft {
             (&self.label, "server label"),
             (&self.username, "server username"),
             (&self.tcp_addr, "server TCP address"),
-            (&self.udp_addr, "server UDP address"),
-            (&self.server_identity, "server identity"),
         ] {
             check_text(value, label)?;
         }
         for value in [
+            &self.udp_addr,
             &self.udp_probe_addr,
+            &self.server_identity,
             &self.download_path,
             &self.receive_limit_mb,
             &self.history_location,
@@ -431,6 +431,23 @@ mod tests {
             diagnostics: Vec::new(),
         });
         assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+    }
+
+    #[test]
+    fn unpinned_tcp_only_server_draft_round_trips() {
+        let mut draft = draft();
+        draft.udp_addr.clear();
+        draft.udp_probe_addr.clear();
+        draft.server_identity.clear();
+        let command = ClientFrame::Management {
+            request_id: RequestId(8),
+            command: ManagementCommand::SaveServer {
+                draft,
+                join: false,
+            },
+        };
+
+        assert_eq!(decode_client(&encode_client(&command).unwrap()).unwrap(), command);
     }
 
     #[test]

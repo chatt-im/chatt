@@ -109,7 +109,7 @@ impl DirectoryEvent {
                     if user.user_id.0 == 0 {
                         return Err("directory user id must be nonzero".into());
                     }
-                    crate::model::check_nonempty_string(&user.name)?;
+                    crate::model::check_string(&user.name)?;
                     if let DirectoryPresence::Online {
                         voice_room_id,
                         voice_room_name,
@@ -179,6 +179,21 @@ mod tests {
                 },
             }],
         });
+        assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+    }
+
+    #[test]
+    fn unnamed_directory_user_round_trips() {
+        let event = DaemonFrame::Directory(DirectoryEvent::Users {
+            request_id: Some(RequestId(5)),
+            users: vec![DirectoryUser {
+                user_id: UserId(8),
+                name: String::new(),
+                local: false,
+                presence: DirectoryPresence::AwayUnseen,
+            }],
+        });
+
         assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
     }
 

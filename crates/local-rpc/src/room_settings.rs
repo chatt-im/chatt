@@ -34,6 +34,8 @@ pub enum ToggleOverride {
 #[jsony(Binary, version)]
 pub struct RoomSettingsValues {
     pub download: DownloadOverride,
+    /// A custom directory for a persistent override. `None` uses the inherited
+    /// or platform-default persistent directory.
     pub download_path: Option<String>,
     pub max_download_mb: Option<u64>,
     pub history: ToggleOverride,
@@ -102,10 +104,9 @@ pub enum RoomSettingsEvent {
 impl RoomSettingsValues {
     pub fn validate(&self) -> Result<(), String> {
         if self.download == DownloadOverride::Persistent {
-            let Some(path) = self.download_path.as_deref() else {
-                return Err("persistent room downloads require a path".into());
-            };
-            crate::model::check_nonempty_string(path)?;
+            if let Some(path) = self.download_path.as_deref() {
+                crate::model::check_nonempty_string(path)?;
+            }
         } else if self.download_path.is_some() {
             return Err("room download path is only valid for persistent downloads".into());
         }
@@ -118,11 +119,11 @@ impl RoomSettingsValues {
 
 impl RoomSettingsDocument {
     pub fn validate(&self) -> Result<(), String> {
-        if self.server_id.0 == [0; 16] || self.room_id.0 == 0 || self.revision == 0 {
-            return Err("room settings identity or revision is invalid".into());
+        if self.server_id.0 == [0; 16] || self.room_id.0 == 0 {
+            return Err("room settings identity is invalid".into());
         }
-        crate::model::check_nonempty_string(&self.server_name)?;
-        crate::model::check_nonempty_string(&self.room_name)?;
+        crate::model::check_string(&self.server_name)?;
+        crate::model::check_string(&self.room_name)?;
         self.values.validate()?;
         self.inherited.validate()?;
         self.effective.validate()
@@ -159,12 +160,9 @@ impl RoomSettingsCommand {
             Self::Save {
                 server_id,
                 room_id,
-                expected_revision,
                 values,
+                ..
             } => {
-                if *expected_revision == 0 {
-                    return Err("room settings revision must be nonzero".into());
-                }
                 values.validate()?;
                 (*server_id, *room_id)
             }
@@ -238,6 +236,54 @@ mod tests {
                     download_path: None,
                     max_download_mb: 50,
                     history_enabled: true,
+                    history_location: None,
+                },
+            },
+        });
+        assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+    }
+
+    #[test]
+    fn first_revision_and_unnamed_room_settings_round_trip() {
+        let values = RoomSettingsValues {
+            download: DownloadOverride::Persistent,
+            download_path: None,
+            max_download_mb: None,
+            history: ToggleOverride::Inherit,
+            history_location: None,
+        };
+        let command = ClientFrame::RoomSettings {
+            request_id: RequestId(4),
+            command: RoomSettingsCommand::Save {
+                server_id: ServerId(*b"room-settings-id"),
+                room_id: RoomId(9),
+                expected_revision: 0,
+                values: values.clone(),
+            },
+        };
+        assert_eq!(decode_client(&encode_client(&command).unwrap()).unwrap(), command);
+
+        let event = DaemonFrame::RoomSettings(RoomSettingsEvent::Document {
+            request_id: RequestId(4),
+            document: RoomSettingsDocument {
+                server_id: ServerId(*b"room-settings-id"),
+                server_name: String::new(),
+                room_id: RoomId(9),
+                room_name: String::new(),
+                revision: 0,
+                values,
+                inherited: EffectiveRoomSettings {
+                    download: DownloadMode::Persistent,
+                    download_path: Some("files".into()),
+                    max_download_mb: 50,
+                    history_enabled: false,
+                    history_location: None,
+                },
+                effective: EffectiveRoomSettings {
+                    download: DownloadMode::Persistent,
+                    download_path: Some("files".into()),
+                    max_download_mb: 50,
+                    history_enabled: false,
                     history_location: None,
                 },
             },
