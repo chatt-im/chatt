@@ -416,7 +416,7 @@ struct RpcClientSender {
 
 #[cfg(unix)]
 trait FrontendSink: Send + Sync {
-    fn send_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String>;
+    fn send_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), SinkError>;
     fn start_bulk(
         &self,
         transfer_id: local_rpc::model::BulkTransferId,
@@ -429,6 +429,25 @@ trait FrontendSink: Send + Sync {
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+enum SinkError {
+    Invalid(String),
+    Overflow(String),
+    Closed(String),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for SinkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(reason) | Self::Overflow(reason) | Self::Closed(reason) => {
+                formatter.write_str(reason)
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 struct UnixFrontendSink {
     outbound: Arc<RpcOutboundQueue>,
     control: Arc<UnixStream>,
@@ -436,16 +455,19 @@ struct UnixFrontendSink {
 
 #[cfg(unix)]
 impl FrontendSink for UnixFrontendSink {
-    fn send_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String> {
+    fn send_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), SinkError> {
         let mut state = self.outbound.state.lock();
         if state.closed {
-            return Err("RPC client writer stopped".into());
+            return Err(SinkError::Closed("RPC client writer stopped".into()));
         }
         let offset = state.bytes.len();
-        local_rpc::frame::encode_daemon_framed_append(frame, &mut state.bytes)?;
+        local_rpc::frame::encode_daemon_framed_append(frame, &mut state.bytes)
+            .map_err(SinkError::Invalid)?;
         if state.bytes.len() > local_rpc::MAX_QUEUED_BYTES {
             state.bytes.truncate(offset);
-            return Err("RPC client outbound queue is full".into());
+            return Err(SinkError::Overflow(
+                "RPC client outbound queue is full".into(),
+            ));
         }
         if !fds.is_empty() {
             let length = state.bytes.len() - offset;
@@ -506,13 +528,13 @@ struct DirectFrontendSink {
 
 #[cfg(all(unix, feature = "embedded-client"))]
 impl DirectFrontendSink {
-    fn try_send(&self, event: FrontendEvent) -> Result<(), String> {
+    fn try_send(&self, event: FrontendEvent) -> Result<(), SinkError> {
         self.events.try_send(event).map_err(|error| match error {
             std::sync::mpsc::TrySendError::Full(_) => {
-                "embedded frontend event queue is full".to_string()
+                SinkError::Overflow("embedded frontend event queue is full".into())
             }
             std::sync::mpsc::TrySendError::Disconnected(_) => {
-                "embedded frontend detached".to_string()
+                SinkError::Closed("embedded frontend detached".into())
             }
         })
     }
@@ -520,8 +542,8 @@ impl DirectFrontendSink {
 
 #[cfg(all(unix, feature = "embedded-client"))]
 impl FrontendSink for DirectFrontendSink {
-    fn send_frame(&self, frame: &DaemonFrame, mut fds: Vec<OwnedFd>) -> Result<(), String> {
-        local_rpc::frame::validate_daemon(frame)?;
+    fn send_frame(&self, frame: &DaemonFrame, mut fds: Vec<OwnedFd>) -> Result<(), SinkError> {
+        local_rpc::frame::validate_daemon(frame).map_err(SinkError::Invalid)?;
         match frame {
             DaemonFrame::LiveShareOpened {
                 request_id,
@@ -530,7 +552,9 @@ impl FrontendSink for DirectFrontendSink {
                 status,
             } => {
                 if fds.len() != 1 {
-                    return Err("live share event carries an invalid descriptor count".into());
+                    return Err(SinkError::Invalid(
+                        "live share event carries an invalid descriptor count".into(),
+                    ));
                 }
                 self.try_send(FrontendEvent::LiveShareOpened {
                     request_id: *request_id,
@@ -548,9 +572,9 @@ impl FrontendSink for DirectFrontendSink {
                 transport,
             } => {
                 if fds.len() != 1 {
-                    return Err(
+                    return Err(SinkError::Invalid(
                         "attachment source event carries an invalid descriptor count".into(),
-                    );
+                    ));
                 }
                 self.try_send(FrontendEvent::AttachmentSourceOpened {
                     request_id: *request_id,
@@ -561,9 +585,9 @@ impl FrontendSink for DirectFrontendSink {
                     fd: fds.pop().expect("checked descriptor"),
                 })
             }
-            _ if !fds.is_empty() => {
-                Err("embedded frontend frame carries unexpected descriptors".into())
-            }
+            _ if !fds.is_empty() => Err(SinkError::Invalid(
+                "embedded frontend frame carries unexpected descriptors".into(),
+            )),
             _ => self.try_send(FrontendEvent::Frame(frame.clone())),
         }
     }
@@ -596,6 +620,7 @@ impl FrontendSink for DirectFrontendSink {
             descriptor,
             body,
         })
+        .map_err(|error| error.to_string())
     }
 
     fn end_session(&self, reason: &str) {
@@ -614,7 +639,11 @@ impl FrontendSink for DirectFrontendSink {
 #[cfg(unix)]
 impl RpcClientSender {
     fn send(&self, frame: &DaemonFrame) -> Result<(), String> {
-        self.send_with_fds(frame, Vec::new())
+        self.send_classified(frame).map_err(|error| error.to_string())
+    }
+
+    fn send_classified(&self, frame: &DaemonFrame) -> Result<(), SinkError> {
+        self.send_with_fds_classified(frame, Vec::new())
     }
 
     fn send_snapshot(
@@ -635,13 +664,19 @@ impl RpcClientSender {
         Ok(snapshot)
     }
 
-    fn send_with_fds(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), String> {
+    fn send_with_fds_classified(
+        &self,
+        frame: &DaemonFrame,
+        fds: Vec<OwnedFd>,
+    ) -> Result<(), SinkError> {
         let expected_fds = match frame {
             DaemonFrame::LiveShareOpened { .. } | DaemonFrame::AttachmentSourceOpened { .. } => 1,
             _ => 0,
         };
         if fds.len() != expected_fds {
-            return Err("daemon frame carries an invalid descriptor count".into());
+            return Err(SinkError::Invalid(
+                "daemon frame carries an invalid descriptor count".into(),
+            ));
         }
         self.sink.send_frame(frame, fds)?;
         self.complete_request(frame);
@@ -674,16 +709,64 @@ impl RpcClientSender {
     }
 
     fn send_or_abort(&self, frame: &DaemonFrame) -> bool {
-        match self.send(frame) {
+        let result = self.send_classified(frame);
+        self.handle_send_result(frame, result)
+    }
+
+    fn send_with_fds_or_abort(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> bool {
+        let result = self.send_with_fds_classified(frame, fds);
+        self.handle_send_result(frame, result)
+    }
+
+    fn handle_send_result(
+        &self,
+        frame: &DaemonFrame,
+        result: Result<(), SinkError>,
+    ) -> bool {
+        match result {
             Ok(()) => true,
-            Err(error) => {
+            Err(SinkError::Invalid(reason)) => {
+                kvlog::error!(
+                    "invalid daemon RPC frame rejected",
+                    frame = daemon_frame_kind(frame),
+                    err = %reason
+                );
+                self.reject_invalid_frame(frame);
+                false
+            }
+            Err(error @ (SinkError::Overflow(_) | SinkError::Closed(_))) => {
                 kvlog::error!(
                     "daemon RPC send failed",
                     frame = daemon_frame_kind(frame),
-                    error = %error
+                    err = %error
                 );
                 self.abort();
                 false
+            }
+        }
+    }
+
+    fn reject_invalid_frame(&self, frame: &DaemonFrame) {
+        let Some((request_id, operation)) = daemon_request_target(frame) else {
+            return;
+        };
+        let rejection = DaemonFrame::RequestResult(local_rpc::frame::RequestResult {
+            request_id,
+            operation,
+            outcome: local_rpc::frame::RequestOutcome::Rejected {
+                code: 500,
+                message: "Chatt core produced an invalid frontend response".into(),
+            },
+        });
+        match self.send_classified(&rejection) {
+            Ok(()) => {}
+            Err(SinkError::Invalid(reason)) => {
+                self.outstanding.lock().remove(&request_id);
+                kvlog::error!("invalid daemon rejection frame", request_id, err = %reason);
+            }
+            Err(error @ (SinkError::Overflow(_) | SinkError::Closed(_))) => {
+                kvlog::error!("daemon RPC rejection send failed", request_id, err = %error);
+                self.abort();
             }
         }
     }
@@ -738,6 +821,49 @@ impl RpcClientSender {
         if let Some(request_id) = request_id {
             self.outstanding.lock().remove(&request_id);
         }
+    }
+}
+
+#[cfg(unix)]
+fn daemon_request_target(
+    frame: &DaemonFrame,
+) -> Option<(local_rpc::model::RequestId, local_rpc::frame::Operation)> {
+    use local_rpc::frame::Operation;
+
+    match frame {
+        DaemonFrame::RequestResult(result) | DaemonFrame::CommandResult { result, .. } => {
+            Some((result.request_id, result.operation))
+        }
+        DaemonFrame::CommandCandidates { request_id, .. } => Some((*request_id, Operation::RunCommand)),
+        DaemonFrame::LiveShareOpened { request_id, .. } => {
+            Some((*request_id, Operation::StartLiveShare))
+        }
+        DaemonFrame::AttachmentSourceOpened { request_id, .. } => {
+            Some((*request_id, Operation::OpenAttachmentSource))
+        }
+        DaemonFrame::Pong { request_id, .. } => Some((*request_id, Operation::Ping)),
+        DaemonFrame::SettingsResult(result) => {
+            Some((result.result.request_id, result.result.operation))
+        }
+        DaemonFrame::IdentityResult(result) => {
+            Some((result.result.request_id, result.result.operation))
+        }
+        DaemonFrame::Management(event) => event
+            .request_id()
+            .map(|request_id| (request_id, Operation::Management)),
+        DaemonFrame::Publishing(event) => event
+            .request_id
+            .map(|request_id| (request_id, Operation::Publishing)),
+        DaemonFrame::Directory(event) => event
+            .request_id()
+            .map(|request_id| (request_id, Operation::Directory)),
+        DaemonFrame::RoomSettings(event) => {
+            Some((event.request_id(), Operation::RoomSettings))
+        }
+        DaemonFrame::BulkDeleteResult(result) => {
+            Some((result.request_id, Operation::BulkDeleteMessages))
+        }
+        _ => None,
     }
 }
 
@@ -2532,25 +2658,17 @@ fn handle_rpc_command(
             let Some(client) = clients.get_mut(&id) else {
                 return;
             };
-            match client.sender.send_with_fds(&opened, vec![frontend_fd]) {
-                Ok(()) => {
-                    client.live_viewers.insert(
-                        stream_id,
-                        RpcLiveViewer {
-                            generation,
-                            _handle: open.handle,
-                        },
-                    );
-                }
-                Err(error) => {
-                    kvlog::error!(
-                        "could not send live-share descriptor to RPC client",
-                        client_id = id.0,
-                        stream_id = stream_id.0,
-                        error = %error
-                    );
-                    client.sender.abort();
-                }
+            if client
+                .sender
+                .send_with_fds_or_abort(&opened, vec![frontend_fd])
+            {
+                client.live_viewers.insert(
+                    stream_id,
+                    RpcLiveViewer {
+                        generation,
+                        _handle: open.handle,
+                    },
+                );
             }
             return;
         }
@@ -3622,16 +3740,7 @@ fn open_rpc_attachment_source(
                 byte_len,
                 transport: AttachmentSourceTransport::DirectFile,
             };
-            if let Err(error) = client.sender.send_with_fds(&opened, vec![fd]) {
-                kvlog::error!(
-                    "could not send attachment file descriptor to RPC client",
-                    client_id = client_id.0,
-                    attachment_timestamp_ms = attachment_id.timestamp_ms,
-                    attachment_transfer_id = attachment_id.transfer_id.0,
-                    error = %error
-                );
-                client.sender.abort();
-            }
+            client.sender.send_with_fds_or_abort(&opened, vec![fd]);
         }
         crate::receive_store::Source::Memory { bytes, .. } => {
             if client.attachment_streams.len() >= local_rpc::MAX_CONCURRENT_ATTACHMENT_STREAMS {
@@ -3718,21 +3827,13 @@ fn open_rpc_attachment_source(
                 transport: AttachmentSourceTransport::ReadAtSocket,
             };
             let fd: OwnedFd = frontend_stream.into();
-            if let Err(error) = client.sender.send_with_fds(&opened, vec![fd]) {
+            if !client.sender.send_with_fds_or_abort(&opened, vec![fd]) {
                 if let Some(mut stream) = client.attachment_streams.remove(&request_id) {
                     let _ = stream.shutdown.shutdown(std::net::Shutdown::Both);
                     if let Some(worker) = stream.worker.take() {
                         let _ = worker.join();
                     }
                 }
-                kvlog::error!(
-                    "could not send attachment range socket to RPC client",
-                    client_id = client_id.0,
-                    attachment_timestamp_ms = attachment_id.timestamp_ms,
-                    attachment_transfer_id = attachment_id.transfer_id.0,
-                    error = %error
-                );
-                client.sender.abort();
             }
         }
     }
@@ -4407,7 +4508,14 @@ fn install_panic_hook() {
 // RPC renderers over the local control socket, which only exists on Unix.
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{os::unix::net::UnixStream, sync::Arc, thread};
+    use std::{
+        os::unix::net::UnixStream,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+    };
 
     use super::{
         RemoteClient, RemoteShutdown, affects_rpc_projection, daemon_instance_id,
@@ -4415,6 +4523,87 @@ mod tests {
     };
     use crate::{attach, client_channel::ClientChannel};
     use parking_lot::Mutex;
+
+    #[derive(Default)]
+    struct ValidatingSink {
+        frames: Mutex<Vec<local_rpc::frame::DaemonFrame>>,
+        aborted: AtomicBool,
+    }
+
+    impl super::FrontendSink for ValidatingSink {
+        fn send_frame(
+            &self,
+            frame: &local_rpc::frame::DaemonFrame,
+            fds: Vec<std::os::fd::OwnedFd>,
+        ) -> Result<(), super::SinkError> {
+            if !fds.is_empty() {
+                return Err(super::SinkError::Invalid(
+                    "test frame carried descriptors".into(),
+                ));
+            }
+            local_rpc::frame::validate_daemon(frame).map_err(super::SinkError::Invalid)?;
+            self.frames.lock().push(frame.clone());
+            Ok(())
+        }
+
+        fn start_bulk(
+            &self,
+            _transfer_id: local_rpc::model::BulkTransferId,
+            _descriptor: local_rpc::model::AttachmentDescriptor,
+            _source: crate::receive_store::Source,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn end_session(&self, _reason: &str) {}
+
+        fn shutdown(&self) {}
+
+        fn abort(&self) {
+            self.aborted.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn invalid_core_response_rejects_request_without_aborting_frontend() {
+        use local_rpc::{
+            directory::{DirectoryEvent, DirectoryPresence, DirectoryUser},
+            frame::{DaemonFrame, Operation, RequestOutcome},
+            ids::UserId,
+            model::RequestId,
+        };
+
+        let sink = Arc::new(ValidatingSink::default());
+        let sender = super::RpcClientSender {
+            sink: sink.clone(),
+            active_bulk: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            outstanding: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        };
+        let request_id = RequestId(7);
+        assert!(sender.begin_request(request_id));
+
+        assert!(!sender.send_or_abort(&DaemonFrame::Directory(
+            DirectoryEvent::Users {
+                request_id: Some(request_id),
+                users: vec![DirectoryUser {
+                    user_id: UserId(3),
+                    name: String::new(),
+                    local: false,
+                    presence: DirectoryPresence::AwayUnseen,
+                }],
+            },
+        )));
+
+        assert!(!sink.aborted.load(Ordering::SeqCst));
+        assert!(sender.outstanding.lock().is_empty());
+        assert!(matches!(
+            sink.frames.lock().as_slice(),
+            [DaemonFrame::RequestResult(result)]
+                if result.request_id == request_id
+                    && result.operation == Operation::Directory
+                    && matches!(result.outcome, RequestOutcome::Rejected { code: 500, .. })
+        ));
+    }
 
     #[test]
     fn voice_telemetry_does_not_rebuild_rpc_snapshots() {
