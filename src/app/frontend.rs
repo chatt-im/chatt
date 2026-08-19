@@ -170,11 +170,13 @@ impl App {
                 .servers
                 .iter()
                 .map(|server| ServerSummary {
+                    server_id: server.id,
                     label: server.label.clone(),
                     username: server.username.clone(),
                     tcp_addr: server.tcp_addr.clone(),
                     require_transport_encryption: server.require_transport_encryption,
                     availability: ServerAvailability::Ready,
+                    active: self.room.active_server_id == Some(server.id),
                 })
                 .collect(),
             error: issue.as_ref().and_then(|issue| match issue {
@@ -1869,6 +1871,7 @@ mod tests {
     #[test]
     fn rpc_selects_ready_server_and_projects_connecting_state() {
         let mut app = app_with_server("work", "token", true);
+        let server_id = app.config.servers[0].id;
         let client_id = ClientId(7);
         app.register_rpc_client(client_id);
 
@@ -1885,6 +1888,9 @@ mod tests {
         assert_eq!(result.outcome, RequestOutcome::Accepted);
         let snapshot = app.rpc_snapshot(client_id);
         assert_eq!(snapshot.active_server.as_deref(), Some("work"));
+        assert_eq!(snapshot.server_selection.servers.len(), 1);
+        assert_eq!(snapshot.server_selection.servers[0].server_id, server_id);
+        assert!(!snapshot.server_selection.servers[0].active);
         assert_eq!(snapshot.connection, ConnectionState::Connecting);
         // The candidate is pending; the active session slot stays untouched
         // until it authenticates.

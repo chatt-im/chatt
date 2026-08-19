@@ -5683,23 +5683,6 @@ impl App {
         ));
     }
 
-    pub(crate) fn management_server_catalog(
-        &self,
-    ) -> Vec<local_rpc::management::ServerCatalogEntry> {
-        self.config
-            .servers
-            .iter()
-            .map(|server| local_rpc::management::ServerCatalogEntry {
-                server_id: server.id,
-                label: server.label.clone(),
-                username: server.username.clone(),
-                tcp_addr: server.tcp_addr.clone(),
-                require_transport_encryption: server.require_transport_encryption,
-                active: self.room.active_server_id == Some(server.id),
-            })
-            .collect()
-    }
-
     pub(crate) fn management_server_draft(
         &self,
         server_id: ServerId,

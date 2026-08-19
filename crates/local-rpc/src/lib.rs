@@ -35,8 +35,8 @@ mod recv_buffer;
 /// has no external users, so the number is not a compatibility record — a
 /// daemon and a renderer either come from the same tree or refuse to speak.
 /// Bump it only if something ever has to negotiate across versions for real.
-pub const PROTOCOL_MIN_VERSION: u16 = 0;
-pub const PROTOCOL_MAX_VERSION: u16 = 0;
+pub const PROTOCOL_MIN_VERSION: u16 = 1;
+pub const PROTOCOL_MAX_VERSION: u16 = 1;
 pub const MAX_BOOTSTRAP_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_ROOM_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;

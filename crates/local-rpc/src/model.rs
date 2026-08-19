@@ -1,7 +1,7 @@
 use jsony::Jsony;
 use kvlog::{Encode, ValueEncoder};
 
-use crate::ids::{FileTransferId, MessageId, RoomId, StreamId, UserId};
+use crate::ids::{FileTransferId, MessageId, RoomId, ServerId, StreamId, UserId};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Jsony)]
 #[jsony(Binary)]
@@ -137,11 +137,13 @@ pub enum ServerAvailability {
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
 pub struct ServerSummary {
+    pub server_id: ServerId,
     pub label: String,
     pub username: String,
     pub tcp_addr: String,
     pub require_transport_encryption: bool,
     pub availability: ServerAvailability,
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
@@ -634,12 +636,21 @@ impl ServerSelectionState {
         for server in &self.servers {
             server.validate()?;
         }
+        if self.servers.iter().filter(|server| server.active).count() > 1 {
+            return Err("server selection has more than one active server".into());
+        }
         for (index, server) in self.servers.iter().enumerate() {
             if self.servers[..index]
                 .iter()
                 .any(|other| other.label == server.label)
             {
                 return Err("server labels must be unique".into());
+            }
+            if self.servers[..index]
+                .iter()
+                .any(|other| other.server_id == server.server_id)
+            {
+                return Err("server ids must be unique".into());
             }
         }
         if let Some(error) = &self.error {
@@ -657,6 +668,9 @@ impl ServerSelectionState {
 
 impl ServerSummary {
     pub fn validate(&self) -> Result<(), String> {
+        if self.server_id.0 == [0; 16] {
+            return Err("server id must be nonzero".into());
+        }
         check_nonempty_string(&self.label)?;
         check_string(&self.username)?;
         check_nonempty_string(&self.tcp_addr)

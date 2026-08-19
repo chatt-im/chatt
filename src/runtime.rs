@@ -3061,16 +3061,6 @@ fn handle_management_command(
     use local_rpc::management::{ManagementCommand, ManagementEvent};
 
     match command {
-        ManagementCommand::OpenServerCatalog => {
-            send_management_event(
-                clients,
-                id,
-                ManagementEvent::ServerCatalog {
-                    request_id,
-                    servers: app.management_server_catalog(),
-                },
-            );
-        }
         ManagementCommand::EditServer { server_id } => {
             let Some(draft) = app.management_server_draft(server_id) else {
                 send_management_rejection(
@@ -3154,16 +3144,31 @@ fn handle_management_command(
             }
         }
         ManagementCommand::DeleteServer { server_id } => {
-            // Core commands run inline. `delete_server` returns only after the
-            // config write commits or rolls back, so this is the resulting
-            // catalog rather than an optimistic pre-delete projection.
+            let existed = app.management_server_draft(server_id).is_some();
             app.handle_client_command(id, CoreCommand::DeleteServer { server_id });
+            let deleted = existed && app.management_server_draft(server_id).is_none();
             send_management_event(
                 clients,
                 id,
-                ManagementEvent::ServerCatalog {
-                    request_id,
-                    servers: app.management_server_catalog(),
+                ManagementEvent::ServerDeleteResult {
+                    result: local_rpc::frame::RequestResult {
+                        request_id,
+                        operation: local_rpc::frame::Operation::Management,
+                        outcome: if deleted {
+                            local_rpc::frame::RequestOutcome::Accepted
+                        } else {
+                            local_rpc::frame::RequestOutcome::Rejected {
+                                code: if existed { 500 } else { 404 },
+                                message: if existed {
+                                    "server deletion was not persisted"
+                                } else {
+                                    "server is no longer configured"
+                                }
+                                .into(),
+                            }
+                        },
+                    },
+                    server_id,
                 },
             );
         }

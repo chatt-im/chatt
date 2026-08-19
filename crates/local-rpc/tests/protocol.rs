@@ -10,7 +10,7 @@ use local_rpc::{
     PROTOCOL_MAX_VERSION, PROTOCOL_MIN_VERSION,
     bulk::BulkFinished,
     frame::{ClientFrame, ClientHello, DaemonFrame, NegotiatedLimits, Welcome},
-    ids::StreamId,
+    ids::{ServerId, StreamId},
     model::{
         BulkTransferId, ConnectionState, DaemonInstanceId, LiveShareViewStatus, RequestId,
         ServerAvailability, ServerSelectionState, ServerSummary, StateSnapshot, VoiceSessionState,
@@ -21,15 +21,15 @@ use local_rpc::{
 
 #[test]
 fn renderer_and_daemon_exchange_frames_and_a_live_share_fd() {
-    assert_eq!(PROTOCOL_MIN_VERSION, 0);
-    assert_eq!(PROTOCOL_MAX_VERSION, 0);
+    assert_eq!(PROTOCOL_MIN_VERSION, 1);
+    assert_eq!(PROTOCOL_MAX_VERSION, 1);
     assert_eq!(MAX_MESSAGE_BODY_BYTES, 16 * 1024);
     assert_eq!(DEFAULT_UPLOAD_LIMIT_BYTES, 50 * 1024 * 1024);
     assert_eq!(MAX_HISTORY_REQUEST_MESSAGES, 500);
 
     let hello = ClientHello::current("test-renderer");
     assert!(hello.validate().is_ok());
-    assert_eq!(hello.negotiated_version(), Some(0));
+    assert_eq!(hello.negotiated_version(), Some(1));
 
     let incompatible = ClientHello {
         min_version: 12,
@@ -39,7 +39,7 @@ fn renderer_and_daemon_exchange_frames_and_a_live_share_fd() {
     assert_eq!(incompatible.negotiated_version(), None);
     assert_eq!(
         incompatible.unsupported_version_message(),
-        "unsupported daemon RPC protocol version: client supports 12..=13, daemon supports 0..=0"
+        "unsupported daemon RPC protocol version: client supports 12..=13, daemon supports 1..=1"
     );
 
     // The range check is all that is left guarding the hello's versions, so it
@@ -91,11 +91,13 @@ fn renderer_and_daemon_exchange_frames_and_a_live_share_fd() {
             active_server: Some("test-server".into()),
             server_selection: ServerSelectionState {
                 servers: vec![ServerSummary {
+                    server_id: ServerId([7; 16]),
                     label: "test-server".into(),
                     username: "alice".into(),
                     tcp_addr: "127.0.0.1:4000".into(),
                     require_transport_encryption: true,
                     availability: ServerAvailability::Ready,
+                    active: true,
                 }],
                 error: None,
                 prompt: None,

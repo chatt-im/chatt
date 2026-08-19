@@ -1547,11 +1547,13 @@ mod tests {
     #[test]
     fn rejects_ambiguous_or_duplicate_server_selection_state() {
         let server = super::super::model::ServerSummary {
+            server_id: super::super::ids::ServerId([2; 16]),
             label: "work".into(),
             username: "alice".into(),
             tcp_addr: "127.0.0.1:4000".into(),
             require_transport_encryption: true,
             availability: super::super::model::ServerAvailability::Ready,
+            active: true,
         };
         let selection = ServerSelectionState {
             servers: vec![server.clone(), server],
@@ -1615,7 +1617,19 @@ mod tests {
                 snapshot: StateSnapshot {
                     connection: ConnectionState::Online,
                     active_server: Some("local".into()),
-                    server_selection: Default::default(),
+                    server_selection: ServerSelectionState {
+                        servers: vec![super::super::model::ServerSummary {
+                            server_id: super::super::ids::ServerId([5; 16]),
+                            label: "local".into(),
+                            username: "alice".into(),
+                            tcp_addr: "127.0.0.1:4000".into(),
+                            require_transport_encryption: true,
+                            availability: super::super::model::ServerAvailability::Ready,
+                            active: true,
+                        }],
+                        error: None,
+                        prompt: None,
+                    },
                     local_identity: Some("alice".into()),
                     rooms: Vec::new(),
                     selected_room: None,

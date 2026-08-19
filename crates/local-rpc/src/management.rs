@@ -44,17 +44,6 @@ pub struct ServerDraft {
 
 #[derive(Clone, Debug, PartialEq, Eq, Jsony)]
 #[jsony(Binary, version)]
-pub struct ServerCatalogEntry {
-    pub server_id: ServerId,
-    pub label: String,
-    pub username: String,
-    pub tcp_addr: String,
-    pub require_transport_encryption: bool,
-    pub active: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Jsony)]
-#[jsony(Binary, version)]
 pub struct FieldDiagnostic {
     pub field: String,
     pub message: String,
@@ -107,7 +96,6 @@ pub struct DeviceSummary {
 #[derive(Clone, Debug, PartialEq, Jsony)]
 #[jsony(Binary, version)]
 pub enum ManagementCommand {
-    OpenServerCatalog,
     EditServer { server_id: ServerId },
     SaveServer { draft: ServerDraft, join: bool },
     DeleteServer { server_id: ServerId },
@@ -130,10 +118,6 @@ pub enum ManagementCommand {
 #[derive(Clone, Debug, PartialEq, Jsony)]
 #[jsony(Binary, version)]
 pub enum ManagementEvent {
-    ServerCatalog {
-        request_id: RequestId,
-        servers: Vec<ServerCatalogEntry>,
-    },
     ServerDraft {
         request_id: Option<RequestId>,
         draft: ServerDraft,
@@ -144,6 +128,10 @@ pub enum ManagementEvent {
         outcome: ServerEditOutcome,
         draft: Option<ServerDraft>,
         diagnostics: Vec<FieldDiagnostic>,
+    },
+    ServerDeleteResult {
+        result: RequestResult,
+        server_id: ServerId,
     },
     Join(JoinState),
     PairingPasswordRequired { retry: bool },
@@ -238,33 +226,16 @@ impl ServerDraft {
 impl ManagementEvent {
     pub fn request_id(&self) -> Option<RequestId> {
         match self {
-            Self::ServerCatalog { request_id, .. } => Some(*request_id),
             Self::ServerDraft { request_id, .. } | Self::Devices { request_id, .. } => *request_id,
-            Self::ServerEditResult { result, .. } => Some(result.request_id),
+            Self::ServerEditResult { result, .. } | Self::ServerDeleteResult { result, .. } => {
+                Some(result.request_id)
+            }
             _ => None,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::ServerCatalog {
-                request_id,
-                servers,
-            } => {
-                check_request(*request_id)?;
-                if servers.len() > crate::MAX_SERVERS {
-                    return Err("server catalog exceeds limit".into());
-                }
-                for server in servers {
-                    if server.server_id.0 == [0; 16] {
-                        return Err("server id must be nonzero".into());
-                    }
-                    check_text(&server.label, "server label")?;
-                    check_text(&server.username, "server username")?;
-                    check_text(&server.tcp_addr, "server TCP address")?;
-                }
-                Ok(())
-            }
             Self::ServerDraft {
                 request_id,
                 draft,
@@ -275,6 +246,19 @@ impl ManagementEvent {
                 }
                 draft.validate()?;
                 validate_diagnostics(diagnostics)
+            }
+            Self::ServerDeleteResult { result, server_id } => {
+                check_request(result.request_id)?;
+                if result.operation != crate::frame::Operation::Management {
+                    return Err("server delete result carries the wrong operation".into());
+                }
+                if server_id.0 == [0; 16] {
+                    return Err("server id must be nonzero".into());
+                }
+                if let crate::frame::RequestOutcome::Rejected { message, .. } = &result.outcome {
+                    check_text(message, "server delete rejection")?;
+                }
+                Ok(())
             }
             Self::ServerEditResult {
                 result,
@@ -431,6 +415,19 @@ mod tests {
             diagnostics: Vec::new(),
         });
         assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+
+        let deleted = DaemonFrame::Management(ManagementEvent::ServerDeleteResult {
+            result: RequestResult {
+                request_id: RequestId(8),
+                operation: Operation::Management,
+                outcome: RequestOutcome::Accepted,
+            },
+            server_id: ServerId([4; 16]),
+        });
+        assert_eq!(
+            decode_daemon(&encode_daemon(&deleted).unwrap()).unwrap(),
+            deleted
+        );
     }
 
     #[test]
