@@ -18,12 +18,7 @@
 //! clipboard is empty.
 
 use std::{
-    borrow::Cow,
-    ffi::OsString,
-    io,
-    os::windows::ffi::OsStringExt,
-    path::PathBuf,
-    sync::OnceLock,
+    borrow::Cow, ffi::OsString, io, os::windows::ffi::OsStringExt, path::PathBuf, sync::OnceLock,
     time::Duration,
 };
 
@@ -135,7 +130,10 @@ pub(crate) fn text() -> Option<String> {
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
-    let end = text.iter().position(|unit| *unit == 0).unwrap_or(text.len());
+    let end = text
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(text.len());
     Some(String::from_utf16_lossy(&text[..end]))
 }
 

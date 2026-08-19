@@ -21,12 +21,8 @@ impl App {
             .active_server_id
             .ok_or_else(|| "connect to a server first".to_string())?;
         let source = self.config.load_runtime_document()?;
-        let document = self.rpc_room_settings_document(
-            &source.config,
-            source.revision,
-            server_id,
-            room_id,
-        )?;
+        let document =
+            self.rpc_room_settings_document(&source.config, source.revision, server_id, room_id)?;
         Ok(wire::RoomSettingsEvent::Document {
             request_id,
             document,
@@ -41,12 +37,8 @@ impl App {
     ) -> Result<wire::RoomSettingsEvent, String> {
         self.require_active_room_settings_target(server_id, room_id)?;
         let source = self.config.load_runtime_document()?;
-        let document = self.rpc_room_settings_document(
-            &source.config,
-            source.revision,
-            server_id,
-            room_id,
-        )?;
+        let document =
+            self.rpc_room_settings_document(&source.config, source.revision, server_id, room_id)?;
         Ok(wire::RoomSettingsEvent::Document {
             request_id,
             document,
@@ -121,12 +113,8 @@ impl App {
             .ok_or_else(|| "server is no longer configured".to_string())?
             .rooms = committed_rooms;
         self.push_file_policy();
-        let document = self.rpc_room_settings_document(
-            &source.config,
-            revision,
-            server_id,
-            room_id,
-        )?;
+        let document =
+            self.rpc_room_settings_document(&source.config, revision, server_id, room_id)?;
         Ok(wire::RoomSettingsEvent::Saved {
             request_id,
             document,

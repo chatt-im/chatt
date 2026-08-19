@@ -96,23 +96,41 @@ pub struct DeviceSummary {
 #[derive(Clone, Debug, PartialEq, Jsony)]
 #[jsony(Binary, version)]
 pub enum ManagementCommand {
-    EditServer { server_id: ServerId },
-    SaveServer { draft: ServerDraft, join: bool },
-    DeleteServer { server_id: ServerId },
+    EditServer {
+        server_id: ServerId,
+    },
+    SaveServer {
+        draft: ServerDraft,
+        join: bool,
+    },
+    DeleteServer {
+        server_id: ServerId,
+    },
     Pair {
         input: String,
         device_name: String,
         overwrite_existing_device: bool,
     },
-    SubmitPairingPassword { password: String },
-    ResolvePlaintext { target: PlaintextPromptTarget, accept: bool },
+    SubmitPairingPassword {
+        password: String,
+    },
+    ResolvePlaintext {
+        target: PlaintextPromptTarget,
+        accept: bool,
+    },
     CancelPairing,
-    RetryJoin { attempt_id: u64 },
-    CancelJoin { attempt_id: u64 },
+    RetryJoin {
+        attempt_id: u64,
+    },
+    CancelJoin {
+        attempt_id: u64,
+    },
     ListDevices,
     CreateDeviceLink,
     CancelDeviceLink,
-    RevokeDevice { device_id: DeviceId },
+    RevokeDevice {
+        device_id: DeviceId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Jsony)]
@@ -134,13 +152,19 @@ pub enum ManagementEvent {
         server_id: ServerId,
     },
     Join(JoinState),
-    PairingPasswordRequired { retry: bool },
+    PairingPasswordRequired {
+        retry: bool,
+    },
     PlaintextConsentRequired {
         label: String,
         target: PlaintextPromptTarget,
     },
-    PairingFailed { message: String },
-    PairingIdentityExists { message: String },
+    PairingFailed {
+        message: String,
+    },
+    PairingIdentityExists {
+        message: String,
+    },
     Devices {
         request_id: Option<RequestId>,
         devices: Vec<DeviceSummary>,
@@ -150,8 +174,13 @@ pub enum ManagementEvent {
         expires_at_ms: u64,
     },
     DeviceLinkCanceled,
-    DeviceLinked { device: DeviceSummary },
-    Status { message: String, error: bool },
+    DeviceLinked {
+        device: DeviceSummary,
+    },
+    Status {
+        message: String,
+        error: bool,
+    },
 }
 
 impl ManagementCommand {
@@ -159,9 +188,7 @@ impl ManagementCommand {
         match self {
             Self::SaveServer { draft, .. } => draft.validate(),
             Self::Pair {
-                input,
-                device_name,
-                ..
+                input, device_name, ..
             } => {
                 check_text(input, "pairing input")?;
                 if !device_name.is_empty() {
@@ -169,19 +196,14 @@ impl ManagementCommand {
                 }
                 Ok(())
             }
-            Self::SubmitPairingPassword { password } => {
-                check_text(password, "pairing password")
-            }
+            Self::SubmitPairingPassword { password } => check_text(password, "pairing password"),
             Self::ResolvePlaintext {
                 target: PlaintextPromptTarget::Join { attempt_id: 0 },
                 ..
             }
             | Self::RetryJoin { attempt_id: 0 }
-            | Self::CancelJoin { attempt_id: 0 } => {
-                Err("join attempt id must be nonzero".into())
-            }
-            Self::EditServer { server_id }
-            | Self::DeleteServer { server_id }
+            | Self::CancelJoin { attempt_id: 0 } => Err("join attempt id must be nonzero".into()),
+            Self::EditServer { server_id } | Self::DeleteServer { server_id }
                 if server_id.0 == [0; 16] =>
             {
                 Err("server id must be nonzero".into())
@@ -402,7 +424,10 @@ mod tests {
                 join: true,
             },
         };
-        assert_eq!(decode_client(&encode_client(&command).unwrap()).unwrap(), command);
+        assert_eq!(
+            decode_client(&encode_client(&command).unwrap()).unwrap(),
+            command
+        );
 
         let event = DaemonFrame::Management(ManagementEvent::ServerEditResult {
             result: RequestResult {
@@ -414,7 +439,10 @@ mod tests {
             draft: None,
             diagnostics: Vec::new(),
         });
-        assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+        assert_eq!(
+            decode_daemon(&encode_daemon(&event).unwrap()).unwrap(),
+            event
+        );
 
         let deleted = DaemonFrame::Management(ManagementEvent::ServerDeleteResult {
             result: RequestResult {
@@ -438,13 +466,13 @@ mod tests {
         draft.server_identity.clear();
         let command = ClientFrame::Management {
             request_id: RequestId(8),
-            command: ManagementCommand::SaveServer {
-                draft,
-                join: false,
-            },
+            command: ManagementCommand::SaveServer { draft, join: false },
         };
 
-        assert_eq!(decode_client(&encode_client(&command).unwrap()).unwrap(), command);
+        assert_eq!(
+            decode_client(&encode_client(&command).unwrap()).unwrap(),
+            command
+        );
     }
 
     #[test]

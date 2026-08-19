@@ -15,10 +15,7 @@ use std::{
     error::Error,
     fmt,
     fs::{self, File},
-    os::{
-        fd::OwnedFd,
-        unix::net::UnixStream,
-    },
+    os::{fd::OwnedFd, unix::net::UnixStream},
     path::PathBuf,
     sync::{
         Arc,
@@ -117,10 +114,7 @@ impl SetupDraft {
             .config
             .take()
             .ok_or_else(|| StartupError::Setup("first-run setup was already completed".into()))?;
-        Ok(PreparedCore {
-            config,
-            instance,
-        })
+        Ok(PreparedCore { config, instance })
     }
 }
 
@@ -160,21 +154,16 @@ impl CoreBuilder {
                 .as_deref()
                 .ok_or_else(|| StartupError::Config("configuration path is unavailable".into()))?,
         };
-        let instance = EmbeddedInstanceLock::claim(
-            &crate::paths::client_instance_name(path),
-            config_path,
-        )?;
+        let instance =
+            EmbeddedInstanceLock::claim(&crate::paths::client_instance_name(path), config_path)?;
         match loaded {
-            AppConfigLoad::Existing(config) => Ok(Startup::Ready(PreparedCore {
-                config,
-                instance,
-            })),
-            AppConfigLoad::Missing(config) => {
-                Ok(Startup::NeedsSetup(SetupDraft {
-                    config: Some(config),
-                    instance: Some(instance),
-                }))
+            AppConfigLoad::Existing(config) => {
+                Ok(Startup::Ready(PreparedCore { config, instance }))
             }
+            AppConfigLoad::Missing(config) => Ok(Startup::NeedsSetup(SetupDraft {
+                config: Some(config),
+                instance: Some(instance),
+            })),
         }
     }
 }
@@ -432,10 +421,12 @@ impl FrontendCommandSender {
     }
 
     fn enqueue(&self, request: DirectRequest) -> Result<(), FrontendSendError> {
-        self.commands.try_send(request).map_err(|error| match error {
-            TrySendError::Full(_) => FrontendSendError::Full,
-            TrySendError::Disconnected(_) => FrontendSendError::Stopped,
-        })?;
+        self.commands
+            .try_send(request)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => FrontendSendError::Full,
+                TrySendError::Disconnected(_) => FrontendSendError::Stopped,
+            })?;
         self.wake
             .send(AppEvent::EmbeddedFrontendWake(self.client_id))
             .map_err(|_| FrontendSendError::Stopped)
@@ -815,10 +806,7 @@ mod tests {
             panic!("fresh path must require setup");
         };
         assert!(matches!(
-            CoreBuilder::new()
-                .config_path(&path)
-                .unwrap()
-                .load(),
+            CoreBuilder::new().config_path(&path).unwrap().load(),
             Err(StartupError::AlreadyRunning)
         ));
 
@@ -916,12 +904,14 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(sender
-            .send(ClientFrame::Ping {
-                request_id: RequestId(1000),
-                nonce: 1000,
-            })
-            .is_err());
+        assert!(
+            sender
+                .send(ClientFrame::Ping {
+                    request_id: RequestId(1000),
+                    nonce: 1000,
+                })
+                .is_err()
+        );
         core.shutdown().unwrap();
     }
 }

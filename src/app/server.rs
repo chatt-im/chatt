@@ -304,8 +304,7 @@ impl ServerEditDraft {
         &mut self,
         document: &local_rpc::management::ServerDraft,
     ) -> Result<(), String> {
-        if document.server_id != self.server_id()
-            || document.is_new != self.new_server().is_some()
+        if document.server_id != self.server_id() || document.is_new != self.new_server().is_some()
         {
             return Err("server draft no longer names the same entry".into());
         }

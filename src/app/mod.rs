@@ -12,8 +12,8 @@ pub(crate) mod participants;
 pub(crate) mod room;
 pub(crate) mod room_settings;
 mod rpc_identity;
-mod rpc_settings;
 mod rpc_room_settings;
+mod rpc_settings;
 pub(crate) mod server;
 mod server_catalog;
 mod shared;
@@ -5332,9 +5332,7 @@ impl App {
                 pairing_string,
                 expires_at_ms,
             } => {
-                let owner = self
-                    .device_management_owner
-                    .unwrap_or(self.command_client);
+                let owner = self.device_management_owner.unwrap_or(self.command_client);
                 self.send_to(
                     owner,
                     TerminalEvent::Navigation(NavigationEvent::ShowOverlay(Box::new(
@@ -5356,7 +5354,10 @@ impl App {
                     .device_management_owner
                     .take()
                     .unwrap_or(self.command_client);
-                self.send_to(owner, TerminalEvent::Navigation(NavigationEvent::CloseOverlay));
+                self.send_to(
+                    owner,
+                    TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
+                );
                 self.send_to(
                     owner,
                     TerminalEvent::DeviceLinked(local_rpc::management::DeviceSummary {
@@ -5372,7 +5373,10 @@ impl App {
                     .device_management_owner
                     .take()
                     .unwrap_or(self.command_client);
-                self.send_to(owner, TerminalEvent::Navigation(NavigationEvent::CloseOverlay));
+                self.send_to(
+                    owner,
+                    TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
+                );
                 self.send_to(owner, TerminalEvent::DeviceLinkCanceled);
                 self.set_status("device link canceled");
             }
@@ -5683,27 +5687,18 @@ impl App {
         ));
     }
 
-    pub(crate) fn management_server_draft(
-        &self,
-        server_id: ServerId,
-    ) -> Option<ServerEditDraft> {
+    pub(crate) fn management_server_draft(&self, server_id: ServerId) -> Option<ServerEditDraft> {
         self.config
             .server_by_id(server_id)
             .map(|server| ServerEditDraft::from_server(server, &self.config))
     }
 
-    pub(crate) fn management_list_devices(
-        &mut self,
-        owner: crate::client_channel::ClientId,
-    ) {
+    pub(crate) fn management_list_devices(&mut self, owner: crate::client_channel::ClientId) {
         self.device_management_owner = Some(owner);
         self.send_network_command(NetworkCommand::ListE2eDevices, true);
     }
 
-    pub(crate) fn management_create_device_link(
-        &mut self,
-        owner: crate::client_channel::ClientId,
-    ) {
+    pub(crate) fn management_create_device_link(&mut self, owner: crate::client_channel::ClientId) {
         self.device_management_owner = Some(owner);
         self.send_network_command(NetworkCommand::CreateDeviceLink, true);
     }
@@ -5753,10 +5748,7 @@ impl App {
                 && self.network.is_some()
                 && self.video_transport.is_some(),
             can_restart: self.cached_screencast_start.is_some(),
-            last_issue: status
-                .last_issue
-                .as_ref()
-                .map(|issue| issue.reason.clone()),
+            last_issue: status.last_issue.as_ref().map(|issue| issue.reason.clone()),
         }
     }
 
@@ -5933,10 +5925,9 @@ impl App {
         if preview_user_id != user_id {
             return Ok(());
         }
-        let gain_db = self.config.user_volume_db(
-            self.room.active_server_id.unwrap_or_default(),
-            user_id,
-        );
+        let gain_db = self
+            .config
+            .user_volume_db(self.room.active_server_id.unwrap_or_default(), user_id);
         self.room.clear_volume_preview();
         self.participant_audio_owner = None;
         self.apply_user_audio_control_with_volume(user_id, gain_db);
@@ -6240,10 +6231,9 @@ impl App {
         }
         if self.participant_audio_owner == Some(client_id) {
             if let Some((user_id, _)) = self.room.volume_preview() {
-                let gain_db = self.config.user_volume_db(
-                    self.room.active_server_id.unwrap_or_default(),
-                    user_id,
-                );
+                let gain_db = self
+                    .config
+                    .user_volume_db(self.room.active_server_id.unwrap_or_default(), user_id);
                 self.room.clear_volume_preview();
                 self.apply_user_audio_control_with_volume(user_id, gain_db);
             }
@@ -9945,12 +9935,13 @@ mod tests {
     fn canceling_an_absent_participant_gain_preview_is_idempotent() {
         let mut app = test_app();
 
-        assert!(app
-            .rpc_cancel_participant_gain(
+        assert!(
+            app.rpc_cancel_participant_gain(
                 crate::client_channel::ClientId(7),
                 rpc::ids::UserId(9),
             )
-            .is_ok());
+            .is_ok()
+        );
         assert!(app.participant_audio_owner.is_none());
         assert!(app.room.volume_preview().is_none());
     }

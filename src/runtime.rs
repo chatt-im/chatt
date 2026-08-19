@@ -33,9 +33,9 @@ use local_rpc::frame::{DaemonFrame, NegotiatedLimits, StateDelta, StateEvent, We
 use parking_lot::Mutex;
 
 #[cfg(all(unix, feature = "embedded-client"))]
-use crate::embedded::{AttachmentBody, DirectRequest, EmbeddedReady, FrontendEvent};
-#[cfg(all(unix, feature = "embedded-client"))]
 use crate::app::frontend::RpcCommandEffect;
+#[cfg(all(unix, feature = "embedded-client"))]
+use crate::embedded::{AttachmentBody, DirectRequest, EmbeddedReady, FrontendEvent};
 
 #[cfg(unix)]
 use crate::attach;
@@ -607,8 +607,7 @@ impl FrontendSink for DirectFrontendSink {
             }
             crate::receive_store::Source::Disk(path) => {
                 let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
-                if file.metadata().map_err(|error| error.to_string())?.len()
-                    != descriptor.byte_len
+                if file.metadata().map_err(|error| error.to_string())?.len() != descriptor.byte_len
                 {
                     return Err("attachment length changed before direct delivery".into());
                 }
@@ -632,14 +631,17 @@ impl FrontendSink for DirectFrontendSink {
     fn shutdown(&self) {}
 
     fn abort(&self) {
-        let _ = self.core_events.send(AppEvent::RpcClientExited(self.client_id));
+        let _ = self
+            .core_events
+            .send(AppEvent::RpcClientExited(self.client_id));
     }
 }
 
 #[cfg(unix)]
 impl RpcClientSender {
     fn send(&self, frame: DaemonFrame) -> Result<(), String> {
-        self.send_classified(frame).map_err(|error| error.to_string())
+        self.send_classified(frame)
+            .map_err(|error| error.to_string())
     }
 
     fn send_classified(&self, frame: DaemonFrame) -> Result<(), SinkError> {
@@ -731,11 +733,7 @@ impl RpcClientSender {
         self.handle_send_result(metadata, result)
     }
 
-    fn handle_send_result(
-        &self,
-        metadata: FrameMetadata,
-        result: Result<(), SinkError>,
-    ) -> bool {
+    fn handle_send_result(&self, metadata: FrameMetadata, result: Result<(), SinkError>) -> bool {
         match result {
             Ok(()) => true,
             Err(SinkError::Invalid(reason)) => {
@@ -815,7 +813,6 @@ impl RpcClientSender {
     fn cancel_request(&self, request_id: local_rpc::model::RequestId) -> bool {
         self.outstanding.lock().remove(&request_id)
     }
-
 }
 
 #[cfg(unix)]
@@ -866,7 +863,9 @@ fn daemon_request_target(
         DaemonFrame::RequestResult(result) | DaemonFrame::CommandResult { result, .. } => {
             Some((result.request_id, result.operation))
         }
-        DaemonFrame::CommandCandidates { request_id, .. } => Some((*request_id, Operation::RunCommand)),
+        DaemonFrame::CommandCandidates { request_id, .. } => {
+            Some((*request_id, Operation::RunCommand))
+        }
         DaemonFrame::LiveShareOpened { request_id, .. } => {
             Some((*request_id, Operation::StartLiveShare))
         }
@@ -889,9 +888,7 @@ fn daemon_request_target(
         DaemonFrame::Directory(event) => event
             .request_id()
             .map(|request_id| (request_id, Operation::Directory)),
-        DaemonFrame::RoomSettings(event) => {
-            Some((event.request_id(), Operation::RoomSettings))
-        }
+        DaemonFrame::RoomSettings(event) => Some((event.request_id(), Operation::RoomSettings)),
         DaemonFrame::BulkDeleteResult(result) => {
             Some((result.request_id, Operation::BulkDeleteMessages))
         }
@@ -1366,12 +1363,7 @@ fn handle_runtime_event(
         }
         #[cfg(all(unix, feature = "embedded-client"))]
         AppEvent::EmbeddedFrontendWake(client_id) => {
-            handle_direct_frontend_requests(
-                app,
-                rpc_clients,
-                client_id,
-                daemon_instance,
-            );
+            handle_direct_frontend_requests(app, rpc_clients, client_id, daemon_instance);
         }
         #[cfg(all(unix, feature = "embedded-client"))]
         AppEvent::EmbeddedCoreShutdown => {
@@ -2962,9 +2954,7 @@ fn handle_room_settings_command(
     use local_rpc::room_settings::RoomSettingsCommand;
 
     let result = match command {
-        RoomSettingsCommand::Open { room_id } => {
-            app.rpc_open_room_settings(request_id, room_id)
-        }
+        RoomSettingsCommand::Open { room_id } => app.rpc_open_room_settings(request_id, room_id),
         RoomSettingsCommand::Reload { server_id, room_id } => {
             app.rpc_reload_room_settings(request_id, server_id, room_id)
         }
@@ -2973,13 +2963,7 @@ fn handle_room_settings_command(
             room_id,
             expected_revision,
             values,
-        } => app.rpc_save_room_settings(
-            request_id,
-            server_id,
-            room_id,
-            expected_revision,
-            values,
-        ),
+        } => app.rpc_save_room_settings(request_id, server_id, room_id, expected_revision, values),
     };
     if let Some(client) = clients.get(&id) {
         match result {
@@ -3010,12 +2994,12 @@ fn handle_directory_command(
     let audio_result = match command {
         DirectoryCommand::Open => {
             if let Some(client) = clients.get(&id) {
-                client.sender.send_or_abort(DaemonFrame::Directory(
-                    DirectoryEvent::Users {
+                client
+                    .sender
+                    .send_or_abort(DaemonFrame::Directory(DirectoryEvent::Users {
                         request_id: Some(request_id),
                         users: app.rpc_directory_users(),
-                    },
-                ));
+                    }));
             }
             return;
         }
@@ -3111,13 +3095,13 @@ fn handle_management_command(
             let draft_id = local_rpc::management::ServerDraftId(client.next_server_draft);
             let document = draft.management_document(draft_id);
             client.server_drafts.insert(draft_id, draft);
-            client.sender.send_or_abort(DaemonFrame::Management(
-                ManagementEvent::ServerDraft {
+            client
+                .sender
+                .send_or_abort(DaemonFrame::Management(ManagementEvent::ServerDraft {
                     request_id: Some(request_id),
                     draft: document,
                     diagnostics: Vec::new(),
-                },
-            ));
+                }));
         }
         ManagementCommand::SaveServer { draft, join } => {
             let draft_id = draft.draft_id;
@@ -3231,14 +3215,12 @@ fn handle_management_command(
                 (local_rpc::management::PlaintextPromptTarget::Pairing, false) => {
                     CoreCommand::CancelPairing
                 }
-                (
-                    local_rpc::management::PlaintextPromptTarget::Join { attempt_id },
-                    true,
-                ) => CoreCommand::AcceptTransportEncryption { attempt_id },
-                (
-                    local_rpc::management::PlaintextPromptTarget::Join { attempt_id },
-                    false,
-                ) => CoreCommand::CancelTransportEncryption { attempt_id },
+                (local_rpc::management::PlaintextPromptTarget::Join { attempt_id }, true) => {
+                    CoreCommand::AcceptTransportEncryption { attempt_id }
+                }
+                (local_rpc::management::PlaintextPromptTarget::Join { attempt_id }, false) => {
+                    CoreCommand::CancelTransportEncryption { attempt_id }
+                }
             };
             app.handle_client_command(id, command);
             send_management_acceptance(clients, id, request_id);
@@ -3271,13 +3253,7 @@ fn handle_management_command(
                 app.management_cancel_device_link(id, redemption_secret_hash);
                 send_management_acceptance(clients, id, request_id);
             } else {
-                send_management_rejection(
-                    clients,
-                    id,
-                    request_id,
-                    404,
-                    "no active device link",
-                );
+                send_management_rejection(clients, id, request_id, 404, "no active device link");
             }
         }
         ManagementCommand::RevokeDevice { device_id } => {
@@ -3333,17 +3309,12 @@ fn send_management_event(
     event: local_rpc::management::ManagementEvent,
 ) {
     if let Some(client) = clients.get(&id) {
-        client
-            .sender
-            .send_or_abort(DaemonFrame::Management(event));
+        client.sender.send_or_abort(DaemonFrame::Management(event));
     }
 }
 
 #[cfg(unix)]
-fn drain_management_events(
-    clients: &mut HashMap<ClientId, RemoteRpcClient>,
-    id: ClientId,
-) {
+fn drain_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>, id: ClientId) {
     let Some(client) = clients.get_mut(&id) else {
         return;
     };
@@ -3356,8 +3327,7 @@ fn drain_management_events(
             ) => match *screen {
                 crate::client_channel::ScreenSpec::ServerEditor(draft) => {
                     client.next_server_draft = client.next_server_draft.wrapping_add(1).max(1);
-                    let draft_id =
-                        local_rpc::management::ServerDraftId(client.next_server_draft);
+                    let draft_id = local_rpc::management::ServerDraftId(client.next_server_draft);
                     let document = draft.management_document(draft_id);
                     client.server_drafts.insert(draft_id, draft);
                     Some(local_rpc::management::ManagementEvent::ServerDraft {
@@ -3401,9 +3371,9 @@ fn drain_management_events(
                         expires_at_ms: dialog.expires_at_ms(),
                     })
                 }
-                crate::client_channel::OverlaySpec::PairingPassword { retry } => Some(
-                    local_rpc::management::ManagementEvent::PairingPasswordRequired { retry },
-                ),
+                crate::client_channel::OverlaySpec::PairingPassword { retry } => {
+                    Some(local_rpc::management::ManagementEvent::PairingPasswordRequired { retry })
+                }
                 _ => None,
             },
             crate::client_channel::TerminalEvent::ServerEditResult {
@@ -3508,24 +3478,24 @@ fn drain_management_events(
             crate::client_channel::TerminalEvent::JoinUpdate(join) => Some(
                 local_rpc::management::ManagementEvent::Join(management_join_state(join)),
             ),
-            crate::client_channel::TerminalEvent::PairingPasswordChallenge { retry } => Some(
-                local_rpc::management::ManagementEvent::PairingPasswordRequired { retry },
-            ),
+            crate::client_channel::TerminalEvent::PairingPasswordChallenge { retry } => {
+                Some(local_rpc::management::ManagementEvent::PairingPasswordRequired { retry })
+            }
             crate::client_channel::TerminalEvent::PairingFailed(message) => {
                 Some(local_rpc::management::ManagementEvent::PairingFailed { message })
             }
-            crate::client_channel::TerminalEvent::DevicePairingIdentityExists { message } => Some(
-                local_rpc::management::ManagementEvent::PairingIdentityExists { message },
-            ),
+            crate::client_channel::TerminalEvent::DevicePairingIdentityExists { message } => {
+                Some(local_rpc::management::ManagementEvent::PairingIdentityExists { message })
+            }
             crate::client_channel::TerminalEvent::DevicePairingFailed { message } => {
                 Some(local_rpc::management::ManagementEvent::PairingFailed { message })
             }
-            crate::client_channel::TerminalEvent::DevicesListed(devices) => Some(
-                local_rpc::management::ManagementEvent::Devices {
+            crate::client_channel::TerminalEvent::DevicesListed(devices) => {
+                Some(local_rpc::management::ManagementEvent::Devices {
                     request_id: None,
                     devices,
-                },
-            ),
+                })
+            }
             crate::client_channel::TerminalEvent::DeviceLinkCanceled => {
                 client.device_link_cancel = None;
                 Some(local_rpc::management::ManagementEvent::DeviceLinkCanceled)
@@ -3535,24 +3505,22 @@ fn drain_management_events(
                 Some(local_rpc::management::ManagementEvent::DeviceLinked { device })
             }
             crate::client_channel::TerminalEvent::Status(message)
-            | crate::client_channel::TerminalEvent::TransientStatus(message) => Some(
-                local_rpc::management::ManagementEvent::Status {
+            | crate::client_channel::TerminalEvent::TransientStatus(message) => {
+                Some(local_rpc::management::ManagementEvent::Status {
                     message,
                     error: false,
-                },
-            ),
-            crate::client_channel::TerminalEvent::Error(message) => Some(
-                local_rpc::management::ManagementEvent::Status {
+                })
+            }
+            crate::client_channel::TerminalEvent::Error(message) => {
+                Some(local_rpc::management::ManagementEvent::Status {
                     message,
                     error: true,
-                },
-            ),
+                })
+            }
             _ => None,
         };
         if let Some(event) = mapped {
-            client
-                .sender
-                .send_or_abort(DaemonFrame::Management(event));
+            client.sender.send_or_abort(DaemonFrame::Management(event));
         }
     }
 }
@@ -3594,10 +3562,7 @@ fn management_join_state(
 }
 
 #[cfg(unix)]
-fn broadcast_rpc_publishing_events(
-    app: &App,
-    clients: &mut HashMap<ClientId, RemoteRpcClient>,
-) {
+fn broadcast_rpc_publishing_events(app: &App, clients: &mut HashMap<ClientId, RemoteRpcClient>) {
     let state = app.rpc_publishing_state();
     for client in clients.values_mut() {
         if client.last_publishing_state.as_ref() == Some(&state) {
@@ -4176,13 +4141,11 @@ fn handle_rpc_effect(
             kind,
             items,
         } => {
-            client
-                .sender
-                .send_or_abort(DaemonFrame::CommandCandidates {
-                    request_id,
-                    kind,
-                    items,
-                });
+            client.sender.send_or_abort(DaemonFrame::CommandCandidates {
+                request_id,
+                kind,
+                items,
+            });
         }
         RpcCommandEffect::MessageReferenceResolved {
             request_id,
@@ -4622,8 +4585,8 @@ mod tests {
         let request_id = RequestId(7);
         assert!(sender.begin_request(request_id));
 
-        assert!(!sender.send_or_abort(DaemonFrame::Directory(
-            DirectoryEvent::Users {
+        assert!(
+            !sender.send_or_abort(DaemonFrame::Directory(DirectoryEvent::Users {
                 request_id: Some(request_id),
                 users: vec![DirectoryUser {
                     user_id: UserId(0),
@@ -4631,8 +4594,8 @@ mod tests {
                     local: false,
                     presence: DirectoryPresence::AwayUnseen,
                 }],
-            },
-        )));
+            },))
+        );
 
         assert!(!sink.aborted.load(Ordering::SeqCst));
         assert!(sender.outstanding.lock().is_empty());

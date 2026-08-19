@@ -36,10 +36,7 @@ impl BulkDeleteResult {
         if self.accepted.len() + self.skipped.len() > crate::MAX_MESSAGES {
             return Err("bulk delete result exceeds limit".into());
         }
-        if self
-            .accepted
-            .windows(2)
-            .any(|ids| ids[0] >= ids[1])
+        if self.accepted.windows(2).any(|ids| ids[0] >= ids[1])
             || self
                 .skipped
                 .windows(2)
@@ -70,7 +67,10 @@ mod tests {
             room_id: RoomId(2),
             targets: vec![MessageId(3), MessageId(8)],
         };
-        assert_eq!(decode_client(&encode_client(&command).unwrap()).unwrap(), command);
+        assert_eq!(
+            decode_client(&encode_client(&command).unwrap()).unwrap(),
+            command
+        );
 
         let event = DaemonFrame::BulkDeleteResult(BulkDeleteResult {
             request_id: RequestId(4),
@@ -81,6 +81,9 @@ mod tests {
                 reason: DeleteSkipReason::NotLocal,
             }],
         });
-        assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+        assert_eq!(
+            decode_daemon(&encode_daemon(&event).unwrap()).unwrap(),
+            event
+        );
     }
 }

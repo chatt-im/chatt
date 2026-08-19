@@ -1793,9 +1793,7 @@ impl Actor {
                         local: certificate.body.device_id == local_device,
                     })
                     .collect();
-                let _ = self
-                    .events
-                    .send(NetworkEvent::E2eDevicesListed { devices });
+                let _ = self.events.send(NetworkEvent::E2eDevicesListed { devices });
                 Ok(())
             }
             Command::CreateDeviceLink => {

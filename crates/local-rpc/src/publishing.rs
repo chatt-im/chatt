@@ -100,8 +100,7 @@ impl PublishingState {
         if let Some(issue) = &self.last_issue {
             crate::model::check_nonempty_string(issue)?;
         }
-        if self.phase == PublishingPhase::Live
-            && (self.stream_id.is_none() || self.codec.is_none())
+        if self.phase == PublishingPhase::Live && (self.stream_id.is_none() || self.codec.is_none())
         {
             return Err("live publishing state is incomplete".into());
         }

@@ -10,8 +10,6 @@ use super::{
     directory::{DirectoryCommand, DirectoryEvent},
     identity::{IdentityCommand, IdentityEvent, IdentityResult},
     management::{ManagementCommand, ManagementEvent},
-    publishing::{PublishingCommand, PublishingEvent},
-    room_settings::{RoomSettingsCommand, RoomSettingsEvent},
     model::{
         AttachmentId, BulkTransferId, CommandCandidate, CommandCandidateKind, CommandInfo,
         CommandOutputLine, ConnectionState, DaemonInstanceId, LiveShare, LiveShareViewStatus,
@@ -19,6 +17,8 @@ use super::{
         StateSnapshot, SystemMessage, TransferSummary, TrustState, VoiceMemberUpdate, VoiceRoster,
         VoiceSessionState, VoiceState, check_voice_member_updates,
     },
+    publishing::{PublishingCommand, PublishingEvent},
+    room_settings::{RoomSettingsCommand, RoomSettingsEvent},
     settings::{SettingsCommand, SettingsEvent, SettingsResult},
 };
 

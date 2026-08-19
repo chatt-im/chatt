@@ -4091,9 +4091,9 @@ impl WorkerState<'_> {
             return Err("upload has both file and in-memory sources".into());
         }
         let (size, name, mut file, source_bytes) = if let Some(bytes) = source_bytes {
-                let size = bytes.len() as u64;
-                let name = upload_username(name_override, &path)?;
-                (size, name, None, Some(bytes))
+            let size = bytes.len() as u64;
+            let name = upload_username(name_override, &path)?;
+            (size, name, None, Some(bytes))
         } else if let Some(file) = opened_file {
             let metadata = file
                 .metadata()
@@ -4143,10 +4143,7 @@ impl WorkerState<'_> {
                             .expect("path upload has an open file")
                             .read_exact(&mut source_prefix)
                             .map_err(|error| {
-                                format!(
-                                    "failed to read compression probe for {}: {error}",
-                                    name
-                                )
+                                format!("failed to read compression probe for {}: {error}", name)
                             })?;
                     }
                 }
@@ -4199,9 +4196,9 @@ impl WorkerState<'_> {
         let seal = if self.room_requires_mls(room_id) {
             let digest = match source_bytes.as_ref() {
                 Some(bytes) => bytes_sha256(bytes),
-                None if opened_source => file_sha256_opened(
-                    file.as_mut().expect("opened upload retains its file"),
-                )?,
+                None if opened_source => {
+                    file_sha256_opened(file.as_mut().expect("opened upload retains its file"))?
+                }
                 None => file_sha256(&path)?,
             };
             self.prepare_upload_seal(room_id, body.encoding(), digest)?

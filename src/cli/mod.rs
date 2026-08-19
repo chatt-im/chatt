@@ -917,14 +917,13 @@ fn run_interactive_app(
     // `chatt` attaches instead of starting. Where there is no control socket,
     // nothing else stops two clients writing the same config, room catalog,
     // room history and receive store, none of which are locked.
-    let _instance = match chatt_platform::instance::claim(
-        &crate::paths::client_instance_name(config_path),
-    )? {
-        chatt_platform::instance::Claim::Held(lock) => lock,
-        chatt_platform::instance::Claim::Taken => {
-            return Err("chatt is already running in this session".into());
-        }
-    };
+    let _instance =
+        match chatt_platform::instance::claim(&crate::paths::client_instance_name(config_path))? {
+            chatt_platform::instance::Claim::Held(lock) => lock,
+            chatt_platform::instance::Claim::Taken => {
+                return Err("chatt is already running in this session".into());
+            }
+        };
     let mut retaking = false;
     loop {
         match crate::attach::run_thin_client(intent.as_ref()) {

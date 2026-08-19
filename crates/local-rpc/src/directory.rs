@@ -12,7 +12,9 @@ pub enum DirectoryPresence {
         voice_room_id: Option<RoomId>,
         voice_room_name: Option<String>,
     },
-    AwaySeen { away_for_ms: u64 },
+    AwaySeen {
+        away_for_ms: u64,
+    },
     AwayUnseen,
 }
 
@@ -97,7 +99,10 @@ impl DirectoryEvent {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.request_id().is_some_and(|request_id| request_id.0 == 0) {
+        if self
+            .request_id()
+            .is_some_and(|request_id| request_id.0 == 0)
+        {
             return Err("request id must be nonzero".into());
         }
         match self {
@@ -166,7 +171,10 @@ mod tests {
                 gain_db: -6.0,
             },
         };
-        assert_eq!(decode_client(&encode_client(&command).unwrap()).unwrap(), command);
+        assert_eq!(
+            decode_client(&encode_client(&command).unwrap()).unwrap(),
+            command
+        );
         let event = DaemonFrame::Directory(DirectoryEvent::Users {
             request_id: Some(RequestId(4)),
             users: vec![DirectoryUser {
@@ -179,7 +187,10 @@ mod tests {
                 },
             }],
         });
-        assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+        assert_eq!(
+            decode_daemon(&encode_daemon(&event).unwrap()).unwrap(),
+            event
+        );
     }
 
     #[test]
@@ -194,7 +205,10 @@ mod tests {
             }],
         });
 
-        assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+        assert_eq!(
+            decode_daemon(&encode_daemon(&event).unwrap()).unwrap(),
+            event
+        );
     }
 
     #[test]

@@ -207,7 +207,10 @@ mod tests {
             request_id: RequestId(3),
             command: RoomSettingsCommand::Open { room_id: RoomId(9) },
         };
-        assert_eq!(decode_client(&encode_client(&command).unwrap()).unwrap(), command);
+        assert_eq!(
+            decode_client(&encode_client(&command).unwrap()).unwrap(),
+            command
+        );
 
         let event = DaemonFrame::RoomSettings(RoomSettingsEvent::Document {
             request_id: RequestId(3),
@@ -240,7 +243,10 @@ mod tests {
                 },
             },
         });
-        assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+        assert_eq!(
+            decode_daemon(&encode_daemon(&event).unwrap()).unwrap(),
+            event
+        );
     }
 
     #[test]
@@ -261,7 +267,10 @@ mod tests {
                 values: values.clone(),
             },
         };
-        assert_eq!(decode_client(&encode_client(&command).unwrap()).unwrap(), command);
+        assert_eq!(
+            decode_client(&encode_client(&command).unwrap()).unwrap(),
+            command
+        );
 
         let event = DaemonFrame::RoomSettings(RoomSettingsEvent::Document {
             request_id: RequestId(4),
@@ -288,6 +297,9 @@ mod tests {
                 },
             },
         });
-        assert_eq!(decode_daemon(&encode_daemon(&event).unwrap()).unwrap(), event);
+        assert_eq!(
+            decode_daemon(&encode_daemon(&event).unwrap()).unwrap(),
+            event
+        );
     }
 }

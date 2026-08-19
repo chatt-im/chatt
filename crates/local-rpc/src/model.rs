@@ -93,7 +93,10 @@ mod log_encoding_tests {
         assert!(!RequestId(RequestId::MAX_EXTERNAL).is_internal());
         assert!(RequestId::FIRST_INTERNAL.is_internal());
         assert_eq!(RequestId::FIRST_INTERNAL.next_internal().0, (1 << 63) + 1);
-        assert_eq!(RequestId(u64::MAX).next_internal(), RequestId::FIRST_INTERNAL);
+        assert_eq!(
+            RequestId(u64::MAX).next_internal(),
+            RequestId::FIRST_INTERNAL
+        );
     }
 
     #[test]
