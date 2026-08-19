@@ -416,7 +416,7 @@ struct RpcClientSender {
 
 #[cfg(unix)]
 trait FrontendSink: Send + Sync {
-    fn send_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), SinkError>;
+    fn send_frame(&self, frame: DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), SinkError>;
     fn start_bulk(
         &self,
         transfer_id: local_rpc::model::BulkTransferId,
@@ -455,13 +455,13 @@ struct UnixFrontendSink {
 
 #[cfg(unix)]
 impl FrontendSink for UnixFrontendSink {
-    fn send_frame(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), SinkError> {
+    fn send_frame(&self, frame: DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), SinkError> {
         let mut state = self.outbound.state.lock();
         if state.closed {
             return Err(SinkError::Closed("RPC client writer stopped".into()));
         }
         let offset = state.bytes.len();
-        local_rpc::frame::encode_daemon_framed_append(frame, &mut state.bytes)
+        local_rpc::frame::encode_daemon_framed_append(&frame, &mut state.bytes)
             .map_err(SinkError::Invalid)?;
         if state.bytes.len() > local_rpc::MAX_QUEUED_BYTES {
             state.bytes.truncate(offset);
@@ -542,8 +542,8 @@ impl DirectFrontendSink {
 
 #[cfg(all(unix, feature = "embedded-client"))]
 impl FrontendSink for DirectFrontendSink {
-    fn send_frame(&self, frame: &DaemonFrame, mut fds: Vec<OwnedFd>) -> Result<(), SinkError> {
-        local_rpc::frame::validate_daemon(frame).map_err(SinkError::Invalid)?;
+    fn send_frame(&self, frame: DaemonFrame, mut fds: Vec<OwnedFd>) -> Result<(), SinkError> {
+        local_rpc::frame::validate_daemon(&frame).map_err(SinkError::Invalid)?;
         match frame {
             DaemonFrame::LiveShareOpened {
                 request_id,
@@ -557,10 +557,10 @@ impl FrontendSink for DirectFrontendSink {
                     ));
                 }
                 self.try_send(FrontendEvent::LiveShareOpened {
-                    request_id: *request_id,
-                    stream_id: *stream_id,
-                    generation: *generation,
-                    status: *status,
+                    request_id,
+                    stream_id,
+                    generation,
+                    status,
                     stream: UnixStream::from(fds.pop().expect("checked descriptor")),
                 })
             }
@@ -577,18 +577,18 @@ impl FrontendSink for DirectFrontendSink {
                     ));
                 }
                 self.try_send(FrontendEvent::AttachmentSourceOpened {
-                    request_id: *request_id,
-                    room_id: *room_id,
-                    attachment_id: *attachment_id,
-                    byte_len: *byte_len,
-                    transport: *transport,
+                    request_id,
+                    room_id,
+                    attachment_id,
+                    byte_len,
+                    transport,
                     fd: fds.pop().expect("checked descriptor"),
                 })
             }
             _ if !fds.is_empty() => Err(SinkError::Invalid(
                 "embedded frontend frame carries unexpected descriptors".into(),
             )),
-            _ => self.try_send(FrontendEvent::Frame(frame.clone())),
+            _ => self.try_send(FrontendEvent::Frame(frame)),
         }
     }
 
@@ -638,11 +638,11 @@ impl FrontendSink for DirectFrontendSink {
 
 #[cfg(unix)]
 impl RpcClientSender {
-    fn send(&self, frame: &DaemonFrame) -> Result<(), String> {
+    fn send(&self, frame: DaemonFrame) -> Result<(), String> {
         self.send_classified(frame).map_err(|error| error.to_string())
     }
 
-    fn send_classified(&self, frame: &DaemonFrame) -> Result<(), SinkError> {
+    fn send_classified(&self, frame: DaemonFrame) -> Result<(), SinkError> {
         self.send_with_fds_classified(frame, Vec::new())
     }
 
@@ -650,26 +650,34 @@ impl RpcClientSender {
         &self,
         instance_id: DaemonInstanceId,
         event_seq: u64,
-        snapshot: local_rpc::model::StateSnapshot,
+        mut snapshot: local_rpc::model::StateSnapshot,
     ) -> Result<local_rpc::model::StateSnapshot, String> {
-        let frame = DaemonFrame::Snapshot {
+        let room_rows = snapshot.room.as_mut().map(|room| {
+            (
+                std::mem::take(&mut room.messages),
+                std::mem::take(&mut room.system_messages),
+            )
+        });
+        let retained = snapshot.clone();
+        if let Some((messages, system_messages)) = room_rows {
+            let room = snapshot.room.as_mut().expect("snapshot room was retained");
+            room.messages = messages;
+            room.system_messages = system_messages;
+        }
+        self.send(DaemonFrame::Snapshot {
             instance_id,
             event_seq,
             snapshot,
-        };
-        self.send(&frame)?;
-        let DaemonFrame::Snapshot { snapshot, .. } = frame else {
-            unreachable!("constructed snapshot frame")
-        };
-        Ok(snapshot)
+        })?;
+        Ok(retained)
     }
 
     fn send_with_fds_classified(
         &self,
-        frame: &DaemonFrame,
+        frame: DaemonFrame,
         fds: Vec<OwnedFd>,
     ) -> Result<(), SinkError> {
-        let expected_fds = match frame {
+        let expected_fds = match &frame {
             DaemonFrame::LiveShareOpened { .. } | DaemonFrame::AttachmentSourceOpened { .. } => 1,
             _ => 0,
         };
@@ -678,8 +686,11 @@ impl RpcClientSender {
                 "daemon frame carries an invalid descriptor count".into(),
             ));
         }
+        let completed_request = completed_request_id(&frame);
         self.sink.send_frame(frame, fds)?;
-        self.complete_request(frame);
+        if let Some(request_id) = completed_request {
+            self.outstanding.lock().remove(&request_id);
+        }
         Ok(())
     }
 
@@ -708,19 +719,21 @@ impl RpcClientSender {
         self.sink.abort();
     }
 
-    fn send_or_abort(&self, frame: &DaemonFrame) -> bool {
+    fn send_or_abort(&self, frame: DaemonFrame) -> bool {
+        let metadata = FrameMetadata::new(&frame);
         let result = self.send_classified(frame);
-        self.handle_send_result(frame, result)
+        self.handle_send_result(metadata, result)
     }
 
-    fn send_with_fds_or_abort(&self, frame: &DaemonFrame, fds: Vec<OwnedFd>) -> bool {
+    fn send_with_fds_or_abort(&self, frame: DaemonFrame, fds: Vec<OwnedFd>) -> bool {
+        let metadata = FrameMetadata::new(&frame);
         let result = self.send_with_fds_classified(frame, fds);
-        self.handle_send_result(frame, result)
+        self.handle_send_result(metadata, result)
     }
 
     fn handle_send_result(
         &self,
-        frame: &DaemonFrame,
+        metadata: FrameMetadata,
         result: Result<(), SinkError>,
     ) -> bool {
         match result {
@@ -728,16 +741,16 @@ impl RpcClientSender {
             Err(SinkError::Invalid(reason)) => {
                 kvlog::error!(
                     "invalid daemon RPC frame rejected",
-                    frame = daemon_frame_kind(frame),
+                    frame = metadata.kind,
                     err = %reason
                 );
-                self.reject_invalid_frame(frame);
+                self.reject_invalid_frame(metadata.request_target);
                 false
             }
             Err(error @ (SinkError::Overflow(_) | SinkError::Closed(_))) => {
                 kvlog::error!(
                     "daemon RPC send failed",
-                    frame = daemon_frame_kind(frame),
+                    frame = metadata.kind,
                     err = %error
                 );
                 self.abort();
@@ -746,8 +759,11 @@ impl RpcClientSender {
         }
     }
 
-    fn reject_invalid_frame(&self, frame: &DaemonFrame) {
-        let Some((request_id, operation)) = daemon_request_target(frame) else {
+    fn reject_invalid_frame(
+        &self,
+        request_target: Option<(local_rpc::model::RequestId, local_rpc::frame::Operation)>,
+    ) {
+        let Some((request_id, operation)) = request_target else {
             return;
         };
         let rejection = DaemonFrame::RequestResult(local_rpc::frame::RequestResult {
@@ -758,7 +774,7 @@ impl RpcClientSender {
                 message: "Chatt core produced an invalid frontend response".into(),
             },
         });
-        match self.send_classified(&rejection) {
+        match self.send_classified(rejection) {
             Ok(()) => {}
             Err(SinkError::Invalid(reason)) => {
                 self.outstanding.lock().remove(&request_id);
@@ -800,27 +816,43 @@ impl RpcClientSender {
         self.outstanding.lock().remove(&request_id)
     }
 
-    fn complete_request(&self, frame: &DaemonFrame) {
-        let request_id = match frame {
-            DaemonFrame::RequestResult(result) => Some(result.request_id),
-            DaemonFrame::CommandResult { result, .. } => Some(result.request_id),
-            DaemonFrame::CommandCandidates { request_id, .. } => Some(*request_id),
-            DaemonFrame::MessageReferenceResolved { request_id, .. } => Some(*request_id),
-            DaemonFrame::Pong { request_id, .. } => Some(*request_id),
-            DaemonFrame::LiveShareOpened { request_id, .. } => Some(*request_id),
-            DaemonFrame::AttachmentSourceOpened { request_id, .. } => Some(*request_id),
-            DaemonFrame::SettingsResult(result) => Some(result.result.request_id),
-            DaemonFrame::IdentityResult(result) => Some(result.result.request_id),
-            DaemonFrame::Management(event) => event.request_id(),
-            DaemonFrame::Publishing(event) => event.request_id,
-            DaemonFrame::Directory(event) => event.request_id(),
-            DaemonFrame::RoomSettings(event) => Some(event.request_id()),
-            DaemonFrame::BulkDeleteResult(result) => Some(result.request_id),
-            _ => None,
-        };
-        if let Some(request_id) = request_id {
-            self.outstanding.lock().remove(&request_id);
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct FrameMetadata {
+    kind: &'static str,
+    request_target: Option<(local_rpc::model::RequestId, local_rpc::frame::Operation)>,
+}
+
+#[cfg(unix)]
+impl FrameMetadata {
+    fn new(frame: &DaemonFrame) -> Self {
+        Self {
+            kind: daemon_frame_kind(frame),
+            request_target: daemon_request_target(frame),
         }
+    }
+}
+
+#[cfg(unix)]
+fn completed_request_id(frame: &DaemonFrame) -> Option<local_rpc::model::RequestId> {
+    match frame {
+        DaemonFrame::RequestResult(result) => Some(result.request_id),
+        DaemonFrame::CommandResult { result, .. } => Some(result.request_id),
+        DaemonFrame::CommandCandidates { request_id, .. } => Some(*request_id),
+        DaemonFrame::MessageReferenceResolved { request_id, .. } => Some(*request_id),
+        DaemonFrame::Pong { request_id, .. } => Some(*request_id),
+        DaemonFrame::LiveShareOpened { request_id, .. } => Some(*request_id),
+        DaemonFrame::AttachmentSourceOpened { request_id, .. } => Some(*request_id),
+        DaemonFrame::SettingsResult(result) => Some(result.result.request_id),
+        DaemonFrame::IdentityResult(result) => Some(result.result.request_id),
+        DaemonFrame::Management(event) => event.request_id(),
+        DaemonFrame::Publishing(event) => event.request_id,
+        DaemonFrame::Directory(event) => event.request_id(),
+        DaemonFrame::RoomSettings(event) => Some(event.request_id()),
+        DaemonFrame::BulkDeleteResult(result) => Some(result.request_id),
+        _ => None,
     }
 }
 
@@ -1515,7 +1547,7 @@ fn handle_direct_upload(
         return;
     }
     let reject_begin = |sender: &RpcClientSender, code, message: String| {
-        sender.send_or_abort(&DaemonFrame::RequestResult(
+        sender.send_or_abort(DaemonFrame::RequestResult(
             local_rpc::frame::RequestResult {
                 request_id: begin_request,
                 operation: local_rpc::frame::Operation::BeginUpload,
@@ -1556,7 +1588,7 @@ fn handle_direct_upload(
         RpcCommandEffect::BeginUpload { upload, .. } => upload,
         RpcCommandEffect::Reply(result) => {
             sender.cancel_bulk(transfer_id);
-            sender.send_or_abort(&DaemonFrame::RequestResult(result));
+            sender.send_or_abort(DaemonFrame::RequestResult(result));
             sender.cancel_request(finish_request);
             return;
         }
@@ -1566,7 +1598,7 @@ fn handle_direct_upload(
             return;
         }
     };
-    if !sender.send_or_abort(&DaemonFrame::RequestResult(
+    if !sender.send_or_abort(DaemonFrame::RequestResult(
         local_rpc::frame::RequestResult {
             request_id: begin_request,
             operation: local_rpc::frame::Operation::BeginUpload,
@@ -1581,7 +1613,7 @@ fn handle_direct_upload(
         Err(message) => local_rpc::frame::RequestOutcome::Rejected { code: 503, message },
     };
     sender.cancel_bulk(upload.transfer_id);
-    sender.send_or_abort(&DaemonFrame::RequestResult(
+    sender.send_or_abort(DaemonFrame::RequestResult(
         local_rpc::frame::RequestResult {
             request_id: finish_request,
             operation: local_rpc::frame::Operation::FinishUpload,
@@ -1742,7 +1774,7 @@ fn spawn_rpc_client(
         limits,
         commands: crate::app::commands::frontend_command_catalog(),
     };
-    if let Err(error) = sender.send(&DaemonFrame::Welcome(welcome)) {
+    if let Err(error) = sender.send(DaemonFrame::Welcome(welcome)) {
         sender.shutdown();
         sender.abort();
         let _ = reader_thread.join();
@@ -1832,7 +1864,7 @@ fn spawn_direct_frontend(
         limits,
         commands: crate::app::commands::frontend_command_catalog(),
     };
-    if let Err(error) = sender.send(&DaemonFrame::Welcome(welcome)) {
+    if let Err(error) = sender.send(DaemonFrame::Welcome(welcome)) {
         app.retire_client(id);
         return Err(error);
     }
@@ -2112,18 +2144,18 @@ fn broadcast_rpc_live_share_status(
     generation: u64,
     state: crate::app::ShareViewState,
 ) {
-    let frame = DaemonFrame::LiveShareStatus {
-        stream_id,
-        generation,
-        status: crate::app::frontend::rpc_live_share_status(state),
-    };
+    let status = crate::app::frontend::rpc_live_share_status(state);
     for client in clients.values_mut() {
         if client
             .live_viewers
             .get(&stream_id)
             .is_some_and(|viewer| viewer.generation == generation)
         {
-            client.sender.send_or_abort(&frame);
+            client.sender.send_or_abort(DaemonFrame::LiveShareStatus {
+                stream_id,
+                generation,
+                status,
+            });
         }
     }
 }
@@ -2135,7 +2167,7 @@ fn send_rpc_event(
     delta: StateDelta,
 ) -> Result<(), String> {
     let seq = client.next_event_seq;
-    client.sender.send(&DaemonFrame::Event(StateEvent {
+    client.sender.send(DaemonFrame::Event(StateEvent {
         instance_id,
         event_seq: seq,
         delta,
@@ -2498,8 +2530,8 @@ fn handle_rpc_command(
                 match result {
                     Ok(result) => client
                         .sender
-                        .send_or_abort(&DaemonFrame::BulkDeleteResult(result)),
-                    Err(message) => client.sender.send_or_abort(&DaemonFrame::RequestResult(
+                        .send_or_abort(DaemonFrame::BulkDeleteResult(result)),
+                    Err(message) => client.sender.send_or_abort(DaemonFrame::RequestResult(
                         local_rpc::frame::RequestResult {
                             request_id,
                             operation: local_rpc::frame::Operation::BulkDeleteMessages,
@@ -2535,7 +2567,7 @@ fn handle_rpc_command(
             let state = app.rpc_publishing_state();
             if let Some(client) = clients.get_mut(&id) {
                 client.last_publishing_state = Some(state.clone());
-                client.sender.send_or_abort(&DaemonFrame::Publishing(
+                client.sender.send_or_abort(DaemonFrame::Publishing(
                     local_rpc::publishing::PublishingEvent {
                         request_id: Some(request_id),
                         state,
@@ -2560,7 +2592,7 @@ fn handle_rpc_command(
             if let Some(client) = clients.get_mut(&id) {
                 client
                     .sender
-                    .send_or_abort(&DaemonFrame::RequestResult(result));
+                    .send_or_abort(DaemonFrame::RequestResult(result));
             }
             return;
         }
@@ -2578,7 +2610,7 @@ fn handle_rpc_command(
                 }
                 client
                     .sender
-                    .send_or_abort(&DaemonFrame::SettingsResult(result));
+                    .send_or_abort(DaemonFrame::SettingsResult(result));
             }
             return;
         }
@@ -2590,7 +2622,7 @@ fn handle_rpc_command(
             if let Some(client) = clients.get_mut(&id) {
                 client
                     .sender
-                    .send_or_abort(&DaemonFrame::IdentityResult(result));
+                    .send_or_abort(DaemonFrame::IdentityResult(result));
             }
             return;
         }
@@ -2660,7 +2692,7 @@ fn handle_rpc_command(
             };
             if client
                 .sender
-                .send_with_fds_or_abort(&opened, vec![frontend_fd])
+                .send_with_fds_or_abort(opened, vec![frontend_fd])
             {
                 client.live_viewers.insert(
                     stream_id,
@@ -2712,7 +2744,7 @@ fn handle_rpc_command(
                 };
                 client
                     .sender
-                    .send_or_abort(&DaemonFrame::RequestResult(result));
+                    .send_or_abort(DaemonFrame::RequestResult(result));
             }
             return;
         }
@@ -2754,7 +2786,7 @@ fn handle_rpc_command(
                 if let Some(client) = clients.get_mut(&id) {
                     client
                         .sender
-                        .send_or_abort(&DaemonFrame::RequestResult(result));
+                        .send_or_abort(DaemonFrame::RequestResult(result));
                 }
                 return;
             }
@@ -2771,7 +2803,7 @@ fn handle_rpc_command(
                 };
                 if client
                     .sender
-                    .send_or_abort(&DaemonFrame::RequestResult(result))
+                    .send_or_abort(DaemonFrame::RequestResult(result))
                     && send_rpc_history_page(client, instance_id, room_id, page).is_err()
                 {
                     client.sender.abort();
@@ -2789,7 +2821,7 @@ fn handle_rpc_command(
                     before,
                     limit,
                 });
-                client.sender.send_or_abort(&DaemonFrame::RequestResult(
+                client.sender.send_or_abort(DaemonFrame::RequestResult(
                     local_rpc::frame::RequestResult {
                         request_id,
                         operation: local_rpc::frame::Operation::LoadOlder,
@@ -2868,7 +2900,7 @@ fn handle_rpc_command(
                 };
                 client
                     .sender
-                    .send_or_abort(&DaemonFrame::RequestResult(result));
+                    .send_or_abort(DaemonFrame::RequestResult(result));
             }
             return;
         }
@@ -2886,9 +2918,9 @@ fn handle_rpc_command(
                 };
                 if client
                     .sender
-                    .send_or_abort(&DaemonFrame::RequestResult(result))
+                    .send_or_abort(DaemonFrame::RequestResult(result))
                 {
-                    client.sender.send_or_abort(&DaemonFrame::BulkCanceled {
+                    client.sender.send_or_abort(DaemonFrame::BulkCanceled {
                         transfer_id,
                         reason: "canceled by frontend".into(),
                     });
@@ -2953,8 +2985,8 @@ fn handle_room_settings_command(
         match result {
             Ok(event) => client
                 .sender
-                .send_or_abort(&DaemonFrame::RoomSettings(event)),
-            Err(message) => client.sender.send_or_abort(&DaemonFrame::RequestResult(
+                .send_or_abort(DaemonFrame::RoomSettings(event)),
+            Err(message) => client.sender.send_or_abort(DaemonFrame::RequestResult(
                 local_rpc::frame::RequestResult {
                     request_id,
                     operation: local_rpc::frame::Operation::RoomSettings,
@@ -2978,7 +3010,7 @@ fn handle_directory_command(
     let audio_result = match command {
         DirectoryCommand::Open => {
             if let Some(client) = clients.get(&id) {
-                client.sender.send_or_abort(&DaemonFrame::Directory(
+                client.sender.send_or_abort(DaemonFrame::Directory(
                     DirectoryEvent::Users {
                         request_id: Some(request_id),
                         users: app.rpc_directory_users(),
@@ -3016,7 +3048,7 @@ fn handle_directory_command(
     match app.rpc_participant_audio_state(user_id) {
         Ok(state) => {
             if let Some(client) = clients.get(&id) {
-                client.sender.send_or_abort(&DaemonFrame::Directory(
+                client.sender.send_or_abort(DaemonFrame::Directory(
                     DirectoryEvent::ParticipantAudio {
                         request_id: Some(request_id),
                         state,
@@ -3040,7 +3072,7 @@ fn send_directory_result(
             Ok(()) => local_rpc::frame::RequestOutcome::Accepted,
             Err(message) => local_rpc::frame::RequestOutcome::Rejected { code: 422, message },
         };
-        client.sender.send_or_abort(&DaemonFrame::RequestResult(
+        client.sender.send_or_abort(DaemonFrame::RequestResult(
             local_rpc::frame::RequestResult {
                 request_id,
                 operation: local_rpc::frame::Operation::Directory,
@@ -3079,7 +3111,7 @@ fn handle_management_command(
             let draft_id = local_rpc::management::ServerDraftId(client.next_server_draft);
             let document = draft.management_document(draft_id);
             client.server_drafts.insert(draft_id, draft);
-            client.sender.send_or_abort(&DaemonFrame::Management(
+            client.sender.send_or_abort(DaemonFrame::Management(
                 ManagementEvent::ServerDraft {
                     request_id: Some(request_id),
                     draft: document,
@@ -3262,7 +3294,7 @@ fn send_management_acceptance(
     request_id: local_rpc::model::RequestId,
 ) {
     if let Some(client) = clients.get(&id) {
-        client.sender.send_or_abort(&DaemonFrame::RequestResult(
+        client.sender.send_or_abort(DaemonFrame::RequestResult(
             local_rpc::frame::RequestResult {
                 request_id,
                 operation: local_rpc::frame::Operation::Management,
@@ -3281,7 +3313,7 @@ fn send_management_rejection(
     message: &str,
 ) {
     if let Some(client) = clients.get(&id) {
-        client.sender.send_or_abort(&DaemonFrame::RequestResult(
+        client.sender.send_or_abort(DaemonFrame::RequestResult(
             local_rpc::frame::RequestResult {
                 request_id,
                 operation: local_rpc::frame::Operation::Management,
@@ -3303,7 +3335,7 @@ fn send_management_event(
     if let Some(client) = clients.get(&id) {
         client
             .sender
-            .send_or_abort(&DaemonFrame::Management(event));
+            .send_or_abort(DaemonFrame::Management(event));
     }
 }
 
@@ -3458,7 +3490,7 @@ fn drain_management_events(
                         None => local_rpc::frame::RequestOutcome::Accepted,
                     },
                 };
-                client.sender.send_or_abort(&DaemonFrame::Management(
+                client.sender.send_or_abort(DaemonFrame::Management(
                     local_rpc::management::ManagementEvent::ServerEditResult {
                         result,
                         outcome,
@@ -3467,7 +3499,7 @@ fn drain_management_events(
                     },
                 ));
                 if let Some(join) = join {
-                    client.sender.send_or_abort(&DaemonFrame::Management(
+                    client.sender.send_or_abort(DaemonFrame::Management(
                         local_rpc::management::ManagementEvent::Join(management_join_state(join)),
                     ));
                 }
@@ -3520,7 +3552,7 @@ fn drain_management_events(
         if let Some(event) = mapped {
             client
                 .sender
-                .send_or_abort(&DaemonFrame::Management(event));
+                .send_or_abort(DaemonFrame::Management(event));
         }
     }
 }
@@ -3571,7 +3603,7 @@ fn broadcast_rpc_publishing_events(
         if client.last_publishing_state.as_ref() == Some(&state) {
             continue;
         }
-        if client.sender.send_or_abort(&DaemonFrame::Publishing(
+        if client.sender.send_or_abort(DaemonFrame::Publishing(
             local_rpc::publishing::PublishingEvent {
                 request_id: None,
                 state: state.clone(),
@@ -3590,7 +3622,7 @@ fn broadcast_rpc_appearance_events(app: &App, clients: &mut HashMap<ClientId, Re
             continue;
         }
         let event = app.rpc_appearance_event();
-        if client.sender.send_or_abort(&DaemonFrame::Appearance(event)) {
+        if client.sender.send_or_abort(DaemonFrame::Appearance(event)) {
             client.appearance_generation = generation;
         }
     }
@@ -3608,7 +3640,7 @@ fn broadcast_rpc_identity_events(app: &mut App, clients: &mut HashMap<ClientId, 
         };
         if client
             .sender
-            .send_or_abort(&DaemonFrame::IdentityEvent(event))
+            .send_or_abort(DaemonFrame::IdentityEvent(event))
         {
             client.identity_generation = generation;
         }
@@ -3629,7 +3661,7 @@ fn broadcast_rpc_settings_events(
             client.settings_device_generation = generation;
             if !client
                 .sender
-                .send_or_abort(&DaemonFrame::SettingsEvent(event))
+                .send_or_abort(DaemonFrame::SettingsEvent(event))
             {
                 continue;
             }
@@ -3643,7 +3675,7 @@ fn broadcast_rpc_settings_events(
         client.next_settings_audio_event_at = now + AUDIO_EVENT_INTERVAL;
         if !client
             .sender
-            .send_or_abort(&DaemonFrame::SettingsEvent(meter))
+            .send_or_abort(DaemonFrame::SettingsEvent(meter))
         {
             continue;
         }
@@ -3655,7 +3687,7 @@ fn broadcast_rpc_settings_events(
             client.last_settings_audio_runtime = Some(runtime.clone());
             client
                 .sender
-                .send_or_abort(&DaemonFrame::SettingsEvent(runtime_event));
+                .send_or_abort(DaemonFrame::SettingsEvent(runtime_event));
         }
     }
 }
@@ -3684,7 +3716,7 @@ fn send_rpc_rejection(
     let Some(client) = clients.get_mut(&id) else {
         return;
     };
-    client.sender.send_or_abort(&DaemonFrame::RequestResult(
+    client.sender.send_or_abort(DaemonFrame::RequestResult(
         local_rpc::frame::RequestResult {
             request_id,
             operation,
@@ -3725,7 +3757,7 @@ fn open_rpc_attachment_source(
     let reject = |client: &RemoteRpcClient, code, message: String| {
         client
             .sender
-            .send_or_abort(&DaemonFrame::RequestResult(RequestResult {
+            .send_or_abort(DaemonFrame::RequestResult(RequestResult {
                 request_id,
                 operation: Operation::OpenAttachmentSource,
                 outcome: RequestOutcome::Rejected { code, message },
@@ -3748,7 +3780,7 @@ fn open_rpc_attachment_source(
                 byte_len,
                 transport: AttachmentSourceTransport::DirectFile,
             };
-            client.sender.send_with_fds_or_abort(&opened, vec![fd]);
+            client.sender.send_with_fds_or_abort(opened, vec![fd]);
         }
         crate::receive_store::Source::Memory { bytes, .. } => {
             if client.attachment_streams.len() >= local_rpc::MAX_CONCURRENT_ATTACHMENT_STREAMS {
@@ -3835,7 +3867,7 @@ fn open_rpc_attachment_source(
                 transport: AttachmentSourceTransport::ReadAtSocket,
             };
             let fd: OwnedFd = frontend_stream.into();
-            if !client.sender.send_with_fds_or_abort(&opened, vec![fd]) {
+            if !client.sender.send_with_fds_or_abort(opened, vec![fd]) {
                 if let Some(mut stream) = client.attachment_streams.remove(&request_id) {
                     let _ = stream.shutdown.shutdown(std::net::Shutdown::Both);
                     if let Some(worker) = stream.worker.take() {
@@ -3992,7 +4024,7 @@ fn handle_rpc_effect(
         RpcCommandEffect::Reply(result) => {
             client
                 .sender
-                .send_or_abort(&DaemonFrame::RequestResult(result));
+                .send_or_abort(DaemonFrame::RequestResult(result));
         }
         RpcCommandEffect::Snapshot(request_id) => {
             let result = local_rpc::frame::RequestResult {
@@ -4002,7 +4034,7 @@ fn handle_rpc_effect(
             };
             if client
                 .sender
-                .send_or_abort(&DaemonFrame::RequestResult(result))
+                .send_or_abort(DaemonFrame::RequestResult(result))
                 && let Err(error) = send_rpc_snapshot(app, id, client, instance_id)
             {
                 kvlog::error!(
@@ -4016,12 +4048,12 @@ fn handle_rpc_effect(
         RpcCommandEffect::Pong(request_id, nonce) => {
             client
                 .sender
-                .send_or_abort(&DaemonFrame::Pong { request_id, nonce });
+                .send_or_abort(DaemonFrame::Pong { request_id, nonce });
         }
         RpcCommandEffect::Disconnect(result) => {
             if client
                 .sender
-                .send_or_abort(&DaemonFrame::RequestResult(result))
+                .send_or_abort(DaemonFrame::RequestResult(result))
             {
                 client.sender.shutdown();
             }
@@ -4043,13 +4075,13 @@ fn handle_rpc_effect(
                 };
                 client
                     .sender
-                    .send_or_abort(&DaemonFrame::RequestResult(rejected));
+                    .send_or_abort(DaemonFrame::RequestResult(rejected));
                 return;
             }
             let transfer_id = read.transfer_id;
             if !client
                 .sender
-                .send_or_abort(&DaemonFrame::RequestResult(result))
+                .send_or_abort(DaemonFrame::RequestResult(result))
             {
                 client.sender.cancel_bulk(transfer_id);
                 return;
@@ -4132,12 +4164,12 @@ fn handle_rpc_effect(
             };
             client
                 .sender
-                .send_or_abort(&DaemonFrame::RequestResult(result));
+                .send_or_abort(DaemonFrame::RequestResult(result));
         }
         RpcCommandEffect::CommandResult { result, lines } => {
             client
                 .sender
-                .send_or_abort(&DaemonFrame::CommandResult { result, lines });
+                .send_or_abort(DaemonFrame::CommandResult { result, lines });
         }
         RpcCommandEffect::CommandCandidates {
             request_id,
@@ -4146,7 +4178,7 @@ fn handle_rpc_effect(
         } => {
             client
                 .sender
-                .send_or_abort(&DaemonFrame::CommandCandidates {
+                .send_or_abort(DaemonFrame::CommandCandidates {
                     request_id,
                     kind,
                     items,
@@ -4161,7 +4193,7 @@ fn handle_rpc_effect(
         } => {
             client
                 .sender
-                .send_or_abort(&DaemonFrame::MessageReferenceResolved {
+                .send_or_abort(DaemonFrame::MessageReferenceResolved {
                     request_id,
                     room_id,
                     room_generation,
@@ -4200,7 +4232,7 @@ fn handle_rpc_upload_chunk(
     if let Some(reason) = error {
         uploads.remove(&transfer_id);
         drop(uploads);
-        sender.send_or_abort(&DaemonFrame::BulkCanceled {
+        sender.send_or_abort(DaemonFrame::BulkCanceled {
             transfer_id,
             reason,
         });
@@ -4257,7 +4289,7 @@ fn finish_rpc_upload(
     };
     client
         .sender
-        .send_or_abort(&DaemonFrame::RequestResult(result));
+        .send_or_abort(DaemonFrame::RequestResult(result));
 }
 
 #[cfg(unix)]
@@ -4307,7 +4339,7 @@ fn ack_terminate_remote(client: &RemoteClient) {
 #[cfg(unix)]
 fn notify_rpc_shutdown(client: &mut RemoteRpcClient, instance_id: DaemonInstanceId) {
     let seq = client.next_event_seq;
-    if let Err(error) = client.sender.send(&DaemonFrame::Event(StateEvent {
+    if let Err(error) = client.sender.send(DaemonFrame::Event(StateEvent {
         instance_id,
         event_seq: seq,
         delta: StateDelta::DaemonStopping,
@@ -4541,7 +4573,7 @@ mod tests {
     impl super::FrontendSink for ValidatingSink {
         fn send_frame(
             &self,
-            frame: &local_rpc::frame::DaemonFrame,
+            frame: local_rpc::frame::DaemonFrame,
             fds: Vec<std::os::fd::OwnedFd>,
         ) -> Result<(), super::SinkError> {
             if !fds.is_empty() {
@@ -4549,8 +4581,8 @@ mod tests {
                     "test frame carried descriptors".into(),
                 ));
             }
-            local_rpc::frame::validate_daemon(frame).map_err(super::SinkError::Invalid)?;
-            self.frames.lock().push(frame.clone());
+            local_rpc::frame::validate_daemon(&frame).map_err(super::SinkError::Invalid)?;
+            self.frames.lock().push(frame);
             Ok(())
         }
 
@@ -4590,12 +4622,12 @@ mod tests {
         let request_id = RequestId(7);
         assert!(sender.begin_request(request_id));
 
-        assert!(!sender.send_or_abort(&DaemonFrame::Directory(
+        assert!(!sender.send_or_abort(DaemonFrame::Directory(
             DirectoryEvent::Users {
                 request_id: Some(request_id),
                 users: vec![DirectoryUser {
-                    user_id: UserId(3),
-                    name: String::new(),
+                    user_id: UserId(0),
+                    name: "invalid-id".into(),
                     local: false,
                     presence: DirectoryPresence::AwayUnseen,
                 }],
@@ -4686,7 +4718,7 @@ mod tests {
         };
         assert!(
             sender
-                .send(&local_rpc::frame::DaemonFrame::Pong {
+                .send(local_rpc::frame::DaemonFrame::Pong {
                     request_id: local_rpc::model::RequestId(1),
                     nonce: 1,
                 })
@@ -4962,7 +4994,7 @@ mod tests {
             .unwrap();
         for nonce in 1..=(super::RPC_CONTROL_BURST * 2) as u64 {
             sender
-                .send(&local_rpc::frame::DaemonFrame::Pong {
+                .send(local_rpc::frame::DaemonFrame::Pong {
                     request_id: local_rpc::model::RequestId(nonce),
                     nonce,
                 })
