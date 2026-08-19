@@ -7,6 +7,21 @@ use crate::ids::{FileTransferId, MessageId, RoomId, ServerId, StreamId, UserId};
 #[jsony(Binary)]
 pub struct RequestId(pub u64);
 
+impl RequestId {
+    /// The high bit is reserved for connector-generated housekeeping requests.
+    pub const INTERNAL_BIT: u64 = 1 << 63;
+    pub const MAX_EXTERNAL: u64 = Self::INTERNAL_BIT - 1;
+    pub const FIRST_INTERNAL: Self = Self(Self::INTERNAL_BIT);
+
+    pub const fn is_internal(self) -> bool {
+        self.0 & Self::INTERNAL_BIT != 0
+    }
+
+    pub const fn next_internal(self) -> Self {
+        Self(self.0.wrapping_add(1) | Self::INTERNAL_BIT)
+    }
+}
+
 impl Encode for RequestId {
     fn encode_log_value_into(&self, output: ValueEncoder<'_>) {
         self.0.encode_log_value_into(output);
@@ -71,6 +86,14 @@ mod log_encoding_tests {
         with_encoded_value(&BulkTransferId(23), |value| {
             assert!(matches!(value, Value::U64(23)));
         });
+    }
+
+    #[test]
+    fn internal_request_ids_stay_in_the_reserved_range_and_wrap() {
+        assert!(!RequestId(RequestId::MAX_EXTERNAL).is_internal());
+        assert!(RequestId::FIRST_INTERNAL.is_internal());
+        assert_eq!(RequestId::FIRST_INTERNAL.next_internal().0, (1 << 63) + 1);
+        assert_eq!(RequestId(u64::MAX).next_internal(), RequestId::FIRST_INTERNAL);
     }
 
     #[test]
