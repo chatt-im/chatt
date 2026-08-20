@@ -1415,7 +1415,7 @@ impl App {
                 room_id: Some(room_id),
                 request,
             },
-            true,
+            false,
         ) {
             Ok(())
         } else {
@@ -1452,7 +1452,7 @@ impl App {
                 room_id: Some(room_id),
                 request,
             },
-            true,
+            false,
         ) {
             Ok(())
         } else {

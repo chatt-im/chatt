@@ -202,12 +202,78 @@ struct RemoteRpcClient {
     appearance_generation: u64,
     identity_generation: u64,
     management_channel: Arc<ClientChannel>,
-    server_drafts: HashMap<local_rpc::management::ServerDraftId, crate::app::ServerEditDraft>,
-    next_server_draft: u64,
+    server_drafts: RpcServerDrafts,
     pending_server_edits:
         HashMap<local_rpc::model::RequestId, local_rpc::management::ServerDraftId>,
     device_link_cancel: Option<Vec<u8>>,
     last_publishing_state: Option<local_rpc::publishing::PublishingState>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct RpcServerDrafts {
+    active: Option<(
+        local_rpc::management::ServerDraftId,
+        crate::app::ServerEditDraft,
+    )>,
+    next_id: u64,
+}
+
+#[cfg(unix)]
+impl RpcServerDrafts {
+    fn open(
+        &mut self,
+        draft: crate::app::ServerEditDraft,
+    ) -> local_rpc::management::ServerDraft {
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let draft_id = local_rpc::management::ServerDraftId(self.next_id);
+        let document = draft.management_document(draft_id);
+        self.active = Some((draft_id, draft));
+        document
+    }
+
+    fn take(
+        &mut self,
+        draft_id: local_rpc::management::ServerDraftId,
+    ) -> Option<crate::app::ServerEditDraft> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(active_id, _)| *active_id == draft_id)
+        {
+            self.active.take().map(|(_, draft)| draft)
+        } else {
+            None
+        }
+    }
+
+    fn restore(
+        &mut self,
+        draft_id: local_rpc::management::ServerDraftId,
+        draft: crate::app::ServerEditDraft,
+    ) {
+        self.active = Some((draft_id, draft));
+    }
+
+    fn get(
+        &self,
+        draft_id: local_rpc::management::ServerDraftId,
+    ) -> Option<&crate::app::ServerEditDraft> {
+        self.active
+            .as_ref()
+            .filter(|(active_id, _)| *active_id == draft_id)
+            .map(|(_, draft)| draft)
+    }
+
+    fn close(&mut self, draft_id: local_rpc::management::ServerDraftId) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(active_id, _)| *active_id == draft_id)
+        {
+            self.active = None;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1359,8 +1425,9 @@ fn handle_runtime_event(
                 return;
             }
             let disconnect = matches!(frame, local_rpc::frame::ClientFrame::Disconnect { .. });
+            let projects = rpc_frame_affects_projection(&frame);
             handle_rpc_command(app, rpc_clients, client_id, frame, daemon_instance);
-            if !disconnect {
+            if !disconnect && projects {
                 broadcast_rpc_snapshots(app, rpc_clients, daemon_instance);
             }
         }
@@ -1515,13 +1582,27 @@ fn handle_direct_frontend_requests(
             continue;
         }
         let disconnect = matches!(frame, local_rpc::frame::ClientFrame::Disconnect { .. });
+        let projects = rpc_frame_affects_projection(&frame);
         handle_rpc_command(app, clients, client_id, frame, instance_id);
         if disconnect {
             retire_direct_frontend(app, clients, client_id);
             return;
         }
-        broadcast_rpc_snapshots(app, clients, instance_id);
+        if projects {
+            broadcast_rpc_snapshots(app, clients, instance_id);
+        }
     }
+}
+
+#[cfg(unix)]
+fn rpc_frame_affects_projection(frame: &local_rpc::frame::ClientFrame) -> bool {
+    !matches!(
+        frame,
+        local_rpc::frame::ClientFrame::Directory {
+            command: local_rpc::directory::DirectoryCommand::Open,
+            ..
+        }
+    )
 }
 
 #[cfg(all(unix, feature = "embedded-client"))]
@@ -1812,8 +1893,7 @@ fn spawn_rpc_client(
         appearance_generation: 0,
         identity_generation: 0,
         management_channel,
-        server_drafts: HashMap::new(),
-        next_server_draft: 0,
+        server_drafts: RpcServerDrafts::default(),
         pending_server_edits: HashMap::new(),
         device_link_cancel: None,
         last_publishing_state: None,
@@ -1893,8 +1973,7 @@ fn spawn_direct_frontend(
         appearance_generation: 0,
         identity_generation: 0,
         management_channel,
-        server_drafts: HashMap::new(),
-        next_server_draft: 0,
+        server_drafts: RpcServerDrafts::default(),
         pending_server_edits: HashMap::new(),
         device_link_cancel: None,
         last_publishing_state: None,
@@ -3107,10 +3186,7 @@ fn handle_management_command(
             let Some(client) = clients.get_mut(&id) else {
                 return;
             };
-            client.next_server_draft = client.next_server_draft.wrapping_add(1).max(1);
-            let draft_id = local_rpc::management::ServerDraftId(client.next_server_draft);
-            let document = draft.management_document(draft_id);
-            client.server_drafts.insert(draft_id, draft);
+            let document = client.server_drafts.open(draft);
             client
                 .sender
                 .send_or_abort(DaemonFrame::Management(ManagementEvent::ServerDraft {
@@ -3123,7 +3199,7 @@ fn handle_management_command(
             let draft_id = draft.draft_id;
             let Some(mut stored) = clients
                 .get_mut(&id)
-                .and_then(|client| client.server_drafts.remove(&draft_id))
+                .and_then(|client| client.server_drafts.take(draft_id))
             else {
                 send_management_rejection(
                     clients,
@@ -3137,7 +3213,7 @@ fn handle_management_command(
             if let Err(message) = stored.apply_management_document(&draft) {
                 let document = stored.management_document(draft_id);
                 if let Some(client) = clients.get_mut(&id) {
-                    client.server_drafts.insert(draft_id, stored);
+                    client.server_drafts.restore(draft_id, stored);
                 }
                 send_management_event(
                     clients,
@@ -3163,7 +3239,7 @@ fn handle_management_command(
             }
             if let Some(client) = clients.get_mut(&id) {
                 let submission = stored.submission();
-                client.server_drafts.insert(draft_id, stored);
+                client.server_drafts.restore(draft_id, stored);
                 client.pending_server_edits.insert(request_id, draft_id);
                 app.handle_client_command(
                     id,
@@ -3174,6 +3250,12 @@ fn handle_management_command(
                     },
                 );
             }
+        }
+        ManagementCommand::CloseServerDraft { draft_id } => {
+            if let Some(client) = clients.get_mut(&id) {
+                client.server_drafts.close(draft_id);
+            }
+            send_management_acceptance(clients, id, request_id);
         }
         ManagementCommand::DeleteServer { server_id } => {
             let existed = app.management_server_draft(server_id).is_some();
@@ -3346,10 +3428,7 @@ fn drain_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>, id:
                 | crate::client_channel::NavigationEvent::ReplaceScreen(screen),
             ) => match *screen {
                 crate::client_channel::ScreenSpec::ServerEditor(draft) => {
-                    client.next_server_draft = client.next_server_draft.wrapping_add(1).max(1);
-                    let draft_id = local_rpc::management::ServerDraftId(client.next_server_draft);
-                    let document = draft.management_document(draft_id);
-                    client.server_drafts.insert(draft_id, draft);
+                    let document = client.server_drafts.open(draft);
                     Some(local_rpc::management::ManagementEvent::ServerDraft {
                         request_id: None,
                         draft: document,
@@ -3456,15 +3535,15 @@ fn drain_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>, id:
                 let document = match (draft_id, replacement) {
                     (Some(draft_id), Some(draft)) => {
                         let document = draft.management_document(draft_id);
-                        client.server_drafts.insert(draft_id, draft);
+                        client.server_drafts.restore(draft_id, draft);
                         Some(document)
                     }
                     (Some(draft_id), None) if code.is_some() => client
                         .server_drafts
-                        .get(&draft_id)
+                        .get(draft_id)
                         .map(|draft| draft.management_document(draft_id)),
                     (Some(draft_id), None) => {
-                        client.server_drafts.remove(&draft_id);
+                        client.server_drafts.close(draft_id);
                         None
                     }
                     (None, _) => None,
@@ -4542,7 +4621,8 @@ mod tests {
 
     use super::{
         RemoteClient, RemoteShutdown, affects_rpc_projection, daemon_instance_id,
-        handle_runtime_event, panic_payload_message, shutdown_remote, upload_staging_active,
+        handle_runtime_event, panic_payload_message, rpc_frame_affects_projection,
+        shutdown_remote, upload_staging_active,
     };
     use crate::{attach, client_channel::ClientChannel};
     use parking_lot::Mutex;
@@ -4670,6 +4750,44 @@ mod tests {
             generation: 1,
             event: NetworkEvent::DeviceLinkCanceled,
         }));
+    }
+
+    #[test]
+    fn opening_the_directory_does_not_rebuild_rpc_snapshots() {
+        let open = local_rpc::frame::ClientFrame::Directory {
+            request_id: local_rpc::model::RequestId(3),
+            command: local_rpc::directory::DirectoryCommand::Open,
+        };
+        assert!(!rpc_frame_affects_projection(&open));
+
+        let edit = local_rpc::frame::ClientFrame::Directory {
+            request_id: local_rpc::model::RequestId(4),
+            command: local_rpc::directory::DirectoryCommand::SetParticipantMuted {
+                user_id: local_rpc::ids::UserId(2),
+                muted: true,
+            },
+        };
+        assert!(rpc_frame_affects_projection(&edit));
+    }
+
+    #[test]
+    fn opening_and_closing_server_drafts_keeps_one_active_handle() {
+        let config = crate::config::Config::default();
+        let mut drafts = super::RpcServerDrafts::default();
+        let first = drafts.open(crate::app::ServerEditDraft::from_server(
+            &crate::config::ServerEntry::default(),
+            &config,
+        ));
+        let second = drafts.open(crate::app::ServerEditDraft::from_server(
+            &crate::config::ServerEntry::default(),
+            &config,
+        ));
+
+        assert_ne!(first.draft_id, second.draft_id);
+        assert!(drafts.take(first.draft_id).is_none());
+        assert!(drafts.get(second.draft_id).is_some());
+        drafts.close(second.draft_id);
+        assert!(drafts.get(second.draft_id).is_none());
     }
 
     fn remote_client() -> (RemoteClient, UnixStream, Arc<ClientChannel>) {

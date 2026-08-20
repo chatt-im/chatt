@@ -103,6 +103,9 @@ pub enum RoomSettingsEvent {
 
 impl RoomSettingsValues {
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_download_mb == Some(0) {
+            return Err("room download limit must be a positive MiB count".into());
+        }
         if self.download == DownloadOverride::Persistent {
             if let Some(path) = self.download_path.as_deref() {
                 crate::model::check_nonempty_string(path)?;
@@ -132,6 +135,9 @@ impl RoomSettingsDocument {
 
 impl EffectiveRoomSettings {
     fn validate(&self) -> Result<(), String> {
+        if self.max_download_mb == 0 {
+            return Err("effective room download limit must be positive".into());
+        }
         match (&self.download, &self.download_path) {
             (DownloadMode::Persistent, Some(path)) => crate::model::check_nonempty_string(path)?,
             (DownloadMode::Persistent, None) => {
@@ -300,6 +306,33 @@ mod tests {
         assert_eq!(
             decode_daemon(&encode_daemon(&event).unwrap()).unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn rejects_zero_download_limits() {
+        let values = RoomSettingsValues {
+            download: DownloadOverride::Inherit,
+            download_path: None,
+            max_download_mb: Some(0),
+            history: ToggleOverride::Inherit,
+            history_location: None,
+        };
+        assert_eq!(
+            values.validate(),
+            Err("room download limit must be a positive MiB count".into())
+        );
+
+        let effective = EffectiveRoomSettings {
+            download: DownloadMode::Memory,
+            download_path: None,
+            max_download_mb: 0,
+            history_enabled: true,
+            history_location: None,
+        };
+        assert_eq!(
+            effective.validate(),
+            Err("effective room download limit must be positive".into())
         );
     }
 }

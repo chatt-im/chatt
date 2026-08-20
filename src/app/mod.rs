@@ -3672,6 +3672,8 @@ impl App {
         // their leases would only lock out the next frontend to ask.
         self.device_link_owner = None;
         self.device_query_owner = None;
+        self.room.clear_volume_preview();
+        self.participant_audio_owner = None;
         self.open_e2e_reviews.clear();
         self.rpc_identity.close_all("disconnected from the server");
         self.pending_mutation_clients.clear();
@@ -5703,22 +5705,30 @@ impl App {
     }
 
     fn claim_device_query(&mut self, owner: crate::client_channel::ClientId) -> Result<(), String> {
-        if self
-            .device_query_owner
-            .is_some_and(|current| current != owner)
-        {
-            return Err("devices are being listed in another client".into());
+        if self.device_query_owner.is_some() {
+            return Err("a device query is already in progress".into());
         }
         self.device_query_owner = Some(owner);
         Ok(())
     }
 
-    fn claim_device_link(&mut self, owner: crate::client_channel::ClientId) -> Result<(), String> {
-        if self
-            .device_link_owner
-            .is_some_and(|current| current != owner)
+    fn require_device_management_session(&self) -> Result<(), String> {
+        if self.network.is_none()
+            || self.room.network_disconnected
+            || self.session_id.is_none()
+            || self.e2e_account_id.is_none()
         {
-            return Err("a device link is already active in another client".into());
+            return Err("linked devices are unavailable until the encrypted account is ready".into());
+        }
+        Ok(())
+    }
+
+    fn claim_new_device_link(
+        &mut self,
+        owner: crate::client_channel::ClientId,
+    ) -> Result<(), String> {
+        if self.device_link_owner.is_some() {
+            return Err("a device link is already active".into());
         }
         self.device_link_owner = Some(owner);
         Ok(())
@@ -5728,18 +5738,28 @@ impl App {
         &mut self,
         owner: crate::client_channel::ClientId,
     ) -> Result<(), String> {
+        self.require_device_management_session()?;
         self.claim_device_query(owner)?;
-        self.send_network_command(NetworkCommand::ListE2eDevices, true);
-        Ok(())
+        if self.send_network_command(NetworkCommand::ListE2eDevices, false) {
+            Ok(())
+        } else {
+            self.device_query_owner = None;
+            Err("linked devices are unavailable while disconnected".into())
+        }
     }
 
     pub(crate) fn management_create_device_link(
         &mut self,
         owner: crate::client_channel::ClientId,
     ) -> Result<(), String> {
-        self.claim_device_link(owner)?;
-        self.send_network_command(NetworkCommand::CreateDeviceLink, true);
-        Ok(())
+        self.require_device_management_session()?;
+        self.claim_new_device_link(owner)?;
+        if self.send_network_command(NetworkCommand::CreateDeviceLink, false) {
+            Ok(())
+        } else {
+            self.device_link_owner = None;
+            Err("device links are unavailable while disconnected".into())
+        }
     }
 
     pub(crate) fn management_cancel_device_link(
@@ -5747,14 +5767,22 @@ impl App {
         owner: crate::client_channel::ClientId,
         redemption_secret_hash: Vec<u8>,
     ) -> Result<(), String> {
-        self.claim_device_link(owner)?;
-        self.send_network_command(
+        self.require_device_management_session()?;
+        match self.device_link_owner {
+            Some(current) if current == owner => {}
+            Some(_) => return Err("the active device link belongs to another client".into()),
+            None => return Err("there is no active device link to cancel".into()),
+        }
+        if self.send_network_command(
             NetworkCommand::CancelDeviceLink {
                 redemption_secret_hash,
             },
-            true,
-        );
-        Ok(())
+            false,
+        ) {
+            Ok(())
+        } else {
+            Err("device links are unavailable while disconnected".into())
+        }
     }
 
     pub(crate) fn management_revoke_device(
@@ -5762,9 +5790,14 @@ impl App {
         owner: crate::client_channel::ClientId,
         device_id: rpc::ids::DeviceId,
     ) -> Result<(), String> {
+        self.require_device_management_session()?;
         self.claim_device_query(owner)?;
-        self.send_network_command(NetworkCommand::RevokeE2eDevice { device_id }, true);
-        Ok(())
+        if self.send_network_command(NetworkCommand::RevokeE2eDevice { device_id }, false) {
+            Ok(())
+        } else {
+            self.device_query_owner = None;
+            Err("linked devices are unavailable while disconnected".into())
+        }
     }
 
     pub(crate) fn rpc_publishing_state(&self) -> local_rpc::publishing::PublishingState {
@@ -5910,6 +5943,13 @@ impl App {
         {
             return Err("participant volume is being edited in another client".into());
         }
+        if self
+            .room
+            .volume_preview()
+            .is_some_and(|(preview_user, _)| preview_user != user_id)
+        {
+            return Err("another participant volume preview must be canceled first".into());
+        }
         let gain_db = config::snap_user_volume_db(gain_db);
         self.participant_audio_owner = Some(owner);
         self.room.begin_volume_preview(user_id, gain_db);
@@ -5929,6 +5969,13 @@ impl App {
             .is_some_and(|current| current != owner)
         {
             return Err("participant volume is being edited in another client".into());
+        }
+        if self
+            .room
+            .volume_preview()
+            .is_some_and(|(preview_user, _)| preview_user != user_id)
+        {
+            return Err("another participant volume preview must be canceled first".into());
         }
         let gain_db = config::snap_user_volume_db(gain_db);
         let server_id = self.room.active_server_id.unwrap_or_default();
@@ -5964,7 +6011,7 @@ impl App {
             return Ok(());
         };
         if preview_user_id != user_id {
-            return Ok(());
+            return Err("another participant volume preview is active".into());
         }
         let gain_db = self
             .config
@@ -9981,6 +10028,17 @@ mod tests {
         TestApp::new(Config::default(), None).expect("test app")
     }
 
+    fn enable_device_management(
+        app: &mut TestApp,
+    ) -> mpsc::Receiver<crate::client_net::NetworkCommand> {
+        let (network_tx, network_rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(network_tx));
+        app.room.network_disconnected = false;
+        app.session_id = Some(rpc::ids::SessionId(1));
+        app.e2e_account_id = Some(rpc::ids::AccountId([7; 32]));
+        network_rx
+    }
+
     #[test]
     fn canceling_an_absent_participant_gain_preview_is_idempotent() {
         let mut app = test_app();
@@ -9997,12 +10055,66 @@ mod tests {
     }
 
     #[test]
+    fn participant_gain_preview_cannot_switch_users_without_canceling() {
+        let mut app = test_app();
+        let first_user = rpc::ids::UserId(8);
+        let second_user = rpc::ids::UserId(9);
+        enter_room_with_users(
+            &mut app,
+            vec![
+                user_summary(first_user, "alice"),
+                user_summary(second_user, "bob"),
+            ],
+        );
+        let owner = crate::client_channel::ClientId(7);
+
+        assert!(
+            app.rpc_preview_participant_gain(owner, first_user, 3.0)
+                .is_ok()
+        );
+        assert!(
+            app.rpc_preview_participant_gain(owner, second_user, 4.0)
+                .is_err()
+        );
+        assert!(
+            app.rpc_commit_participant_gain(owner, second_user, 4.0)
+                .is_err()
+        );
+        assert_eq!(app.room.volume_preview(), Some((first_user, 3.0)));
+        assert_eq!(app.participant_audio_owner, Some(owner));
+
+        assert!(app.rpc_cancel_participant_gain(owner, first_user).is_ok());
+        assert!(app.room.volume_preview().is_none());
+        assert!(app.participant_audio_owner.is_none());
+    }
+
+    #[test]
+    fn disconnect_clears_participant_gain_ownership_with_the_preview() {
+        let mut app = test_app();
+        let user_id = rpc::ids::UserId(8);
+        enter_room_with_users(&mut app, vec![user_summary(user_id, "alice")]);
+        let owner = crate::client_channel::ClientId(7);
+        assert!(
+            app.rpc_preview_participant_gain(owner, user_id, 3.0)
+                .is_ok()
+        );
+
+        app.disconnect_network();
+
+        assert!(app.room.volume_preview().is_none());
+        assert!(app.participant_audio_owner.is_none());
+    }
+
+    #[test]
     fn device_leases_reject_a_second_frontend_and_keep_routing_to_the_first() {
         let mut app = test_app();
+        let network = enable_device_management(&mut app);
         let first = crate::client_channel::ClientId(11);
         let second = crate::client_channel::ClientId(12);
 
         assert!(app.management_create_device_link(first).is_ok());
+        assert!(matches!(network.recv().unwrap(), NetworkCommand::CreateDeviceLink));
+        assert!(app.management_create_device_link(first).is_err());
         assert!(app.management_create_device_link(second).is_err());
         assert!(
             app.management_cancel_device_link(second, Vec::new())
@@ -10012,6 +10124,8 @@ mod tests {
 
         // Listing is a separate round trip, so it is not blocked by the link.
         assert!(app.management_list_devices(second).is_ok());
+        assert!(matches!(network.recv().unwrap(), NetworkCommand::ListE2eDevices));
+        assert!(app.management_list_devices(second).is_err());
         assert!(app.management_list_devices(first).is_err());
         assert!(
             app.management_revoke_device(first, rpc::ids::DeviceId([0; 16]))
@@ -10032,6 +10146,7 @@ mod tests {
     #[test]
     fn retiring_the_device_lease_owner_releases_it() {
         let mut app = test_app();
+        let _network = enable_device_management(&mut app);
         let owner = crate::client_channel::ClientId(21);
 
         assert!(app.management_create_device_link(owner).is_ok());
@@ -10040,6 +10155,22 @@ mod tests {
 
         assert_eq!(app.device_link_owner, None);
         assert_eq!(app.device_query_owner, None);
+    }
+
+    #[test]
+    fn offline_device_commands_are_rejected_without_claiming_or_queueing() {
+        let mut app = test_app();
+        let owner = crate::client_channel::ClientId(21);
+
+        assert!(app.management_list_devices(owner).is_err());
+        assert!(app.management_create_device_link(owner).is_err());
+        assert!(
+            app.management_revoke_device(owner, rpc::ids::DeviceId([3; 16]))
+                .is_err()
+        );
+        assert!(app.device_link_owner.is_none());
+        assert!(app.device_query_owner.is_none());
+        assert!(app.pending_network_commands.is_empty());
     }
 
     #[test]
@@ -10490,6 +10621,62 @@ mod tests {
             response.recv().unwrap().unwrap_err(),
             "not connected to a server"
         );
+    }
+
+    #[test]
+    fn rejected_rpc_upload_is_not_retained_for_reconnect() {
+        let mut app = test_app();
+        let (network_tx, _network_rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(network_tx));
+        enter_test_room(&mut app);
+        app.room.network_disconnected = true;
+        let upload = crate::test_temp::TempDir::new("rejected-rpc-upload")
+            .with_path("upload.txt");
+        std::fs::write(&upload, b"payload").unwrap();
+
+        assert!(
+            app.queue_rpc_upload(RoomId(1), upload.to_path_buf(), "renamed.txt".into())
+                .is_err()
+        );
+        assert!(app.pending_network_commands.is_empty());
+        assert!(!upload.exists());
+    }
+
+    #[cfg(feature = "embedded-client")]
+    #[test]
+    fn rejected_direct_uploads_are_not_retained_for_reconnect() {
+        let mut app = test_app();
+        let (network_tx, _network_rx) = mpsc::channel();
+        app.network = Some(NetworkClient::from_parts_for_test(network_tx));
+        enter_test_room(&mut app);
+        app.room.network_disconnected = true;
+
+        assert!(
+            app.queue_direct_upload(
+                RoomId(1),
+                crate::embedded::UploadSource::Memory(std::sync::Arc::new(b"memory".to_vec())),
+                "memory.txt".into(),
+            )
+            .is_err()
+        );
+        assert!(app.pending_network_commands.is_empty());
+
+        let upload = crate::test_temp::TempDir::new("rejected-direct-upload")
+            .with_path("upload.txt");
+        std::fs::write(&upload, b"disk").unwrap();
+        let file = std::fs::File::open(&upload).unwrap();
+        assert!(
+            app.queue_direct_upload(
+                RoomId(1),
+                crate::embedded::UploadSource::File {
+                    file,
+                    original_path: Some(upload.to_path_buf()),
+                },
+                "disk.txt".into(),
+            )
+            .is_err()
+        );
+        assert!(app.pending_network_commands.is_empty());
     }
 
     #[test]

@@ -103,6 +103,9 @@ pub enum ManagementCommand {
         draft: ServerDraft,
         join: bool,
     },
+    CloseServerDraft {
+        draft_id: ServerDraftId,
+    },
     DeleteServer {
         server_id: ServerId,
     },
@@ -187,6 +190,9 @@ impl ManagementCommand {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::SaveServer { draft, .. } => draft.validate(),
+            Self::CloseServerDraft { draft_id } if draft_id.0 == 0 => {
+                Err("server draft identity must be nonzero".into())
+            }
             Self::Pair {
                 input, device_name, ..
             } => {
@@ -456,6 +462,17 @@ mod tests {
             decode_daemon(&encode_daemon(&deleted).unwrap()).unwrap(),
             deleted
         );
+
+        let closed = ClientFrame::Management {
+            request_id: RequestId(9),
+            command: ManagementCommand::CloseServerDraft {
+                draft_id: ServerDraftId(3),
+            },
+        };
+        assert_eq!(
+            decode_client(&encode_client(&closed).unwrap()).unwrap(),
+            closed
+        );
     }
 
     #[test]
@@ -480,6 +497,14 @@ mod tests {
         let command = ClientFrame::Management {
             request_id: RequestId(1),
             command: ManagementCommand::RetryJoin { attempt_id: 0 },
+        };
+        assert!(encode_client(&command).is_err());
+
+        let command = ClientFrame::Management {
+            request_id: RequestId(1),
+            command: ManagementCommand::CloseServerDraft {
+                draft_id: ServerDraftId(0),
+            },
         };
         assert!(encode_client(&command).is_err());
 
