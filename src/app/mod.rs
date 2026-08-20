@@ -414,6 +414,7 @@ pub(crate) struct App {
     /// requesting frontend alone may see, and the link outlives any single
     /// round trip, so it holds its own lease until redemption or cancellation.
     device_link_owner: Option<crate::client_channel::ClientId>,
+    device_link_expires_at_ms: Option<u64>,
     /// Frontend awaiting the device list.
     ///
     /// Listing and revoking are both answered by one undifferentiated
@@ -1592,6 +1593,7 @@ impl App {
             voice_roster: frontend::VoiceRosterProjection::default(),
             command_client: crate::client_channel::ClientId::PRIMARY,
             device_link_owner: None,
+            device_link_expires_at_ms: None,
             device_query_owner: None,
             participant_audio_owner: None,
             quit_requested: false,
@@ -3671,6 +3673,7 @@ impl App {
         // The link and any outstanding list died with the session, so holding
         // their leases would only lock out the next frontend to ask.
         self.device_link_owner = None;
+        self.device_link_expires_at_ms = None;
         self.device_query_owner = None;
         self.room.clear_volume_preview();
         self.participant_audio_owner = None;
@@ -5349,6 +5352,7 @@ impl App {
                 pairing_string,
                 expires_at_ms,
             } => {
+                self.device_link_expires_at_ms = Some(expires_at_ms);
                 let owner = self.device_link_owner.unwrap_or(self.command_client);
                 self.send_to(
                     owner,
@@ -5368,6 +5372,7 @@ impl App {
                 device_name,
             } => {
                 let owner = self.device_link_owner.take().unwrap_or(self.command_client);
+                self.device_link_expires_at_ms = None;
                 self.send_to(
                     owner,
                     TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
@@ -5384,6 +5389,7 @@ impl App {
             }
             NetworkEvent::DeviceLinkCanceled => {
                 let owner = self.device_link_owner.take().unwrap_or(self.command_client);
+                self.device_link_expires_at_ms = None;
                 self.send_to(
                     owner,
                     TerminalEvent::Navigation(NavigationEvent::CloseOverlay),
@@ -5727,6 +5733,13 @@ impl App {
         &mut self,
         owner: crate::client_channel::ClientId,
     ) -> Result<(), String> {
+        if self
+            .device_link_expires_at_ms
+            .is_some_and(|expires_at_ms| expires_at_ms <= unix_now_ms())
+        {
+            self.device_link_owner = None;
+            self.device_link_expires_at_ms = None;
+        }
         if self.device_link_owner.is_some() {
             return Err("a device link is already active".into());
         }
@@ -6316,6 +6329,7 @@ impl App {
         self.rpc_identity.retire(client_id);
         if self.device_link_owner == Some(client_id) {
             self.device_link_owner = None;
+            self.device_link_expires_at_ms = None;
         }
         if self.device_query_owner == Some(client_id) {
             self.device_query_owner = None;
@@ -10171,6 +10185,26 @@ mod tests {
         assert!(app.device_link_owner.is_none());
         assert!(app.device_query_owner.is_none());
         assert!(app.pending_network_commands.is_empty());
+    }
+
+    #[test]
+    fn expired_device_link_releases_its_owner_before_replacement() {
+        let mut app = test_app();
+        let network = enable_device_management(&mut app);
+        let first = crate::client_channel::ClientId(21);
+        let second = crate::client_channel::ClientId(22);
+        assert!(app.management_create_device_link(first).is_ok());
+        assert!(matches!(network.recv().unwrap(), NetworkCommand::CreateDeviceLink));
+        app.handle_network_event(NetworkEvent::DeviceLinkCreated {
+            redemption_secret_hash: vec![3; 32],
+            pairing_string: "expired".into(),
+            expires_at_ms: unix_now_ms().saturating_sub(1),
+        });
+
+        assert!(app.management_create_device_link(second).is_ok());
+        assert!(matches!(network.recv().unwrap(), NetworkCommand::CreateDeviceLink));
+        assert_eq!(app.device_link_owner, Some(second));
+        assert!(app.device_link_expires_at_ms.is_none());
     }
 
     #[test]
