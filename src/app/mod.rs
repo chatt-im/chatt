@@ -412,7 +412,8 @@ pub(crate) struct App {
     ///
     /// The pairing string and the redemption that follows it are secrets the
     /// requesting frontend alone may see, and the link outlives any single
-    /// round trip, so it holds its own lease until redemption or cancellation.
+    /// round trip, so it holds its own lease until redemption, cancellation,
+    /// expiry, or session teardown.
     device_link_owner: Option<crate::client_channel::ClientId>,
     device_link_expires_at_ms: Option<u64>,
     /// Frontend awaiting the device list.

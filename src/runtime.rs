@@ -255,6 +255,21 @@ impl RpcServerDrafts {
         self.active = Some((draft_id, draft));
     }
 
+    fn update(
+        &mut self,
+        draft_id: local_rpc::management::ServerDraftId,
+        draft: crate::app::ServerEditDraft,
+    ) -> bool {
+        let Some((active_id, active)) = self.active.as_mut() else {
+            return false;
+        };
+        if *active_id != draft_id {
+            return false;
+        }
+        *active = draft;
+        true
+    }
+
     fn get(
         &self,
         draft_id: local_rpc::management::ServerDraftId,
@@ -3535,8 +3550,10 @@ fn drain_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>, id:
                 let document = match (draft_id, replacement) {
                     (Some(draft_id), Some(draft)) => {
                         let document = draft.management_document(draft_id);
-                        client.server_drafts.restore(draft_id, draft);
-                        Some(document)
+                        client
+                            .server_drafts
+                            .update(draft_id, draft)
+                            .then_some(document)
                     }
                     (Some(draft_id), None) if code.is_some() => client
                         .server_drafts
@@ -4785,6 +4802,14 @@ mod tests {
 
         assert_ne!(first.draft_id, second.draft_id);
         assert!(drafts.take(first.draft_id).is_none());
+        assert!(drafts.get(second.draft_id).is_some());
+        assert!(!drafts.update(
+            first.draft_id,
+            crate::app::ServerEditDraft::from_server(
+                &crate::config::ServerEntry::default(),
+                &config,
+            )
+        ));
         assert!(drafts.get(second.draft_id).is_some());
         drafts.close(second.draft_id);
         assert!(drafts.get(second.draft_id).is_none());
