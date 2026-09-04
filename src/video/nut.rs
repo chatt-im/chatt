@@ -4,8 +4,9 @@
 //! unit once the next frame's start code arrives — with damage-driven capture
 //! the latest frame sits buffered until the screen changes again. NUT frame
 //! headers carry an explicit payload size, so every frame emits the moment its
-//! bytes arrive. Payloads for H.264/HEVC are the encoder's Annex-B access units
-//! verbatim, so downstream consumers of [`CapturedFrame`] are unchanged.
+//! bytes arrive. H.264/HEVC payloads may be Annex-B or length-prefixed (for
+//! example when copying RTMP input). The demuxer normalizes them to Annex-B
+//! access units for downstream consumers of [`CapturedFrame`].
 //!
 //! The demuxer handles what `ffmpeg -f nut` (format version 3, default
 //! syncpoints) produces for a video stream: the main header's frame-code table,
@@ -367,6 +368,7 @@ struct StreamInfo {
     time_base: (u64, u64),
     msb_pts_shift: u32,
     extradata: Vec<u8>,
+    nal_length_size: Option<usize>,
     last_pts: i64,
 }
 
@@ -545,7 +547,8 @@ impl NutDemuxer {
         if extradata_len > MAX_EXTRADATA_BYTES {
             return malformed("extradata too large");
         }
-        let extradata = cursor.take(extradata_len as usize)?.to_vec();
+        let mut extradata = cursor.take(extradata_len as usize)?.to_vec();
+        let mut nal_length_size = None;
         if stream_class == 0 && self.emit_stream.is_none() {
             let expected: &[u8] = match self.codec {
                 Codec::H264 => b"H264",
@@ -554,12 +557,21 @@ impl NutDemuxer {
             if fourcc != expected {
                 return Err(Fault::Fail(NutError::CodecMismatch));
             }
+            if extradata.first() == Some(&1) {
+                nal_length_size = Some(
+                    bitstream::configuration_nal_length_size(self.codec, &extradata)
+                        .map_err(|_| Fault::Fail(NutError::Malformed("invalid decoder configuration")))?,
+                );
+                extradata = bitstream::configuration_to_annex_b(self.codec, &extradata)
+                    .map_err(|_| Fault::Fail(NutError::Malformed("invalid decoder configuration")))?;
+            }
             self.emit_stream = Some(stream_id);
         }
         self.streams[stream_id] = Some(StreamInfo {
             time_base,
             msb_pts_shift: msb_pts_shift as u32,
             extradata,
+            nal_length_size,
             last_pts: 0,
         });
         Ok(())
@@ -666,6 +678,10 @@ impl NutDemuxer {
             let mut data = Vec::with_capacity(prefix.len() + payload.len());
             data.extend_from_slice(prefix);
             data.extend_from_slice(payload);
+            if let Some(length_size) = stream.nal_length_size {
+                data = bitstream::length_prefixed_to_annex_b(data, length_size)
+                    .map_err(|_| Fault::Fail(NutError::Malformed("invalid length-prefixed video frame")))?;
+            }
             let is_key = flags & FLAG_KEY != 0;
             if is_key && !contains_parameter_set(self.codec, &data) {
                 data = with_extradata_prefix(&stream.extradata, data);
@@ -1047,6 +1063,93 @@ mod tests {
     }
 
     #[test]
+    fn demuxes_length_prefixed_frames_using_decoder_configuration() {
+        for codec in [Codec::H264, Codec::Hevc] {
+            for length_size in 1..=4 {
+                let (fourcc, configuration, params, key, delta) = match codec {
+                    Codec::H264 => {
+                        let mut config = bitstream::h264::build_avcc_extra_data(&SPS[4..], &PPS[4..]);
+                        config[4] = 0xfc | (length_size - 1) as u8;
+                        (b"H264", config, extradata(), IDR.to_vec(), SLICE.to_vec())
+                    }
+                    Codec::Hevc => {
+                        let mut config = vec![0; 23];
+                        config[0] = 1;
+                        config[21] = 0xfc | (length_size - 1) as u8;
+                        config[22] = 3;
+                        let mut params = Vec::new();
+                        for nal_type in [32, 33, 34] {
+                            config.extend_from_slice(&[nal_type, 0, 1, 0, 2, nal_type << 1, 1]);
+                            params.extend_from_slice(&[0, 0, 0, 1, nal_type << 1, 1]);
+                        }
+                        (b"HEVC", config, params, vec![0, 0, 0, 1, 38, 1], vec![0, 0, 0, 1, 2, 1])
+                    }
+                };
+                let inband_key = [&params[..], &key].concat();
+                let mut stream = [
+                    NUT_MAGIC.as_slice(),
+                    &test_main_header(),
+                    &test_stream_header(fourcc, &configuration),
+                    &test_syncpoint(0),
+                ].concat();
+                // Cover both container-only and in-band parameter sets, plus
+                // delta frames. Payload framing comes from the configuration.
+                for (index, unit) in [&key, &inband_key, &delta].into_iter().enumerate() {
+                    let mut payload = Vec::new();
+                    let offsets = start_code_offsets(unit);
+                    for (index, offset) in offsets.iter().enumerate() {
+                        let start = offset + 3;
+                        let end = offsets.get(index + 1).map_or(unit.len(), |next| next - 1);
+                        let len = ((end - start) as u32).to_be_bytes();
+                        payload.extend_from_slice(&len[4 - length_size..]);
+                        payload.extend_from_slice(&unit[start..end]);
+                    }
+                    let flags = if index < 2 { FLAG_KEY } else { 0 };
+                    stream.extend_from_slice(&test_frame(flags, 128 + index as u64 * 33, &payload));
+                }
+                let mut demuxer = NutDemuxer::new(codec);
+                let mut frames = Vec::new();
+                for byte in stream {
+                    demuxer.push(&[byte], &mut frames).unwrap();
+                }
+                assert_eq!(frames.len(), 3);
+                assert_eq!(frames[0].data, inband_key);
+                assert_eq!(frames[1].data, inband_key);
+                assert_eq!(frames[2].data, delta);
+                assert_eq!(frames[2].ts_ms, 66);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_length_prefixed_video() {
+        let configuration = bitstream::h264::build_avcc_extra_data(&SPS[4..], &PPS[4..]);
+        for payload in [&[0, 0, 0][..], &[0, 0, 0, 0], &[0, 0, 0, 4, 0x65]] {
+            let stream = [
+                NUT_MAGIC.as_slice(),
+                &test_main_header(),
+                &test_stream_header(b"H264", &configuration),
+                &test_frame(FLAG_KEY, 128, payload),
+            ].concat();
+            assert_eq!(
+                NutDemuxer::new(Codec::H264).push(&stream, &mut Vec::new()),
+                Err(NutError::Malformed("invalid length-prefixed video frame")),
+            );
+        }
+        for end in 1..configuration.len() {
+            let stream = [
+                NUT_MAGIC.as_slice(),
+                &test_main_header(),
+                &test_stream_header(b"H264", &configuration[..end]),
+            ].concat();
+            assert_eq!(
+                NutDemuxer::new(Codec::H264).push(&stream, &mut Vec::new()),
+                Err(NutError::Malformed("invalid decoder configuration")),
+            );
+        }
+    }
+
+    #[test]
     fn keyframe_with_inband_parameter_sets_passes_through() {
         let unit = [SPS, PPS, IDR].concat();
         let stream = [
@@ -1160,6 +1263,10 @@ mod tests {
     }
 
     fn ffmpeg_nut_capture(codec_args: &[&str]) -> Vec<u8> {
+        ffmpeg_capture(codec_args, "nut")
+    }
+
+    fn ffmpeg_capture(codec_args: &[&str], format: &str) -> Vec<u8> {
         let output = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -1173,7 +1280,7 @@ mod tests {
                 "1",
             ])
             .args(codec_args)
-            .args(["-f", "nut", "-"])
+            .args(["-f", format, "-"])
             .output()
             .expect("ffmpeg runs");
         assert!(
@@ -1231,6 +1338,46 @@ mod tests {
         ]);
         let frames = demux_in_chunks(Codec::H264, &bytes);
         assert_live_stream(Codec::H264, &frames, 320, 240);
+    }
+
+    #[test]
+    fn demuxes_ffmpeg_stream_copy_from_flv() {
+        // RTMP transports FLV: stream copy preserves its avcC configuration
+        // and length-prefixed packets when writing NUT.
+        let flv = ffmpeg_capture(&[
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-bf", "0", "-g", "15",
+        ], "flv");
+        let mut input = tempfile::NamedTempFile::new().unwrap();
+        input.write_all(&flv).unwrap();
+        let output = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(input.path())
+            .args(["-c:v", "copy", "-an", "-f", "nut", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let frames = demux_in_chunks(Codec::H264, &output.stdout);
+        assert_live_stream(Codec::H264, &frames, 320, 240);
+        for frame in frames.iter().filter(|frame| frame.is_key) {
+            assert!(bitstream::parse_keyframe(Codec::H264, &frame.data).is_some());
+        }
+        let mut normalized = tempfile::NamedTempFile::new().unwrap();
+        for frame in &frames {
+            normalized.write_all(&frame.data).unwrap();
+        }
+        let decode_hash = |path: &std::path::Path| {
+            let output = Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(path)
+                .args(["-map", "0:v", "-fps_mode", "passthrough", "-f", "hash", "-hash", "sha256", "-"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+            output.stdout
+        };
+        assert_eq!(decode_hash(normalized.path()), decode_hash(input.path()));
     }
 
     #[test]

@@ -99,6 +99,52 @@ pub fn length_prefixed_to_annex_b_in_place(access_unit: &mut [u8]) -> Result<(),
     Ok(())
 }
 
+/// Converts a captured access unit using the NAL length width from its decoder
+/// configuration. Four-byte lengths reuse the existing allocation.
+pub fn length_prefixed_to_annex_b(
+    mut access_unit: Vec<u8>,
+    length_size: usize,
+) -> Result<Vec<u8>, String> {
+    if length_size == 4 {
+        length_prefixed_to_annex_b_in_place(&mut access_unit)?;
+        return Ok(access_unit);
+    }
+    if !(1..=3).contains(&length_size) {
+        return Err("invalid video NAL length size".into());
+    }
+    let mut remaining = access_unit.as_slice();
+    let mut out = Vec::with_capacity(access_unit.len());
+    while !remaining.is_empty() {
+        let length_bytes = remaining
+            .get(..length_size)
+            .ok_or_else(|| "truncated video NAL length".to_string())?;
+        let length = length_bytes.iter().fold(0usize, |len, byte| (len << 8) | usize::from(*byte));
+        remaining = &remaining[length_size..];
+        if length == 0 || length > remaining.len() {
+            return Err("invalid video NAL length".into());
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&remaining[..length]);
+        remaining = &remaining[length..];
+    }
+    if out.is_empty() {
+        return Err("video access unit contains no NAL units".into());
+    }
+    Ok(out)
+}
+
+/// Reads the packet NAL length width from an `avcC` or `hvcC` descriptor.
+pub fn configuration_nal_length_size(codec: Codec, configuration: &[u8]) -> Result<usize, String> {
+    let (minimum_len, offset) = match codec {
+        Codec::H264 => (7, 4),
+        Codec::Hevc => (23, 21),
+    };
+    if configuration.len() < minimum_len || configuration[0] != 1 {
+        return Err("invalid video decoder configuration".into());
+    }
+    Ok(usize::from(configuration[offset] & 3) + 1)
+}
+
 /// Extracts parameter sets from an `avcC` or `hvcC` decoder descriptor and
 /// emits the Annex-B extradata expected by NUT/FFmpeg.
 pub fn configuration_to_annex_b(codec: Codec, configuration: &[u8]) -> Result<Vec<u8>, String> {
@@ -109,9 +155,7 @@ pub fn configuration_to_annex_b(codec: Codec, configuration: &[u8]) -> Result<Ve
 }
 
 fn avcc_to_annex_b(configuration: &[u8]) -> Result<Vec<u8>, String> {
-    if configuration.len() < 7 || configuration[0] != 1 || configuration[4] & 3 != 3 {
-        return Err("invalid avcC decoder configuration".into());
-    }
+    configuration_nal_length_size(Codec::H264, configuration)?;
     let mut cursor = 6usize;
     let sps_count = configuration[5] & 0x1f;
     let mut out = Vec::new();
@@ -132,9 +176,7 @@ fn avcc_to_annex_b(configuration: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn hvcc_to_annex_b(configuration: &[u8]) -> Result<Vec<u8>, String> {
-    if configuration.len() < 23 || configuration[0] != 1 || configuration[21] & 3 != 3 {
-        return Err("invalid hvcC decoder configuration".into());
-    }
+    configuration_nal_length_size(Codec::Hevc, configuration)?;
     let arrays = configuration[22] as usize;
     let mut cursor = 23usize;
     let mut out = Vec::new();
@@ -235,6 +277,41 @@ impl Iterator for NalIterator<'_> {
 #[cfg(test)]
 mod conversion_tests {
     use super::*;
+
+    #[test]
+    fn converts_capture_nal_lengths_of_each_width() {
+        for length_size in 1..=4 {
+            let mut packet = Vec::new();
+            for nal in [&[0x65, 0x88, 0x84][..], &[0x41, 0x9a]] {
+                let length = (nal.len() as u32).to_be_bytes();
+                packet.extend_from_slice(&length[4 - length_size..]);
+                packet.extend_from_slice(nal);
+            }
+            assert_eq!(
+                length_prefixed_to_annex_b(packet, length_size).unwrap(),
+                [0, 0, 0, 1, 0x65, 0x88, 0x84, 0, 0, 0, 1, 0x41, 0x9a],
+            );
+            assert!(length_prefixed_to_annex_b(Vec::new(), length_size).is_err());
+            assert!(length_prefixed_to_annex_b(vec![0; length_size], length_size).is_err());
+            let mut truncated = vec![0; length_size];
+            truncated[length_size - 1] = 2;
+            truncated.push(0x65);
+            assert!(length_prefixed_to_annex_b(truncated, length_size).is_err());
+            assert!(length_prefixed_to_annex_b(vec![0; length_size - 1], length_size).is_err());
+        }
+        for length_size in [0, 5, usize::MAX] {
+            assert!(length_prefixed_to_annex_b(vec![1], length_size).is_err());
+        }
+    }
+
+    #[test]
+    fn converts_nal_length_that_resembles_an_annex_b_start_code() {
+        let mut packet = vec![0, 0, 1, 0];
+        packet.extend_from_slice(&[0x65; 256]);
+        let converted = length_prefixed_to_annex_b(packet, 4).unwrap();
+        assert_eq!(&converted[..4], &[0, 0, 0, 1]);
+        assert_eq!(&converted[4..], &[0x65; 256]);
+    }
 
     #[test]
     fn length_prefixed_access_unit_round_trips_to_annex_b() {
