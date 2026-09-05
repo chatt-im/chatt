@@ -117,8 +117,11 @@ fn log_neteq_diagnostics(snapshot: &LivePlaybackSnapshot) {
         decision = snapshot.neteq_decision.as_str(),
         reason = snapshot.neteq_decision_reason.as_str(),
         accelerate_count = snapshot.accelerate_count,
+        accelerate_samples = snapshot.accelerate_samples,
         expand_count = snapshot.expand_count,
+        expand_samples = snapshot.expand_samples,
         hard_trim_count = snapshot.hard_trim_count,
+        receive_queue_max_us = snapshot.receive_queue_max_us,
         dred_near_playout = snapshot.neteq_dred_near_playout,
         callbacks = snapshot.playback_callbacks,
         callback_overruns = snapshot.playback_callback_overruns,
@@ -144,8 +147,7 @@ pub(crate) fn handle_live_playback_command(
             streams.start_stream(stream_id);
         }
         LivePlaybackCommand::Packet(packet) => {
-            let received_at = packet.received_at;
-            let _ = streams.insert_packet(packet, received_at);
+            let _ = streams.insert_packet(packet, Instant::now());
         }
         LivePlaybackCommand::StopStream(stream_id) => {
             streams.stop_stream(stream_id, mixer_events);
@@ -314,6 +316,7 @@ pub(crate) struct LiveDecodeStreams {
     /// the matching `StopStream`, so the mixer-side drop is never the last Arc.
     retiring: Vec<RetiringStream>,
     audio_report: Arc<AudioReportHub>,
+    receive_queue_max_us: u64,
 }
 
 struct RetiringStream {
@@ -343,6 +346,7 @@ impl LiveDecodeStreams {
     ) -> Self {
         Self {
             tuning,
+            receive_queue_max_us: 0,
             streams: HashMap::new(),
             mixer_streams: HashSet::new(),
             stopped_streams: HashSet::new(),
@@ -444,6 +448,10 @@ impl LiveDecodeStreams {
         packet: RemoteVoicePacket,
         now: Instant,
     ) -> Option<InsertOutcome> {
+        let queue_age = now.saturating_duration_since(packet.received_at);
+        self.receive_queue_max_us = self.receive_queue_max_us.max(
+            queue_age.as_micros().min(u128::from(u64::MAX)) as u64,
+        );
         let report_packet = self.audio_report.is_active().then(|| packet.clone());
         let RemoteVoicePacket {
             stream_id,
@@ -476,11 +484,11 @@ impl LiveDecodeStreams {
         let outcome = match payload {
             VoicePayload::Silence => {
                 let muted = flags & LIVE_PACKET_FLAG_MUTE != 0;
-                stream.observe_sender_silence(stream_id, sequence, muted, now);
+                stream.observe_sender_silence(stream_id, sequence, muted, received_at);
                 Some(InsertOutcome::Accepted)
             }
             VoicePayload::Opus(opus) => {
-                let late = stream.insert_audio(timestamp, sequence, flags, opus, now);
+                let late = stream.insert_audio(timestamp, sequence, flags, opus, received_at);
                 kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
                     "audio pop playback packet inserted",
                     stream_id,
@@ -773,6 +781,7 @@ impl LiveDecodeStreams {
                 .update(now, neteq_target_ms, neteq_playout_delay_ms);
 
         LivePlaybackSnapshot {
+            receive_queue_max_us: self.receive_queue_max_us,
             active_streams: self.streams.len(),
             stream_activity: self
                 .streams
@@ -1278,6 +1287,24 @@ mod tests {
             streams.stats().direct_samples > 0,
             "no decoded audio reached the callback"
         );
+    }
+
+    #[test]
+    fn stalled_ingress_preserves_speech_for_neteq_and_measures_queue_age() {
+        let now = Instant::now();
+        let mut streams = LiveDecodeStreams::new(test_tuning());
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        for seq in 0..10u32 {
+            let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
+            let received = now + Duration::from_millis(u64::from(seq) * 20);
+            assert_eq!(streams.insert_packet(voice_packet(7, seq, 0, opus, received), now + Duration::from_millis(600)), Some(InsertOutcome::Accepted));
+        }
+        assert_eq!(streams.receive_queue_max_us, 600_000);
+        let stream = streams.get(7).unwrap();
+        let shared = lock_shared_stream(&stream.source.shared);
+        assert_eq!(shared.diagnostics().packets_buffered, 10);
+        assert_eq!(shared.diagnostics().packet_buffer_ms, 200);
+        assert_eq!(shared.diagnostics().packets_discarded, 0);
     }
 
     #[test]

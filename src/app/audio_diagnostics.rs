@@ -137,6 +137,9 @@ impl AudioDiagnostics {
             format_bytes_compact(self.voice_bytes_received),
             self.encoder_profile.label(),
             backend
+        ) + &format!(
+            "\n  receive queue: max {}",
+            format_us_compact(self.snapshot.receive_queue_max_us),
         ) + &health
             + &events
     }
@@ -239,6 +242,7 @@ mod tests {
                 neteq_lock_wait_count: 2,
                 neteq_lock_wait_total_us: 300,
                 neteq_lock_wait_max_us: 250,
+                receive_queue_max_us: 123_000,
                 ..Default::default()
             },
             LiveEncoderProfile::DRED_35,
@@ -286,6 +290,7 @@ mod tests {
         assert!(body.contains("playback\n"));
         assert!(body.contains("callback: 12 calls, 1 overruns, max 1.2ms"));
         assert!(body.contains("neteq lock waits 300us total / 250us max / 2"));
+        assert!(body.contains("receive queue: max 123.0ms"));
         assert!(body.contains(
             "assist: 3 requests, 2 bursts, 5 prefilled, 4 mixed, 1 underruns, 1 lock-miss silence"
         ));

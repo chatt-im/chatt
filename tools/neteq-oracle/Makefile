@@ -1,10 +1,11 @@
 # Standalone build of the WebRTC NetEQ DSP, used to dump byte-exact reference
 # vectors for the Rust port. Compiles the specific signal_processing and neteq
-# translation units against a vendored abseil-cpp checkout. No gn/gclient.
+# translation units against Abseil headers. No gn/gclient.
 #
 # Prereqs:
 #   - WebRTC source at $(WEBRTC) (default /tmp/webrtc)
-#   - abseil-cpp cloned at $(WEBRTC)/third_party/abseil-cpp
+#   - Abseil development headers/libraries (system installation or checkout)
+#   - See README.md for network-oracle and sanitizer prerequisites/commands
 #
 # Usage:
 #   make            # build ./oracle
@@ -21,7 +22,8 @@
 # Then `make vectors` writes pipeline_out.txt / pipeline_sync_after.txt and the
 # Rust test `pipeline_matches_oracle` asserts them byte-for-byte. The tape
 # repeats over as many whole cycles as the clip allows, so the entire audio is
-# exercised. Without the fixture the Rust test is a no-op.
+# exercised. The Rust test is ignored by default and requires the fixture when
+# explicitly invoked with --ignored. README.md documents /tmp vector output.
 #
 # Everything compiles in one clang++ invocation. The source set mixes .c and
 # .cc translation units that share basenames (e.g. signal_processing's
@@ -99,6 +101,36 @@ vectors: oracle
 	./oracle ../../tests/neteq_vectors
 
 clean:
-	rm -rf oracle build
+	rm -rf oracle network-oracle network-oracle-sanitized build
 
 .PHONY: vectors clean
+
+# Link only the reference control-plane translation units. No algorithm stubs.
+NETWORK_SRCS := network.cc \
+  $(NETEQ)/packet.cc $(NETEQ)/packet_buffer.cc $(NETEQ)/statistics_calculator.cc \
+  $(NETEQ)/decoder_database.cc $(WEBRTC)/system_wrappers/source/metrics.cc \
+  $(NETEQ)/expand_uma_logger.cc $(WEBRTC)/api/audio_codecs/audio_format.cc \
+  $(WEBRTC)/rtc_base/ref_counter.cc \
+  $(WEBRTC)/modules/audio_coding/codecs/cng/webrtc_cng.cc \
+  $(NETEQ)/decision_logic.cc $(NETEQ)/delay_manager.cc \
+  $(NETEQ)/delay_constraints.cc $(NETEQ)/buffer_level_filter.cc \
+  $(NETEQ)/packet_arrival_history.cc $(NETEQ)/histogram.cc \
+  $(NETEQ)/underrun_optimizer.cc $(NETEQ)/reorder_optimizer.cc \
+  $(WEBRTC)/api/neteq/tick_timer.cc $(WEBRTC)/rtc_base/checks.cc \
+  $(WEBRTC)/rtc_base/experiments/struct_parameters_parser.cc \
+  $(WEBRTC)/rtc_base/experiments/field_trial_parser.cc \
+  $(WEBRTC)/rtc_base/experiments/field_trial_units.cc \
+  $(WEBRTC)/rtc_base/logging.cc $(WEBRTC)/rtc_base/string_encode.cc \
+  $(WEBRTC)/rtc_base/string_utils.cc $(WEBRTC)/rtc_base/time_utils.cc \
+  $(WEBRTC)/rtc_base/platform_thread_types.cc \
+  $(WEBRTC)/rtc_base/strings/string_builder.cc \
+  $(WEBRTC)/rtc_base/system_time.cc $(WEBRTC)/api/task_queue/task_queue_base.cc
+
+network-oracle: $(NETWORK_SRCS)
+	$(CXX) $(CXXFLAGS) -ffunction-sections -fdata-sections $(NETWORK_SRCS) \
+	  -Wl,--gc-sections $$(pkg-config --libs absl_strings absl_str_format) -pthread -o $@
+
+network-oracle-sanitized: $(NETWORK_SRCS)
+	$(CXX) $(CXXFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -ffunction-sections -fdata-sections $(NETWORK_SRCS) \
+	  -Wl,--gc-sections $$(pkg-config --libs absl_strings absl_str_format) -pthread -o $@

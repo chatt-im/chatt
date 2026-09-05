@@ -1396,7 +1396,10 @@ impl NetEqCore {
             ReturnCode::SuccessLowEnergy => Mode::AccelerateLowEnergy,
             ReturnCode::NoStretch | ReturnCode::Error => Mode::AccelerateFail,
         };
-        let removed = result.length_change_samples;
+        // Fast acceleration can remove several pitch periods while the DSP
+        // result reports the original single-period lag. Account the actual
+        // PCM length change so diagnostics describe the catch-up that happened.
+        let removed = input.len().saturating_sub(output.len());
         self.apply_timescale_result(borrowed);
         self.expand.reset();
         removed as i32
@@ -1817,7 +1820,92 @@ mod tests {
     }
 
     #[test]
-    fn stale_resume_timestamp_after_idle_keeps_playout_delay_bounded() {
+    fn repeated_renderer_stalls_recover_with_time_scaling_across_rollover() {
+        let tuning = LiveAudioTuning {
+            neteq_max_delay: std::time::Duration::from_millis(300),
+            hard_queue_bound: std::time::Duration::from_millis(400),
+            ..LiveAudioTuning::default()
+        };
+        let mut core = NetEqCore::new(tuning).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut clock = WallClock::new();
+        let mut output = [0.0; OUTPUT_SIZE_SAMPLES];
+        let mut sequence = 0u32;
+        let mut timestamp = u32::MAX - 40 * LIVE_OPUS_FRAME_SAMPLES as u32;
+        for episode in 0..20 {
+            // Audio keeps arriving during a 900 ms renderer stall. Then the
+            // device resumes for ten seconds. Repeat instead of testing one reset.
+            let mut removed = 0;
+            let mut failed = 0;
+            for packet in 0..545 {
+                let payload = encode_tone(&mut encoder, sequence as usize * LIVE_OPUS_FRAME_SAMPLES);
+                core.insert_packet(clock.now(), timestamp, sequence, 0, &payload);
+                for _ in 0..2 {
+                    if packet >= 45 {
+                        let result = core.get_audio(clock.now(), &mut output);
+                        removed += result.time_stretched;
+                        failed += u32::from(result.mode == Mode::AccelerateFail);
+                    }
+                    clock.advance_block();
+                }
+                sequence = sequence.wrapping_add(1);
+                timestamp = timestamp.wrapping_add(LIVE_OPUS_FRAME_SAMPLES as u32);
+            }
+            assert_eq!(core.diagnostics().packets_discarded, 0, "recovery must not discard speech");
+            assert!(removed > 0, "must actually time-compress speech");
+            assert!(core.diagnostics().playout_delay_ms < 250,
+                "episode {episode}, removed {removed}, failed {failed}: {:?}", core.diagnostics());
+        }
+    }
+
+    #[test]
+    fn fast_acceleration_accounts_for_the_actual_pcm_removed() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        for (index, sample) in core.decoded_buffer[..SAMPLES_30_MS].iter_mut().enumerate() {
+            *sample = (10_000.0 * (index as f32 * 2.0 * std::f32::consts::PI * 440.0 / 48_000.0).sin()) as i16;
+        }
+        let removed = core.do_accelerate(SAMPLES_30_MS, true);
+        let actual = SAMPLES_30_MS - core.scratch.timescale.output.len();
+        assert!(actual > SAMPLES_10_MS, "must exercise multi-period acceleration");
+        assert_eq!(removed as usize, actual);
+        assert_eq!(core.sync_buffer.future_length(), SAMPLES_30_MS - actual);
+    }
+
+    #[test]
+    fn short_talkspurts_and_silence_resume_flags_do_not_accumulate_delay() {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let payload = encode_tone(&mut encoder, 0);
+        let mut clock = WallClock::new();
+        let mut output = [0.0; OUTPUT_SIZE_SAMPLES];
+        let mut sequence = 0;
+        let mut timestamp = u32::MAX - 20 * LIVE_OPUS_FRAME_SAMPLES as u32;
+        // Two simulated minutes of 100–300 ms utterances separated by silence,
+        // including the resume flags sent around mute changes.
+        for episode in 0..120 {
+            let words = 5 + episode % 11;
+            for packet in 0..words {
+                let flags = if packet < 3 { LIVE_PACKET_FLAG_SILENCE_RESUME } else { 0 };
+                core.insert_packet(clock.now(), timestamp, sequence, flags, &payload);
+                for _ in 0..2 {
+                    core.get_audio(clock.now(), &mut output);
+                    clock.advance_block();
+                }
+                timestamp = timestamp.wrapping_add(LIVE_OPUS_FRAME_SAMPLES as u32);
+                sequence += 1;
+            }
+            for _ in 0..100 - words * 2 {
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
+                timestamp = timestamp.wrapping_add(OUTPUT_SIZE_SAMPLES as u32);
+            }
+            assert!(core.diagnostics().target_ms <= 100, "episode {episode}: {:?}", core.diagnostics());
+            assert!(core.diagnostics().playout_delay_ms < 250, "episode {episode}: {:?}", core.diagnostics());
+        }
+    }
+
+    #[test]
+    fn opus_reset_does_not_erase_stalled_media_clock_delay() {
         let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
         let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
         let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
@@ -1843,10 +1931,10 @@ mod tests {
             clock.advance_block();
         }
 
-        // A replayed source may restart its local media clock; if the sender only
-        // rebases it just past the previous packet instead of across the whole
-        // idle wall-clock gap, the receiver must discard the old arrival-history
-        // baseline so diagnostics do not report the idle as queued latency.
+        // The RTP clock fails to advance through 30 seconds of wall time.
+        // OPUS_RESET resets codec state, not the media timeline. Upstream's
+        // arrival estimator retains this discrepancy; a receive-gap heuristic
+        // cannot distinguish this input from genuinely delayed speech.
         ts = last_ts.wrapping_add(OUTPUT_SIZE_SAMPLES as u32);
         let mut max_resume = 0u64;
         for offset in 0..100u32 {
@@ -1867,8 +1955,8 @@ mod tests {
         }
 
         assert!(
-            max_resume < 1_000,
-            "stale resume timestamp inflated playout delay to {max_resume}ms"
+            max_resume >= 30_000,
+            "codec reset hid the stalled media clock: {max_resume}ms"
         );
     }
 

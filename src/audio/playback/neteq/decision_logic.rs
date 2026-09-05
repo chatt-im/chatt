@@ -200,8 +200,6 @@ impl DecisionLogic {
                 (self.packet_length_samples * 1000 / fs_hz as usize) as i32,
             );
         }
-        self.packet_arrival_history
-            .reset_for_timing_discontinuity(info.main_timestamp, arrival_samples);
         let inserted = self.packet_arrival_history.insert(
             info.main_timestamp,
             info.packet_length_samples as i32,
@@ -362,13 +360,11 @@ impl DecisionLogic {
     }
 
     pub(crate) fn playout_delay_ms(&self, status: &NetEqStatus, now_samples: i64) -> i32 {
-        // `target_timestamp` (the sync buffer end timestamp) freezes during Expand
-        // because no decoded samples advance it, exactly as in WebRTC. WebRTC's
-        // timeline convention is `end_timestamp + generated_noise_samples`, so the
-        // synthetic samples played during concealment must be added back. Without
-        // this, Chatt's sustained idle Expand (see `NetEqCore::get_audio`) makes the
-        // playout position look frozen while wall-clock advances, so the estimated
-        // delay grows unbounded and wraps, spuriously driving constant Accelerate.
+        // Chatt's telemetry includes samples played during concealment, when
+        // the decoded sync-buffer timestamp is stationary. Upstream's controller
+        // GetPlayoutDelayMs only subtracts sync_buffer_samples; this addition is
+        // a Chatt adaptation, not a literal port of that method. The decision
+        // tree does not consult playout delay for time scaling after Expand.
         let playout_timestamp = status
             .target_timestamp
             .wrapping_add(status.generated_noise_samples as u32)
@@ -483,35 +479,34 @@ mod tests {
     }
 
     #[test]
-    fn timing_discontinuity_does_not_poison_arrival_delay() {
+    fn delayed_forward_packet_keeps_network_delay_evidence() {
         let mut timer = TickTimer::new();
         let mut logic = logic(&timer);
-
-        assert!(
-            logic
-                .packet_arrived(48000, true, &info(0, 0), &timer, now_samples(&timer))
-                .is_none()
-        );
+        assert_eq!(logic.packet_arrived(48000, true, &info(0, 0), &timer, 0), None);
         timer.increment_by(2);
-        assert_eq!(
-            logic.packet_arrived(48000, true, &info(960, 1), &timer, now_samples(&timer)),
-            Some(0)
-        );
+        assert_eq!(logic.packet_arrived(48000, true, &info(960, 1), &timer, now_samples(&timer)), Some(0));
+        // A receive gap cannot distinguish a source restart from queued speech.
+        // The C++ reference retains the measured 1000 ms network delay.
+        timer.increment_by(102);
+        assert_eq!(logic.packet_arrived(48000, true, &info(1920, 2), &timer, now_samples(&timer)), Some(1000));
+    }
 
-        // A sender/source restart after a long idle can keep RTP timestamps near
-        // the previous talkspurt. The stale baseline must be discarded before it
-        // reads as tens of seconds of playout delay.
-        timer.increment_by(3000);
-        assert!(
-            logic
-                .packet_arrived(48000, true, &info(1920, 2), &timer, now_samples(&timer))
-                .is_none()
-        );
+    #[test]
+    fn reordered_primary_after_short_recovery_updates_delay_target() {
+        let mut timer = TickTimer::new();
+        let mut logic = logic(&timer);
+        logic.packet_arrived(48000, true, &info(0, 0), &timer, 0);
         timer.increment_by(2);
-        assert_eq!(
-            logic.packet_arrived(48000, true, &info(2880, 3), &timer, now_samples(&timer)),
-            Some(0)
-        );
+        let recovery = PacketArrivedInfo { packet_length_samples: 480, ..info(960, 1) };
+        logic.packet_arrived(48000, true, &recovery, &timer, now_samples(&timer));
+        timer.increment_by(2);
+        logic.packet_arrived(48000, true, &info(1920, 2), &timer, now_samples(&timer));
+        let before = logic.target_level_ms();
+        timer.increment_by(20);
+        // The 10 ms recovered unit must not hide this late 20 ms primary.
+        // The actual C++ oracle returns 220 ms for this arrival.
+        assert_eq!(logic.packet_arrived(48000, true, &info(960, 1), &timer, now_samples(&timer)), Some(220));
+        assert!(logic.target_level_ms() > before);
     }
 
     #[test]

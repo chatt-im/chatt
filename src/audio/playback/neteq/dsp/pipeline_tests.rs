@@ -10,12 +10,12 @@
 //! The tick loop and `do_*` shapes mirror `core.rs::get_audio` exactly, so this
 //! pins the DSP layer plus the sync-buffer and shared-state interplay across the
 //! whole clip (the tape repeats over as many cycles as the audio allows). The
-//! C++ side runs the identical tape (the operations are scripted, not chosen by
-//! NetEQ's decision logic, which the port does not mirror).
+//! C++ side runs the identical tape. Operations are scripted; controller
+//! decisions are checked separately in `network_differential`.
 //!
 //! The fixture is a large real-audio dump that is generated on demand and not
-//! committed (see `tools/neteq-oracle/Makefile`); without it the test is a
-//! no-op.
+//! committed (see `tools/neteq-oracle/Makefile`). Explicitly running this ignored
+//! test requires the fixture; a missing file must not be counted as a pass.
 
 use super::super::sync_buffer::SyncBuffer;
 use super::background_noise::BackgroundNoise;
@@ -87,24 +87,9 @@ fn build_tape(audio_len: usize) -> Vec<Op> {
     tape
 }
 
-/// Returns the vector path for `name`, or `None` if it does not exist. The
-/// pipeline fixtures are large real-audio dumps that are generated on demand
-/// (`make -C tools/neteq-oracle vectors` after producing `pipeline_audio_in`)
-/// and deliberately not committed, so the test is a no-op without them.
-fn vector_path(name: &str) -> Option<std::path::PathBuf> {
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests/neteq_vectors");
-    path.push(format!("{name}.txt"));
-    path.exists().then_some(path)
-}
-
 #[test]
+#[ignore = "requires generated real-audio C++ reference vectors; see tools/neteq-oracle/README.md"]
 fn pipeline_matches_oracle() {
-    if vector_path("pipeline_audio_in").is_none() || vector_path("pipeline_out").is_none() {
-        eprintln!("pipeline fixtures absent; skipping (regenerate to run)");
-        return;
-    }
-
     let audio: Vec<i16> = load("pipeline_audio_in")
         .into_iter()
         .map(|x| x as i16)

@@ -144,4 +144,5 @@ mod tests {
         let q = histogram.quantile(((1i64 << 30) as f64 * 0.95) as i32);
         assert!((3..=5).contains(&q), "q={q}");
     }
+
 }

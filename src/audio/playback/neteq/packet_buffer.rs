@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 
-use super::packet::{Packet, is_obsolete_timestamp};
+use super::packet::{Packet, is_newer_timestamp, is_obsolete_timestamp};
 use super::tick_timer::TickTimer;
 
 /// Sample rate of the live audio path, in samples per millisecond.
@@ -196,7 +196,7 @@ impl PacketBuffer {
             .iter()
             .rev()
             .map(|p| p.timestamp)
-            .find(|&ts| ts < timestamp)
+            .find(|&ts| is_newer_timestamp(timestamp, ts))
     }
 
     pub(crate) fn peek_next_packet(&self) -> Option<&Packet> {
@@ -352,6 +352,19 @@ mod tests {
         let outcome = buffer.insert_packet(opus(1920, 2, Priority::PRIMARY), &timer);
         assert_eq!(outcome, InsertOutcome::Flushed);
         assert_eq!(buffer.timestamps(), vec![1920]);
+    }
+
+    #[test]
+    fn recovery_lookup_crosses_timestamp_rollover() {
+        let timer = TickTimer::new();
+        let mut buffer = PacketBuffer::new(100);
+        let start = u32::MAX - 20 * 960;
+        for seq in 0..40u32 {
+            buffer.insert_packet(opus(start.wrapping_add(seq * 960), seq, Priority::PRIMARY), &timer);
+        }
+        let next = start.wrapping_add(21 * 960);
+        assert_eq!(buffer.next_lower_timestamp(next), Some(start.wrapping_add(20 * 960)));
+
     }
 
     #[test]

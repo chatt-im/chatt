@@ -838,6 +838,8 @@ pub struct LivePlaybackStreamActivity {
 
 #[derive(Debug, Default, Clone)]
 pub struct LivePlaybackSnapshot {
+    /// Worst receive-to-decoder handoff age over this playback instance.
+    pub receive_queue_max_us: u64,
     pub active_streams: usize,
     pub stream_activity: Vec<LivePlaybackStreamActivity>,
     /// Mixed-but-unplayed samples staged after NetEQ: the device mix-adapter

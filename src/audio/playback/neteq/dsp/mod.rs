@@ -30,8 +30,8 @@ pub(crate) mod test_vectors {
     use std::path::PathBuf;
 
     pub(crate) fn load(name: &str) -> Vec<i64> {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/neteq_vectors");
+        let mut path = std::env::var_os("CHATT_NETEQ_VECTORS").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/neteq_vectors"));
         path.push(format!("{name}.txt"));
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));

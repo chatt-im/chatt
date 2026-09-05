@@ -11,4 +11,6 @@
 /web/public/emoji.db
 /crates/mls-rs/Cargo.lock
 /tools/neteq-oracle/oracle
+/tools/neteq-oracle/network-oracle
+/tools/neteq-oracle/network-oracle-sanitized
 /tools/neteq-oracle/build/

@@ -15,12 +15,6 @@
 
 use std::collections::VecDeque;
 
-/// A forward packet after a long receive-side idle period can belong to a new
-/// talkspurt or source instance even if the sender failed to advance RTP time
-/// across that idle. Do not let that stale baseline read as queued playout.
-const TIMING_DISCONTINUITY_MIN_GAP_MS: i64 = 1_000;
-const TIMING_DISCONTINUITY_MIN_EXCESS_MS: i64 = 250;
-
 /// Unwraps wrap-around `u32` RTP timestamps into a monotonic `i64`. Port of
 /// `RtpTimestampUnwrapper` (signed-delta form).
 #[derive(Debug, Default)]
@@ -109,41 +103,9 @@ impl PacketArrivalHistory {
         self.history.len()
     }
 
-    /// Drops the current arrival baseline if the next forward packet follows a
-    /// large wall-clock receive gap that the media timestamp did not also cover.
-    ///
-    /// This catches sender implementations that restart a source or miss a
-    /// silence marker without advancing RTP time across the quiet period. Genuine
-    /// silence-aware streams, where RTP time advances with wall time, keep the
-    /// existing history and continue through the usual obsolete-window pruning.
-    pub(crate) fn reset_for_timing_discontinuity(
-        &mut self,
-        rtp_timestamp: u32,
-        now_samples: i64,
-    ) -> bool {
-        if self.sample_rate_khz <= 0 {
-            return false;
-        }
-        let Some(newest) = self.history.back().copied() else {
-            return false;
-        };
-        let unwrapped = self.unwrapper.peek_unwrap(rtp_timestamp);
-        if unwrapped <= newest.rtp_timestamp {
-            return false;
-        }
-
-        let arrival_gap_ms = (now_samples - newest.arrival_timestamp) / self.sample_rate_khz;
-        let media_gap_ms = (unwrapped - newest.rtp_timestamp) / self.sample_rate_khz;
-        if arrival_gap_ms >= TIMING_DISCONTINUITY_MIN_GAP_MS
-            && arrival_gap_ms.saturating_sub(media_gap_ms) >= TIMING_DISCONTINUITY_MIN_EXCESS_MS
-        {
-            self.reset();
-            return true;
-        }
-        false
-    }
-
-    /// Records a packet arrival. Returns false if it is too old or a duplicate.
+    /// Records a packet arrival. Returns false if too old or already contained.
+    /// Like upstream, a longer same-timestamp packet returns true while retaining
+    /// the original entry.
     /// Port of `PacketArrivalHistory::Insert`.
     pub(crate) fn insert(
         &mut self,
@@ -160,15 +122,17 @@ impl PacketArrivalHistory {
             return false;
         }
         // Sorted insert, scanning from the back (arrivals are mostly in
-        // order). A same-timestamp entry was already rejected by `contains`
-        // only when the earlier packet spans this one, so replace on equality.
+        // order). Like upstream map::emplace, keep an existing timestamp even
+        // if this packet has a longer duration. Replacing it would change the
+        // baseline and leave stale entries in the monotonic min/max deques.
         let position = self
             .history
             .iter()
             .rposition(|entry| entry.rtp_timestamp <= packet.rtp_timestamp);
         match position {
             Some(index) if self.history[index].rtp_timestamp == packet.rtp_timestamp => {
-                self.history[index] = packet;
+                // Upstream reports true here, but leaves the original entry.
+                return true;
             }
             Some(index) => {
                 if self.history.len() == HISTORY_CAPACITY {
@@ -353,34 +317,56 @@ mod tests {
     }
 
     #[test]
-    fn long_wall_gap_without_matching_media_gap_resets_baseline() {
+    fn longer_duplicate_keeps_original_arrival_and_duration() {
         let mut history = PacketArrivalHistory::new(2000);
         history.set_sample_rate(48000);
-        assert!(history.insert(0, 960, 0));
-        assert!(history.insert(960, 960, 2 * TICK));
-
-        // The next packet is only one media frame later, but arrives 30 seconds
-        // later. Treat this as a source/talkspurt timing discontinuity instead
-        // of reporting a 30 s playout delay.
-        let mut now = 3002 * TICK;
-        assert!(history.reset_for_timing_discontinuity(1920, now));
-        assert!(history.insert(1920, 960, now));
-        assert_eq!(history.delay_ms(1920, now), 0);
-
-        now += 2 * TICK;
-        assert!(!history.reset_for_timing_discontinuity(2880, now));
-        assert!(history.insert(2880, 960, now));
-        assert!(history.max_delay_ms() <= 1, "{}", history.max_delay_ms());
+        assert!(history.insert(0, 480, 0));
+        assert!(history.insert(0, 960, TICK));
+        assert_eq!(history.size(), 1);
+        assert_eq!(history.delay_ms(0, TICK), 10);
+        assert_eq!(history.max_delay_ms(), 0);
+        // The longer duplicate must not hide the following 10 ms packet.
+        assert!(history.insert(480, 480, TICK));
+        assert_eq!(history.size(), 2);
+        assert!(history.insert(120_000, 960, 250 * TICK));
+        assert_eq!(history.size(), 1);
+        assert_eq!(history.max_delay_ms(), 0);
     }
 
     #[test]
-    fn long_gap_with_matching_media_gap_keeps_baseline() {
+    fn longer_duplicate_cannot_keep_an_expired_delay_baseline_alive() {
         let mut history = PacketArrivalHistory::new(2000);
         history.set_sample_rate(48000);
-        assert!(history.insert(0, 960, 0));
-        assert!(history.insert(960, 960, 2 * TICK));
+        history.insert(0, 480, 0);
+        history.insert(0, 960, TICK);
+        // The old entry must leave both history and the minimum-delay deque.
+        // Replacing only history leaves its original minimum behind indefinitely
+        // when the newer arrivals have a higher relative arrival time.
+        history.insert(120_000, 960, 251 * TICK);
+        assert_eq!(history.size(), 1);
+        assert_eq!(history.delay_ms(120_000, 251 * TICK), 0);
+        assert_eq!(history.max_delay_ms(), 0);
+    }
 
-        let media_advanced = 960 + 3000 * 10 * 48;
-        assert!(!history.reset_for_timing_discontinuity(media_advanced, 3002 * TICK));
+    #[test]
+    fn longer_duplicate_does_not_turn_clock_drift_into_lifetime_delay() {
+        let mut history = PacketArrivalHistory::new(2000);
+        history.set_sample_rate(48000);
+        history.insert(0, 480, 0);
+        history.insert(0, 960, TICK);
+        for packet in 1..=10_000_u32 {
+            // About 104 ppm clock skew, with 10 ms additional network delay
+            // after the initial packet. Only skew within the 2 s window counts.
+            let ts = packet * 960 - packet / 10;
+            let arrival = (packet as i64 * 2 + 1) * TICK;
+            history.insert(ts, 960, arrival);
+            assert!(history.min_arrivals.len() <= history.size(),
+                "minimum queue outlived its history at packet {packet}");
+            assert!(history.max_arrivals.len() <= history.size());
+            if packet > 200 {
+                assert!(history.delay_ms(ts, arrival) <= 1,
+                    "expired baseline retained clock drift at packet {packet}");
+            }
+        }
     }
 }

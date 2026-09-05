@@ -296,7 +296,7 @@ void CaseParabolicFit() {
   for (auto t : triples) {
     size_t idx = 10;  // Realistic peak index (PeakDetection never passes 0).
     int16_t val = 0;
-    webrtc::DspHelper::ParabolicFit(t.data(), fs_mult, &idx, &val);
+    webrtc::DspHelper::ParabolicFit(t, fs_mult, &idx, &val);
     out.push_back(static_cast<int32_t>(idx));
     out.push_back(val);
   }

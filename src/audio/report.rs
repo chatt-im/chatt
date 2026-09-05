@@ -2296,6 +2296,7 @@ struct StreamActivityManifest {
 #[derive(Jsony)]
 #[jsony(Json)]
 struct PlaybackCounters {
+    receive_queue_max_us: u64,
     active_streams: usize,
     stream_activity: Vec<StreamActivityManifest>,
     output_ring_samples: usize,
@@ -2358,6 +2359,7 @@ struct PlaybackCounters {
 impl From<&LivePlaybackSnapshot> for PlaybackCounters {
     fn from(s: &LivePlaybackSnapshot) -> Self {
         Self {
+            receive_queue_max_us: s.receive_queue_max_us,
             active_streams: s.active_streams,
             stream_activity: s
                 .stream_activity
@@ -2813,6 +2815,7 @@ mod tests {
             playback_assist_lock_miss_silence_blocks: 19,
             neteq_lock_wait_max_us: 23,
             hard_trim_count: 29,
+            receive_queue_max_us: 123_000,
             concealment_expands: 31,
             backend_stream_errors: 37,
             playback_callback_max_duration_us: 41,
@@ -2860,6 +2863,7 @@ mod tests {
             "\"assist_lock_miss_silence_blocks\":19",
             "\"neteq_lock_wait_max_us\":23",
             "\"hard_trim_count\":29",
+            "\"receive_queue_max_us\":123000",
             "\"concealment_expands\":31",
             "\"backend_stream_errors\":37",
             "\"callback_max_duration_us\":41",

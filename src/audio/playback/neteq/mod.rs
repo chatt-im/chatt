@@ -21,6 +21,8 @@ mod delay_optimizer;
 mod dsp;
 mod histogram;
 mod neteq_status;
+#[cfg(test)]
+mod network_differential;
 mod operation;
 mod packet;
 mod packet_arrival_history;
