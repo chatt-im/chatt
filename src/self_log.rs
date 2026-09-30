@@ -31,8 +31,14 @@ struct LogRingBuffer {
 
 impl LogRingBuffer {
     fn new() -> Self {
+        // `Box::new([0; N])` builds the array on the stack first in unoptimised
+        // builds: a 4 MiB temporary on whichever thread first logs, which
+        // overflows a 1 MiB Windows main stack. `vec!` zero-allocates in place.
         Self {
-            data: Box::new([0u8; RING_BUFFER_SIZE]),
+            data: vec![0u8; RING_BUFFER_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("the ring buffer has RING_BUFFER_SIZE bytes"),
             write_pos: 0,
             len: 0,
         }
