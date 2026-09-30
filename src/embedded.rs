@@ -15,7 +15,6 @@ use std::{
     error::Error,
     fmt,
     fs::{self, File},
-    os::{fd::OwnedFd, unix::net::UnixStream},
     path::PathBuf,
     sync::{
         Arc,
@@ -35,6 +34,21 @@ use crate::{
     app::{AppEvent, EventSender},
     config::{AppConfigLoad, Config},
 };
+
+/// A stream the core writes to and the frontend reads from: a `UnixStream` on
+/// Unix, a loopback `TcpStream` on Windows.
+pub use crate::local_stream::LocalStream;
+/// A resource the core hands the frontend with a frame: an `OwnedFd` on Unix,
+/// an enum of an open file or a [`LocalStream`] on Windows.
+pub use crate::local_stream::FrameResource;
+
+/// The resource of [`FrontendEvent::AttachmentSourceOpened`].
+///
+/// On Unix it is an `OwnedFd`: an open file for
+/// [`AttachmentSourceTransport::DirectFile`], a socket for
+/// [`AttachmentSourceTransport::ReadAtSocket`]. On Windows it is
+/// `FrameResource::File` or `FrameResource::Stream` respectively.
+pub type AttachmentSourceHandle = FrameResource;
 
 const COMMAND_QUEUE_ITEMS: usize = 128;
 const EVENT_QUEUE_ITEMS: usize = 64;
@@ -585,7 +599,7 @@ pub enum FrontendEvent {
         stream_id: StreamId,
         generation: u64,
         status: LiveShareViewStatus,
-        stream: UnixStream,
+        stream: LocalStream,
     },
     AttachmentSourceOpened {
         request_id: RequestId,
@@ -593,7 +607,7 @@ pub enum FrontendEvent {
         attachment_id: AttachmentId,
         byte_len: u64,
         transport: AttachmentSourceTransport,
-        fd: OwnedFd,
+        fd: AttachmentSourceHandle,
     },
     /// The core retired this frontend session while the core itself remains
     /// available to its other work.

@@ -921,13 +921,13 @@ pub(crate) enum AppEvent {
         client_id: crate::client_channel::ClientId,
         frame: local_rpc::frame::ClientFrame,
     },
-    #[cfg(unix)]
+    #[cfg(renderer_clients)]
     RpcClientExited(crate::client_channel::ClientId),
-    #[cfg(all(unix, feature = "embedded-client"))]
+    #[cfg(feature = "embedded-client")]
     EmbeddedFrontendWake(crate::client_channel::ClientId),
-    #[cfg(all(unix, feature = "embedded-client"))]
+    #[cfg(feature = "embedded-client")]
     EmbeddedCoreShutdown,
-    #[cfg(unix)]
+    #[cfg(renderer_clients)]
     AttachmentStreamWorkerExited {
         client_id: crate::client_channel::ClientId,
         request_id: local_rpc::model::RequestId,
@@ -2072,7 +2072,7 @@ impl App {
         requested
     }
 
-    #[cfg(all(unix, feature = "embedded-client"))]
+    #[cfg(feature = "embedded-client")]
     pub(crate) fn request_quit(&mut self) {
         self.quit_requested = true;
     }
@@ -2202,13 +2202,14 @@ impl App {
                 unreachable!("client attach events are owned by the daemon runtime")
             }
             #[cfg(unix)]
-            AppEvent::RpcClientAttach { .. }
-            | AppEvent::RpcClientFrame { .. }
-            | AppEvent::RpcClientExited(_)
-            | AppEvent::AttachmentStreamWorkerExited { .. } => {
+            AppEvent::RpcClientAttach { .. } | AppEvent::RpcClientFrame { .. } => {
                 unreachable!("RPC client events are owned by the daemon runtime")
             }
-            #[cfg(all(unix, feature = "embedded-client"))]
+            #[cfg(renderer_clients)]
+            AppEvent::RpcClientExited(_) | AppEvent::AttachmentStreamWorkerExited { .. } => {
+                unreachable!("RPC client events are owned by the daemon runtime")
+            }
+            #[cfg(feature = "embedded-client")]
             AppEvent::EmbeddedFrontendWake(_) | AppEvent::EmbeddedCoreShutdown => {
                 unreachable!("embedded frontend events are owned by the core runtime")
             }

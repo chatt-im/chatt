@@ -26,22 +26,16 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Condvar, Mutex},
-};
-
-// The renderer-facing half of the fanout is Unix-only; see the note below.
-#[cfg(unix)]
-use std::{
     io::Write,
     net::Shutdown,
+    sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
 };
 
-// Native renderers reach the fanout over the local RPC socket, which is
-// Unix-only; see the note in `runtime.rs`. Frame fanout itself is portable, so
-// only the viewer-facing half below is gated.
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+// Native renderers read their viewer's frames from a local stream: the far end
+// of a socket passed over the renderer socket on Unix, or held directly by an
+// embedded frontend.
+use crate::local_stream::{InterruptibleStream, LocalStream, StreamInterrupt, interruptible};
 
 use rpc::{ids::StreamId, video::SharedVideoFrame};
 
@@ -129,13 +123,12 @@ struct QueueState {
     overflows: u64,
 }
 
-#[cfg(unix)]
 pub struct NativeViewerHandle {
     fanout: VideoFrameFanout,
     viewer_id: u64,
     stream_id: StreamId,
     queue: Arc<NativeQueue>,
-    control: Arc<UnixStream>,
+    control: StreamInterrupt,
     join: Option<JoinHandle<()>>,
 }
 
@@ -278,20 +271,16 @@ impl VideoFrameFanout {
         }
     }
 
-    #[cfg(unix)]
     pub fn add_native(
         &self,
         viewer_id: u64,
         stream_id: StreamId,
-        stream: UnixStream,
+        stream: LocalStream,
         wait_for_upstream_bootstrap: bool,
     ) -> Result<NativeViewerHandle, String> {
         let key = (viewer_id, stream_id);
-        let control = Arc::new(
-            stream
-                .try_clone()
-                .map_err(|error| format!("cannot clone native video socket: {error}"))?,
-        );
+        let (stream, control) = interruptible(stream)
+            .map_err(|error| format!("cannot clone native video socket: {error}"))?;
         let queue = Arc::new(NativeQueue {
             viewer_id,
             stream_id,
@@ -655,8 +644,7 @@ fn is_bootstrap_boundary(frame: &SharedVideoFrame) -> bool {
         .is_some_and(|header| header.bootstrap_end)
 }
 
-#[cfg(unix)]
-fn native_writer_loop(mut stream: UnixStream, queue: Arc<NativeQueue>) {
+fn native_writer_loop(mut stream: InterruptibleStream, queue: Arc<NativeQueue>) {
     let mut written = 0u64;
     let mut write_error = None;
     while let Some(frame) = queue.pop() {
@@ -713,7 +701,6 @@ fn native_writer_loop(mut stream: UnixStream, queue: Arc<NativeQueue>) {
     queue.close();
 }
 
-#[cfg(unix)]
 impl Drop for NativeViewerHandle {
     fn drop(&mut self) {
         self.fanout
@@ -724,18 +711,17 @@ impl Drop for NativeViewerHandle {
             .native
             .remove(&(self.viewer_id, self.stream_id));
         self.queue.close();
-        let _ = self.control.shutdown(Shutdown::Both);
+        self.control.interrupt();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
     }
 }
 
-// The fanout tests drive native viewers through a `UnixStream` pair, so they
-// exercise the Unix-only half of this module.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_stream::local_stream_pair;
     use std::io::Read;
 
     fn frame(stream_id: u32, key: bool, marker: u8) -> SharedVideoFrame {
@@ -786,7 +772,7 @@ mod tests {
         fanout.send(frame(7, true, 3));
         fanout.send(frame(7, false, 4));
 
-        let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
+        let (daemon_stream, mut frontend_stream) = local_stream_pair().unwrap();
         frontend_stream
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
@@ -812,7 +798,7 @@ mod tests {
     fn native_viewer_without_a_cached_gop_starts_with_a_bootstrap_boundary() {
         let fanout = VideoFrameFanout::new(None);
         fanout.start_stream(StreamId(7));
-        let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
+        let (daemon_stream, mut frontend_stream) = local_stream_pair().unwrap();
         frontend_stream
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
@@ -830,7 +816,7 @@ mod tests {
     fn cold_native_viewer_waits_for_the_upstream_cached_gop_boundary() {
         let fanout = VideoFrameFanout::new(None);
         fanout.start_stream(StreamId(7));
-        let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
+        let (daemon_stream, mut frontend_stream) = local_stream_pair().unwrap();
         frontend_stream
             .set_read_timeout(Some(std::time::Duration::from_millis(50)))
             .unwrap();
@@ -878,7 +864,7 @@ mod tests {
         fanout.send(frame(7, true, 1));
         fanout.send(frame(7, false, 2));
 
-        let (daemon_stream, mut frontend_stream) = UnixStream::pair().unwrap();
+        let (daemon_stream, mut frontend_stream) = local_stream_pair().unwrap();
         frontend_stream
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();

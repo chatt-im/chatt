@@ -67,9 +67,9 @@ enum SnapshotScope {
     Diff,
 }
 
-/// Result of opening a share for a native renderer, which reaches the daemon
-/// over the Unix-only local RPC socket; see the note in `runtime.rs`.
-#[cfg(unix)]
+/// Result of opening a share for a renderer client; see the note in
+/// `runtime.rs`.
+#[cfg(renderer_clients)]
 pub(crate) struct RpcLiveShareOpen {
     pub(crate) handle: crate::video::NativeViewerHandle,
     pub(crate) status: local_rpc::model::LiveShareViewStatus,
@@ -445,15 +445,15 @@ impl App {
         self.voice_roster.expires_at
     }
 
-    /// Opens a live screen share for a native renderer attached over the local
-    /// RPC socket. That socket is Unix-only; see the note in `runtime.rs`.
-    #[cfg(unix)]
+    /// Opens a live screen share for a renderer client, writing its video to
+    /// `stream`; see the note in `runtime.rs`.
+    #[cfg(renderer_clients)]
     pub(crate) fn start_rpc_live_share(
         &mut self,
         client_id: ClientId,
         stream_id: rpc::ids::StreamId,
         generation: u64,
-        stream: std::os::unix::net::UnixStream,
+        stream: crate::local_stream::LocalStream,
     ) -> Result<RpcLiveShareOpen, String> {
         let share = self
             .room

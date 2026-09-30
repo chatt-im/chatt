@@ -28,11 +28,12 @@ mod config_diagnostics;
 mod device_link;
 mod e2e;
 mod e2e_identity;
-#[cfg(all(feature = "embedded-client", unix))]
+#[cfg(feature = "embedded-client")]
 pub mod embedded;
 mod file_compression;
 mod fuzzy;
 mod local_control;
+mod local_stream;
 pub mod mdns;
 #[cfg(test)]
 mod mls_e2e_test;

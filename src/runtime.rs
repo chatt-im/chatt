@@ -10,12 +10,15 @@ use std::{
 
 // Serving other processes, meaning terminal clients that attach and native
 // renderers speaking the local RPC protocol, rides on Unix-domain sockets and
-// descriptor passing. Windows runs the terminal UI in this process only, so the whole
-// remote-serving half is compiled out there and the maps it feeds stay empty.
-// `AppEvent`'s corresponding variants are gated the same way.
+// descriptor passing, so that transport is compiled out on Windows.
+//
+// The renderer-client model itself is not socket-bound: the in-process frontend
+// of `embedded-client` is one too, on every platform. `cfg(renderer_clients)`
+// (see `build.rs`) covers the model, `cfg(unix)` only the socket transport and
+// terminal attach. `AppEvent`'s corresponding variants are gated the same way.
 #[cfg(unix)]
 use std::os::{
-    fd::{AsRawFd, IntoRawFd, OwnedFd},
+    fd::{AsRawFd, IntoRawFd},
     unix::net::UnixStream,
 };
 
@@ -24,17 +27,21 @@ use local_rpc::model::DaemonInstanceId;
 
 // Everything below serves attached clients and RPC renderers, so it is used
 // only where that half is compiled in.
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 use std::collections::HashSet;
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 use local_rpc::frame::{DaemonFrame, NegotiatedLimits, StateDelta, StateEvent, Welcome};
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 use parking_lot::Mutex;
+#[cfg(renderer_clients)]
+use crate::local_stream::{
+    FrameResource, InterruptibleStream, StreamInterrupt, interruptible, local_stream_pair,
+};
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 use crate::app::frontend::RpcCommandEffect;
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 use crate::embedded::{AttachmentBody, DirectRequest, EmbeddedReady, FrontendEvent};
 
 #[cfg(unix)]
@@ -55,29 +62,61 @@ const CORE_BATCH_BUDGET: usize = 256;
 const RPC_CONTROL_BURST: usize = 8;
 static PANIC_HOOK: Once = Once::new();
 
-/// Windows stand-ins for the remote-serving half of the runtime.
+/// Stand-ins for the halves of the runtime a build does not serve.
 ///
-/// Nothing can attach on Windows: no control socket is published, so the client
-/// and RPC-client maps the shared event loop carries are always empty. Making
-/// their value types uninhabited says exactly that to the compiler: the maps
-/// provably hold nothing, and every operation over them is a no-op the
-/// optimiser can see through.
+/// Terminal attach needs the Unix control socket, so it is absent on Windows.
+/// Renderer clients exist wherever the Unix renderer socket or the embedded
+/// frontend does, so they are absent only from a Windows build without
+/// `embedded-client`. Where a half is absent nothing can join it, so the map
+/// the shared event loop carries for it is always empty. Making its value type
+/// uninhabited says exactly that to the compiler: the map provably holds
+/// nothing, and every operation over it is a no-op the optimiser can see
+/// through.
 ///
 /// The point of the stand-ins is that the loop body itself carries no `cfg`, so
-/// each of these has a `cfg(unix)` twin with the same signature. Adding an
-/// operation on either map means adding it here too; that is the cost of the
-/// arrangement and it is cheaper than the alternative, which is `cfg` on every
-/// function signature that threads the maps through.
+/// each of these has a twin with the same signature under the opposite gate.
+/// Adding an operation on either map means adding it here too; that is the
+/// cost of the arrangement and it is cheaper than the alternative, which is
+/// `cfg` on every function signature that threads the maps through.
 ///
 /// The `AppEvent` match arms that stay gated are a different thing: those
-/// variants are themselves `cfg(unix)` on `AppEvent`, so on Windows there is no
-/// pattern to write. They are not stand-in candidates.
+/// variants are themselves gated on `AppEvent`, so where they are absent there
+/// is no pattern to write. They are not stand-in candidates.
 #[cfg(not(unix))]
-mod no_remote {
+mod no_attach {
     use super::*;
 
     /// A terminal client attached over the local control socket.
     pub(super) enum RemoteClient {}
+
+    pub(super) fn shutdown_remote(client: RemoteClient, _shutdown: RemoteShutdown) {
+        // Uninhabited: the compiler discharges this arm-less match.
+        match client {}
+    }
+
+    pub(super) fn wake_remote(client: &RemoteClient, _dirty: DirtySections) {
+        match *client {}
+    }
+
+    pub(super) fn terminate_remote(client: &RemoteClient) {
+        match *client {}
+    }
+
+    pub(super) fn ack_terminate_remote(client: &RemoteClient) {
+        match *client {}
+    }
+}
+
+#[cfg(not(unix))]
+use no_attach::{
+    RemoteClient, ack_terminate_remote, shutdown_remote, terminate_remote, wake_remote,
+};
+
+/// Renderer-client stand-ins; see [`no_attach`] for the arrangement.
+#[cfg(not(renderer_clients))]
+mod no_renderers {
+    use super::*;
+
     /// A native renderer speaking the local RPC protocol.
     pub(super) enum RemoteRpcClient {}
 
@@ -114,6 +153,14 @@ mod no_remote {
     ) {
     }
 
+    pub(super) fn broadcast_rpc_publishing_events(
+        _app: &App,
+        _clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    ) {
+    }
+
+    pub(super) fn drain_all_management_events(_clients: &mut HashMap<ClientId, RemoteRpcClient>) {}
+
     /// No renderer can be staging an upload when no renderer can connect.
     pub(super) fn rpc_upload_staging_active(_clients: &HashMap<ClientId, RemoteRpcClient>) -> bool {
         false
@@ -121,22 +168,6 @@ mod no_remote {
 
     pub(super) fn shutdown_rpc(client: &mut RemoteRpcClient) {
         // Uninhabited: the compiler discharges this arm-less match.
-        match *client {}
-    }
-
-    pub(super) fn shutdown_remote(client: RemoteClient, _shutdown: RemoteShutdown) {
-        match client {}
-    }
-
-    pub(super) fn wake_remote(client: &RemoteClient, _dirty: DirtySections) {
-        match *client {}
-    }
-
-    pub(super) fn terminate_remote(client: &RemoteClient) {
-        match *client {}
-    }
-
-    pub(super) fn ack_terminate_remote(client: &RemoteClient) {
         match *client {}
     }
 
@@ -164,13 +195,13 @@ mod no_remote {
     }
 }
 
-#[cfg(not(unix))]
-use no_remote::{
-    RemoteClient, RemoteRpcClient, ack_terminate_remote, broadcast_rpc_appearance_events,
-    broadcast_rpc_identity_events, broadcast_rpc_live_share_status, broadcast_rpc_settings_events,
-    broadcast_rpc_snapshots, broadcast_rpc_voice_roster, notify_rpc_shutdown,
-    project_rpc_history_change, rpc_upload_staging_active, shutdown_remote, shutdown_rpc,
-    terminate_remote, wake_remote,
+#[cfg(not(renderer_clients))]
+use no_renderers::{
+    RemoteRpcClient, broadcast_rpc_appearance_events, broadcast_rpc_identity_events,
+    broadcast_rpc_live_share_status, broadcast_rpc_publishing_events,
+    broadcast_rpc_settings_events, broadcast_rpc_snapshots, broadcast_rpc_voice_roster,
+    drain_all_management_events, notify_rpc_shutdown, project_rpc_history_change,
+    rpc_upload_staging_active, shutdown_rpc,
 };
 
 #[cfg(unix)]
@@ -181,9 +212,10 @@ struct RemoteClient {
     control_thread: Option<JoinHandle<()>>,
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 struct RemoteRpcClient {
     sender: RpcClientSender,
+    #[cfg(unix)]
     control: Option<Arc<UnixStream>>,
     events: EventSender,
     reader_thread: Option<JoinHandle<()>>,
@@ -209,7 +241,7 @@ struct RemoteRpcClient {
     last_publishing_state: Option<local_rpc::publishing::PublishingState>,
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 #[derive(Default)]
 struct RpcServerDrafts {
     active: Option<(
@@ -219,7 +251,7 @@ struct RpcServerDrafts {
     next_id: u64,
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 impl RpcServerDrafts {
     fn open(
         &mut self,
@@ -291,20 +323,20 @@ impl RpcServerDrafts {
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 struct RpcLiveViewer {
     generation: u64,
     _handle: crate::video::NativeViewerHandle,
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 struct AttachmentStreamControl {
-    shutdown: UnixStream,
+    shutdown: StreamInterrupt,
     worker: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 struct RpcHistoryRequest {
     room_id: rpc::ids::RoomId,
     room_generation: u64,
@@ -312,7 +344,7 @@ struct RpcHistoryRequest {
     limit: u16,
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 struct RpcUpload {
     upload: local_rpc::bulk::BeginUpload,
     file: tempfile::NamedTempFile,
@@ -327,7 +359,7 @@ enum RpcOutboundControl {
     /// so bounds the write in front of it.
     Descriptors {
         length: usize,
-        fds: Vec<OwnedFd>,
+        fds: Vec<FrameResource>,
     },
     StartBulk {
         transfer_id: local_rpc::model::BulkTransferId,
@@ -488,16 +520,16 @@ impl RpcAttachmentStream {
 }
 
 #[derive(Clone)]
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 struct RpcClientSender {
     sink: Arc<dyn FrontendSink>,
     active_bulk: Arc<Mutex<HashSet<local_rpc::model::BulkTransferId>>>,
     outstanding: Arc<Mutex<HashSet<local_rpc::model::RequestId>>>,
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 trait FrontendSink: Send + Sync {
-    fn send_frame(&self, frame: DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), SinkError>;
+    fn send_frame(&self, frame: DaemonFrame, fds: Vec<FrameResource>) -> Result<(), SinkError>;
     fn start_bulk(
         &self,
         transfer_id: local_rpc::model::BulkTransferId,
@@ -509,7 +541,7 @@ trait FrontendSink: Send + Sync {
     fn abort(&self);
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 #[derive(Debug)]
 enum SinkError {
     Invalid(String),
@@ -517,7 +549,7 @@ enum SinkError {
     Closed(String),
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 impl std::fmt::Display for SinkError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -536,7 +568,7 @@ struct UnixFrontendSink {
 
 #[cfg(unix)]
 impl FrontendSink for UnixFrontendSink {
-    fn send_frame(&self, frame: DaemonFrame, fds: Vec<OwnedFd>) -> Result<(), SinkError> {
+    fn send_frame(&self, frame: DaemonFrame, fds: Vec<FrameResource>) -> Result<(), SinkError> {
         let mut state = self.outbound.state.lock();
         if state.closed {
             return Err(SinkError::Closed("RPC client writer stopped".into()));
@@ -600,14 +632,14 @@ impl FrontendSink for UnixFrontendSink {
     }
 }
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 struct DirectFrontendSink {
     events: crate::embedded::EventQueue,
     core_events: EventSender,
     client_id: ClientId,
 }
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 impl DirectFrontendSink {
     fn try_send(&self, event: FrontendEvent) -> Result<(), SinkError> {
         self.events.send(event).map_err(|error| match error {
@@ -621,9 +653,9 @@ impl DirectFrontendSink {
     }
 }
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 impl FrontendSink for DirectFrontendSink {
-    fn send_frame(&self, frame: DaemonFrame, mut fds: Vec<OwnedFd>) -> Result<(), SinkError> {
+    fn send_frame(&self, frame: DaemonFrame, mut fds: Vec<FrameResource>) -> Result<(), SinkError> {
         local_rpc::frame::validate_daemon(&frame).map_err(SinkError::Invalid)?;
         match frame {
             DaemonFrame::LiveShareOpened {
@@ -637,12 +669,18 @@ impl FrontendSink for DirectFrontendSink {
                         "live share event carries an invalid descriptor count".into(),
                     ));
                 }
+                let stream = crate::local_stream::into_local_stream(
+                    fds.pop().expect("checked descriptor"),
+                )
+                .map_err(|_| {
+                    SinkError::Invalid("live share event carries a resource that is not a stream".into())
+                })?;
                 self.try_send(FrontendEvent::LiveShareOpened {
                     request_id,
                     stream_id,
                     generation,
                     status,
-                    stream: UnixStream::from(fds.pop().expect("checked descriptor")),
+                    stream,
                 })
             }
             DaemonFrame::AttachmentSourceOpened {
@@ -721,7 +759,7 @@ impl FrontendSink for DirectFrontendSink {
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 impl RpcClientSender {
     fn send(&self, frame: DaemonFrame) -> Result<(), String> {
         self.send_classified(frame)
@@ -761,7 +799,7 @@ impl RpcClientSender {
     fn send_with_fds_classified(
         &self,
         frame: DaemonFrame,
-        fds: Vec<OwnedFd>,
+        fds: Vec<FrameResource>,
     ) -> Result<(), SinkError> {
         let expected_fds = match &frame {
             DaemonFrame::LiveShareOpened { .. } | DaemonFrame::AttachmentSourceOpened { .. } => 1,
@@ -811,7 +849,7 @@ impl RpcClientSender {
         self.handle_send_result(metadata, result)
     }
 
-    fn send_with_fds_or_abort(&self, frame: DaemonFrame, fds: Vec<OwnedFd>) -> bool {
+    fn send_with_fds_or_abort(&self, frame: DaemonFrame, fds: Vec<FrameResource>) -> bool {
         let metadata = FrameMetadata::new(&frame);
         let result = self.send_with_fds_classified(frame, fds);
         self.handle_send_result(metadata, result)
@@ -899,14 +937,14 @@ impl RpcClientSender {
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 #[derive(Clone, Copy)]
 struct FrameMetadata {
     kind: &'static str,
     request_target: Option<(local_rpc::model::RequestId, local_rpc::frame::Operation)>,
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 impl FrameMetadata {
     fn new(frame: &DaemonFrame) -> Self {
         Self {
@@ -916,7 +954,7 @@ impl FrameMetadata {
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn completed_request_id(frame: &DaemonFrame) -> Option<local_rpc::model::RequestId> {
     match frame {
         DaemonFrame::RequestResult(result) => Some(result.request_id),
@@ -937,7 +975,7 @@ fn completed_request_id(frame: &DaemonFrame) -> Option<local_rpc::model::Request
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn daemon_request_target(
     frame: &DaemonFrame,
 ) -> Option<(local_rpc::model::RequestId, local_rpc::frame::Operation)> {
@@ -980,7 +1018,7 @@ fn daemon_request_target(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn daemon_frame_kind(frame: &DaemonFrame) -> &'static str {
     match frame {
         DaemonFrame::Welcome(_) => "welcome",
@@ -1042,11 +1080,11 @@ pub(crate) fn run_daemon(config: Config) -> Result<(), Box<dyn std::error::Error
 enum RuntimeMode {
     Terminal,
     Daemon,
-    #[cfg(all(unix, feature = "embedded-client"))]
+    #[cfg(feature = "embedded-client")]
     Embedded(crate::embedded::DirectBootstrap),
 }
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 pub(crate) fn run_embedded(
     config: Config,
     bootstrap: crate::embedded::DirectBootstrap,
@@ -1063,9 +1101,9 @@ fn run_app_inner(
     mode: RuntimeMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let headless = !matches!(&mode, RuntimeMode::Terminal);
-    #[cfg(all(unix, feature = "embedded-client"))]
+    #[cfg(feature = "embedded-client")]
     let embedded = matches!(&mode, RuntimeMode::Embedded(_));
-    #[cfg(not(all(unix, feature = "embedded-client")))]
+    #[cfg(not(feature = "embedded-client"))]
     let embedded = false;
     if !embedded {
         install_panic_hook();
@@ -1138,7 +1176,7 @@ fn run_app_inner(
     let mut clients = HashMap::<ClientId, RemoteClient>::new();
     let mut rpc_clients = HashMap::<ClientId, RemoteRpcClient>::new();
     let daemon_instance = daemon_instance_id();
-    #[cfg(all(unix, feature = "embedded-client"))]
+    #[cfg(feature = "embedded-client")]
     if let RuntimeMode::Embedded(bootstrap) = mode {
         let id = ClientId(next_client_id as u32);
         next_client_id += 1;
@@ -1446,19 +1484,19 @@ fn handle_runtime_event(
                 broadcast_rpc_snapshots(app, rpc_clients, daemon_instance);
             }
         }
-        #[cfg(all(unix, feature = "embedded-client"))]
+        #[cfg(feature = "embedded-client")]
         AppEvent::EmbeddedFrontendWake(client_id) => {
             handle_direct_frontend_requests(app, rpc_clients, client_id, daemon_instance);
         }
-        #[cfg(all(unix, feature = "embedded-client"))]
+        #[cfg(feature = "embedded-client")]
         AppEvent::EmbeddedCoreShutdown => {
             app.request_quit();
         }
-        #[cfg(unix)]
+        #[cfg(renderer_clients)]
         AppEvent::RpcClientExited(id) => {
             retire_rpc_frontend(app, rpc_clients, id, "frontend transport stopped");
         }
-        #[cfg(unix)]
+        #[cfg(renderer_clients)]
         AppEvent::AttachmentStreamWorkerExited {
             client_id,
             request_id,
@@ -1515,7 +1553,7 @@ fn handle_runtime_event(
     }
 }
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 fn handle_direct_frontend_requests(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -1609,7 +1647,7 @@ fn handle_direct_frontend_requests(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn rpc_frame_affects_projection(frame: &local_rpc::frame::ClientFrame) -> bool {
     !matches!(
         frame,
@@ -1620,7 +1658,7 @@ fn rpc_frame_affects_projection(frame: &local_rpc::frame::ClientFrame) -> bool {
     )
 }
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 fn handle_direct_upload(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -1713,7 +1751,7 @@ fn handle_direct_upload(
     ));
 }
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 fn retire_direct_frontend(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -1722,7 +1760,7 @@ fn retire_direct_frontend(
     retire_rpc_frontend(app, clients, id, "embedded frontend detached");
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn retire_rpc_frontend(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -1915,7 +1953,7 @@ fn spawn_rpc_client(
     })
 }
 
-#[cfg(all(unix, feature = "embedded-client"))]
+#[cfg(feature = "embedded-client")]
 fn spawn_direct_frontend(
     app: &mut App,
     id: ClientId,
@@ -1971,6 +2009,7 @@ fn spawn_direct_frontend(
     }
     Ok(RemoteRpcClient {
         sender,
+        #[cfg(unix)]
         control: None,
         events,
         reader_thread: None,
@@ -2143,7 +2182,7 @@ fn rpc_writer_loop(
     outbound.close();
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_rpc_snapshot(
     app: &mut App,
     id: ClientId,
@@ -2164,7 +2203,7 @@ fn send_rpc_snapshot(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn broadcast_rpc_snapshots(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -2198,7 +2237,7 @@ fn broadcast_rpc_snapshots(
 /// is the point: a speaking edge is sampled every 50 ms and moves one bit of
 /// one row, so rebuilding and diffing every client's whole snapshot for it is
 /// pure waste.
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn broadcast_rpc_voice_roster(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -2226,7 +2265,7 @@ fn broadcast_rpc_voice_roster(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn broadcast_rpc_live_share_status(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     stream_id: rpc::ids::StreamId,
@@ -2249,7 +2288,7 @@ fn broadcast_rpc_live_share_status(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_rpc_event(
     client: &mut RemoteRpcClient,
     instance_id: DaemonInstanceId,
@@ -2265,7 +2304,7 @@ fn send_rpc_event(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn project_rpc_history_change(
     app: &App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -2346,7 +2385,7 @@ fn project_rpc_history_change(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn sync_rpc_state(
     app: &App,
     id: ClientId,
@@ -2418,7 +2457,7 @@ fn sync_rpc_state(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn complete_pending_rpc_history(
     app: &App,
     id: ClientId,
@@ -2470,7 +2509,7 @@ fn complete_pending_rpc_history(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_rpc_history_page(
     client: &mut RemoteRpcClient,
     instance_id: DaemonInstanceId,
@@ -2500,7 +2539,7 @@ fn send_rpc_history_page(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn projection_deltas(
     old: &local_rpc::model::StateSnapshot,
     next: &local_rpc::model::StateSnapshot,
@@ -2600,7 +2639,7 @@ fn projection_deltas(
     deltas
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn handle_rpc_command(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -2741,7 +2780,7 @@ fn handle_rpc_command(
             if replaced.is_some() {
                 app.stop_rpc_live_share(stream_id);
             }
-            let (daemon_stream, frontend_stream) = match UnixStream::pair() {
+            let (daemon_stream, frontend_stream) = match local_stream_pair() {
                 Ok(pair) => pair,
                 Err(error) => {
                     send_live_share_rejection(
@@ -2769,7 +2808,7 @@ fn handle_rpc_command(
                     return;
                 }
             };
-            let frontend_fd: OwnedFd = frontend_stream.into();
+            let frontend_fd: FrameResource = frontend_stream.into();
             let opened = DaemonFrame::LiveShareOpened {
                 request_id,
                 stream_id,
@@ -3040,7 +3079,7 @@ fn handle_rpc_command(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn handle_room_settings_command(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -3078,7 +3117,7 @@ fn handle_room_settings_command(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn handle_directory_command(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -3154,7 +3193,7 @@ fn handle_directory_command(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_directory_result(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
@@ -3176,7 +3215,7 @@ fn send_directory_result(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn handle_management_command(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -3380,7 +3419,7 @@ fn handle_management_command(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_management_acceptance(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
@@ -3397,7 +3436,7 @@ fn send_management_acceptance(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_management_rejection(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
@@ -3419,7 +3458,7 @@ fn send_management_rejection(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_management_event(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
@@ -3430,7 +3469,7 @@ fn send_management_event(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn drain_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>, id: ClientId) {
     let Some(client) = clients.get_mut(&id) else {
         return;
@@ -3641,7 +3680,7 @@ fn drain_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>, id:
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn drain_all_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>) {
     let ids = clients.keys().copied().collect::<Vec<_>>();
     for id in ids {
@@ -3649,7 +3688,7 @@ fn drain_all_management_events(clients: &mut HashMap<ClientId, RemoteRpcClient>)
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn management_join_state(
     join: crate::client_channel::JoinView,
 ) -> local_rpc::management::JoinState {
@@ -3677,7 +3716,7 @@ fn management_join_state(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn broadcast_rpc_publishing_events(app: &App, clients: &mut HashMap<ClientId, RemoteRpcClient>) {
     let state = app.rpc_publishing_state();
     for client in clients.values_mut() {
@@ -3695,7 +3734,7 @@ fn broadcast_rpc_publishing_events(app: &App, clients: &mut HashMap<ClientId, Re
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn broadcast_rpc_appearance_events(app: &App, clients: &mut HashMap<ClientId, RemoteRpcClient>) {
     let generation = app.rpc_appearance_generation();
     for client in clients.values_mut() {
@@ -3712,7 +3751,7 @@ fn broadcast_rpc_appearance_events(app: &App, clients: &mut HashMap<ClientId, Re
 /// Hands each renderer the identity review it has not seen yet. Opening a
 /// review needs a server round trip, so the document always arrives this way
 /// rather than as the reply to `Open`.
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn broadcast_rpc_identity_events(app: &mut App, clients: &mut HashMap<ClientId, RemoteRpcClient>) {
     for (id, client) in clients.iter_mut() {
         let Some((generation, event)) = app.rpc_identity_event(*id, client.identity_generation)
@@ -3728,7 +3767,7 @@ fn broadcast_rpc_identity_events(app: &mut App, clients: &mut HashMap<ClientId, 
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn broadcast_rpc_settings_events(
     app: &App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -3773,7 +3812,7 @@ fn broadcast_rpc_settings_events(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_live_share_rejection(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
@@ -3785,7 +3824,7 @@ fn send_live_share_rejection(
     send_rpc_rejection(clients, id, request_id, operation, code, message);
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn send_rpc_rejection(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
     id: ClientId,
@@ -3809,12 +3848,12 @@ fn send_rpc_rejection(
     ));
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn rpc_upload_staging_active(clients: &HashMap<ClientId, RemoteRpcClient>) -> bool {
     upload_staging_active(clients.values().map(|client| client.uploads.as_ref()))
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn upload_staging_active<'a, T: 'a>(
     uploads: impl IntoIterator<Item = &'a Mutex<HashMap<local_rpc::model::BulkTransferId, T>>>,
 ) -> bool {
@@ -3823,7 +3862,7 @@ fn upload_staging_active<'a, T: 'a>(
         .any(|uploads| !uploads.lock().is_empty())
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn open_rpc_attachment_source(
     client: &mut RemoteRpcClient,
     client_id: ClientId,
@@ -3888,7 +3927,7 @@ fn open_rpc_attachment_source(
                 );
                 return;
             }
-            let (daemon_stream, frontend_stream) = match UnixStream::pair() {
+            let (daemon_stream, frontend_stream) = match local_stream_pair() {
                 Ok(pair) => pair,
                 Err(error) => {
                     reject(
@@ -3899,8 +3938,8 @@ fn open_rpc_attachment_source(
                     return;
                 }
             };
-            let shutdown = match daemon_stream.try_clone() {
-                Ok(stream) => stream,
+            let (daemon_stream, shutdown) = match interruptible(daemon_stream) {
+                Ok(pair) => pair,
                 Err(error) => {
                     reject(
                         client,
@@ -3947,10 +3986,10 @@ fn open_rpc_attachment_source(
                 byte_len,
                 transport: AttachmentSourceTransport::ReadAtSocket,
             };
-            let fd: OwnedFd = frontend_stream.into();
+            let fd: FrameResource = frontend_stream.into();
             if !client.sender.send_with_fds_or_abort(opened, vec![fd]) {
                 if let Some(mut stream) = client.attachment_streams.remove(&request_id) {
-                    let _ = stream.shutdown.shutdown(std::net::Shutdown::Both);
+                    stream.shutdown.interrupt();
                     if let Some(worker) = stream.worker.take() {
                         let _ = worker.join();
                     }
@@ -3960,16 +3999,20 @@ fn open_rpc_attachment_source(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn open_direct_attachment_source(
     path: &std::path::Path,
     byte_len: u64,
-) -> Result<OwnedFd, (u16, String)> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC)
+) -> Result<FrameResource, (u16, String)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // On Windows std already opens handles non-inheritable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC);
+    }
+    let file = options
         .open(path)
         .map_err(|error| (404, format!("attachment source cannot be opened: {error}")))?;
     let metadata = file.metadata().map_err(|error| {
@@ -3987,7 +4030,7 @@ fn open_direct_attachment_source(
     Ok(file.into())
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 struct AttachmentStreamWorkerGuard {
     events: EventSender,
     client_id: ClientId,
@@ -3999,7 +4042,7 @@ struct AttachmentStreamWorkerGuard {
     reason: String,
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 impl Drop for AttachmentStreamWorkerGuard {
     fn drop(&mut self) {
         kvlog::info!(
@@ -4022,9 +4065,9 @@ impl Drop for AttachmentStreamWorkerGuard {
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn run_attachment_stream_worker(
-    mut stream: UnixStream,
+    mut stream: InterruptibleStream,
     bytes: Arc<Vec<u8>>,
     events: EventSender,
     client_id: ClientId,
@@ -4092,7 +4135,7 @@ fn run_attachment_stream_worker(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn handle_rpc_effect(
     app: &mut App,
     client: &mut RemoteRpcClient,
@@ -4284,7 +4327,7 @@ fn handle_rpc_effect(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn handle_rpc_upload_chunk(
     uploads: &Mutex<HashMap<local_rpc::model::BulkTransferId, RpcUpload>>,
     sender: &RpcClientSender,
@@ -4318,7 +4361,7 @@ fn handle_rpc_upload_chunk(
     }
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn finish_rpc_upload(
     app: &mut App,
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -4371,11 +4414,11 @@ fn finish_rpc_upload(
         .send_or_abort(DaemonFrame::RequestResult(result));
 }
 
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn shutdown_rpc(client: &mut RemoteRpcClient) {
     client.live_viewers.clear();
     for stream in client.attachment_streams.values() {
-        let _ = stream.shutdown.shutdown(std::net::Shutdown::Both);
+        stream.shutdown.interrupt();
     }
     for (_, mut stream) in client.attachment_streams.drain() {
         if let Some(worker) = stream.worker.take() {
@@ -4383,6 +4426,7 @@ fn shutdown_rpc(client: &mut RemoteRpcClient) {
         }
     }
     client.sender.shutdown();
+    #[cfg(unix)]
     if let Some(control) = &client.control {
         let _ = control.shutdown(std::net::Shutdown::Both);
     }
@@ -4415,7 +4459,7 @@ fn ack_terminate_remote(client: &RemoteClient) {
 
 /// Tells a renderer the daemon is going away, before its connection is torn
 /// down under it.
-#[cfg(unix)]
+#[cfg(renderer_clients)]
 fn notify_rpc_shutdown(client: &mut RemoteRpcClient, instance_id: DaemonInstanceId) {
     let seq = client.next_event_seq;
     if let Err(error) = client.sender.send(DaemonFrame::Event(StateEvent {
