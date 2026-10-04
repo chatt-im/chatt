@@ -19,6 +19,14 @@
 //! `PIPE_REJECT_REMOTE_CLIENTS` keeps it off the network, and
 //! `FILE_FLAG_FIRST_PIPE_INSTANCE` on the first instance means startup fails
 //! rather than silently sharing a name another process already squatted.
+//!
+//! The name is predictable, so another local user can create it first. The
+//! server then refuses to start, which is loud; the client side is what has to
+//! not be fooled. It verifies that the process serving the pipe runs as the
+//! same user before sending anything, so a squatter cannot hand `invite` a
+//! forged join string, and it connects with `SECURITY_IDENTIFICATION` quality
+//! of service, so a squatter holding `SeImpersonatePrivilege` can learn who
+//! connected but cannot act as them.
 
 use std::{
     io,
@@ -34,26 +42,27 @@ use std::{
 
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     },
     Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FlushFileBuffers,
-        OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+        PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
     },
     System::{
         IO::{CancelIo, GetOverlappedResult, OVERLAPPED},
         Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
-            WaitNamedPipeW,
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+            PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+            PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
         },
         Threading::{CreateEventW, ResetEvent, WaitForSingleObject},
     },
 };
 
 use chatt_platform::osstr::wide_null;
-use chatt_platform::security::{OwnerOnlySecurity, current_user_sid};
+use chatt_platform::security::{OwnerOnlySecurity, current_user_sid, process_user_sid};
 
 use super::{ACCEPT_ERROR_BACKOFF, AdminSender, ControlStream, STREAM_TIMEOUT, handle_connection};
 
@@ -118,8 +127,20 @@ impl AdminSocket {
                             if worker_shutdown.load(Ordering::SeqCst) {
                                 break;
                             }
+                            // A client opened and closed the pipe before
+                            // `ConnectNamedPipe` ran. The instance still holds
+                            // that dead connection, and connecting it again
+                            // without a disconnect fails the same way forever.
+                            if error.raw_os_error() == Some(ERROR_NO_DATA as i32) {
+                                // SAFETY: the handle is a pipe instance owned here.
+                                unsafe { DisconnectNamedPipe(listener.get()) };
+                                continue;
+                            }
                             kvlog::warn!("server control accept failed", error = %error);
                             thread::sleep(ACCEPT_ERROR_RETRY);
+                            // Whatever broke may be a property of this
+                            // instance, so retrying on it could fail forever.
+                            listener = replace_instance(listener, &worker_wide, &security);
                             continue;
                         }
                     }
@@ -152,6 +173,7 @@ impl AdminSocket {
                                 event,
                             };
                             handle_connection(&stream, &commands);
+                            stream.await_client_close(Instant::now() + STREAM_TIMEOUT);
                             listener = stream.into_pipe();
                         }
                         Err(error) => {
@@ -159,10 +181,7 @@ impl AdminSocket {
                         }
                     }
                     // SAFETY: the handle is a connected pipe instance owned here.
-                    unsafe {
-                        FlushFileBuffers(listener.get());
-                        DisconnectNamedPipe(listener.get());
-                    }
+                    unsafe { DisconnectNamedPipe(listener.get()) };
 
                     match next {
                         Some(next) => listener = next,
@@ -193,7 +212,9 @@ impl Drop for AdminSocket {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         // The worker rechecks the flag every ACCEPT_POLL_INTERVAL while waiting
-        // for a client, so it needs no wakeup connection to exit.
+        // for a client, so it needs no wakeup connection to exit. A connection
+        // it is serving is bounded too: every read, write and the final wait
+        // for the client to hang up runs against a deadline.
         if let Some(worker) = self.worker.take() {
             if worker.join().is_err() {
                 kvlog::error!("server control worker thread panicked");
@@ -224,6 +245,34 @@ impl Stream {
 
     fn into_pipe(self) -> OwnedHandle {
         self.pipe
+    }
+
+    /// Waits until the client closes its end, or until `deadline`.
+    ///
+    /// `DisconnectNamedPipe` discards whatever the client has not read yet, so
+    /// the response has to be consumed first. `FlushFileBuffers` is the usual
+    /// way to wait for that, but it blocks with no bound: a client that never
+    /// reads would pin the single control worker, and with it `Drop`'s join,
+    /// forever. A client that has read its response closes the pipe, which
+    /// completes a pending read with `ERROR_BROKEN_PIPE`, so an overlapped read
+    /// under the same deadline as every other operation is the bounded form.
+    fn await_client_close(&self, deadline: Instant) {
+        let mut scratch = [0u8; 64];
+        // A client still writing completes every read at once, so the deadline
+        // is checked here as well as inside the wait.
+        while Instant::now() < deadline {
+            match self.transfer(
+                scratch.as_mut_ptr(),
+                scratch.len(),
+                Direction::Read,
+                deadline,
+            ) {
+                // Bytes past the one request are not answered; discard them.
+                Ok(read) if read > 0 => {}
+                // Closed, broken or timed out: done waiting either way.
+                Ok(_) | Err(_) => return,
+            }
+        }
     }
 }
 
@@ -396,7 +445,18 @@ fn wait_for_client(pipe: &OwnedHandle, shutdown: &AtomicBool) -> io::Result<bool
         let millis = u32::try_from(ACCEPT_POLL_INTERVAL.as_millis()).unwrap_or(u32::MAX);
         // SAFETY: the event is owned and referenced by the pending connect.
         match unsafe { WaitForSingleObject(event.get(), millis) } {
-            WAIT_OBJECT_0 => return Ok(true),
+            WAIT_OBJECT_0 => {
+                // The connect finished; it can have finished with an error.
+                let mut transferred = 0;
+                // SAFETY: the operation signalled completion, so its result
+                // is available and `overlapped` is no longer borrowed.
+                let ok =
+                    unsafe { GetOverlappedResult(pipe.get(), &overlapped, &mut transferred, 0) };
+                if ok == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                return Ok(true);
+            }
             WAIT_TIMEOUT => {}
             // Anything else is a broken wait, most likely an invalidated
             // handle. Re-waiting on it would spin this thread forever, so it
@@ -414,6 +474,30 @@ fn create_event() -> io::Result<OwnedHandle> {
         return Err(io::Error::last_os_error());
     }
     Ok(OwnedHandle(handle))
+}
+
+/// Swaps `old` for a fresh instance of the same pipe after an error.
+///
+/// The new instance is created before the old one closes, so the name never
+/// lapses for a squatter to take. If creating it fails, the old instance is
+/// disconnected and kept, which is the best remaining option.
+fn replace_instance(
+    old: OwnedHandle,
+    wide_name: &[u16],
+    security: &OwnerOnlySecurity,
+) -> OwnedHandle {
+    match create_instance(wide_name, security, PipeInstance::Extra) {
+        Ok(fresh) => {
+            drop(old);
+            fresh
+        }
+        Err(error) => {
+            kvlog::warn!("failed to recreate server control pipe instance", error = %error);
+            // SAFETY: the handle is a pipe instance owned here.
+            unsafe { DisconnectNamedPipe(old.get()) };
+            old
+        }
+    }
 }
 
 /// Whether this is the name's first instance, which claims it exclusively.
@@ -464,6 +548,10 @@ fn connect_to(name: &str) -> io::Result<Stream> {
     let wide = wide_null(name);
     let deadline = Instant::now() + STREAM_TIMEOUT;
     loop {
+        // Identification-level quality of service: whoever serves the pipe
+        // may learn who connected, but cannot impersonate them, even holding
+        // SeImpersonatePrivilege.
+        //
         // SAFETY: the name is NUL-terminated and all optional pointers are null.
         let handle = unsafe {
             CreateFileW(
@@ -472,12 +560,14 @@ fn connect_to(name: &str) -> io::Result<Stream> {
                 0,
                 ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
                 ptr::null_mut(),
             )
         };
         if handle != INVALID_HANDLE_VALUE {
-            return Stream::new(OwnedHandle(handle));
+            let pipe = OwnedHandle(handle);
+            verify_server_user(&pipe)?;
+            return Stream::new(pipe);
         }
         let error = io::Error::last_os_error();
         // ERROR_PIPE_BUSY means every instance is serving someone else; wait
@@ -496,6 +586,34 @@ fn connect_to(name: &str) -> io::Result<Stream> {
         // SAFETY: the name is NUL-terminated.
         unsafe { WaitNamedPipeW(wide.as_ptr(), millis) };
     }
+}
+
+/// Fails unless the process serving `pipe` runs as the current user.
+///
+/// The pipe's name is predictable, so any local user can create it before the
+/// server does. Only the server's token user is trusted with the request and,
+/// for `invite`, with producing the join string the caller hands out.
+fn verify_server_user(pipe: &OwnedHandle) -> io::Result<()> {
+    let mut pid = 0;
+    // SAFETY: the handle is an open client end of a pipe and the
+    // out-parameter is owned here.
+    if unsafe { GetNamedPipeServerProcessId(pipe.get(), &mut pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let server = process_user_sid(pid).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot verify the server control pipe's owner (pid {pid}): {error}"),
+        )
+    })?;
+    let user = current_user_sid()?;
+    if server != user {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("server control pipe is served by another user ({server}, pid {pid})"),
+        ));
+    }
+    Ok(())
 }
 
 /// The control pipe's name.
