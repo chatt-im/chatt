@@ -72,6 +72,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Memory",
     # The CF_* clipboard format constants.
     "Win32_System_Ole",
+    # The message-only window that owns the clipboard through a write.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [features]

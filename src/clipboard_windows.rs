@@ -18,12 +18,17 @@
 //! clipboard is empty.
 
 use std::{
-    borrow::Cow, ffi::OsString, io, os::windows::ffi::OsStringExt, path::PathBuf, sync::OnceLock,
-    time::Duration,
+    borrow::Cow,
+    ffi::OsString,
+    io,
+    os::windows::ffi::OsStringExt,
+    path::PathBuf,
+    sync::OnceLock,
+    time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
-    Foundation::GlobalFree,
+    Foundation::{GlobalFree, HWND},
     System::{
         DataExchange::{
             CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
@@ -32,6 +37,7 @@ use windows_sys::Win32::{
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
     },
+    UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, HWND_MESSAGE},
 };
 
 /// The MIME reported for a clipboard holding only a device-independent bitmap.
@@ -40,30 +46,89 @@ use windows_sys::Win32::{
 /// unreadable image visible as one instead of as an empty clipboard.
 const DIB_MIME: &str = "image/x-dib";
 
-const OPEN_ATTEMPTS: u32 = 5;
-const OPEN_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// The longest an open waits for another process to let go of the clipboard,
+/// in total. The callers are user actions on threads that have other work, so
+/// this is a hard bound rather than a retry count times a delay.
+const OPEN_BUDGET: Duration = Duration::from_millis(20);
+const OPEN_RETRY_DELAY: Duration = Duration::from_millis(4);
 
 /// The clipboard, open for this thread until the value is dropped.
 struct ClipboardGuard;
 
 impl ClipboardGuard {
-    /// Opens the clipboard, retrying while another process holds it.
+    /// Opens the clipboard, associated with `owner`, retrying while another
+    /// process holds it.
     ///
     /// Only one process can have the clipboard open at a time, so losing the
     /// first attempt to whichever application the user just copied from is
-    /// ordinary rather than a failure.
-    fn open() -> io::Result<Self> {
-        for attempt in 0..OPEN_ATTEMPTS {
-            // SAFETY: a null window handle associates the clipboard with the
-            // current task, which is what a process without windows wants.
-            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+    /// ordinary rather than a failure. The retries stop at [`OPEN_BUDGET`].
+    ///
+    /// A null `owner` is fine for reading. Writing needs a real window: after
+    /// `OpenClipboard(NULL)`, `EmptyClipboard` sets the clipboard owner to
+    /// null, which the documentation says makes `SetClipboardData` fail.
+    fn open(owner: HWND) -> io::Result<Self> {
+        let deadline = Instant::now() + OPEN_BUDGET;
+        loop {
+            // SAFETY: `owner` is null or a window this thread created and
+            // keeps alive until after this guard closes the clipboard.
+            if unsafe { OpenClipboard(owner) } != 0 {
                 return Ok(Self);
             }
-            if attempt + 1 < OPEN_ATTEMPTS {
-                std::thread::sleep(OPEN_RETRY_DELAY);
+            let error = io::Error::last_os_error();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(error);
             }
+            std::thread::sleep(OPEN_RETRY_DELAY.min(remaining));
         }
-        Err(io::Error::last_os_error())
+    }
+}
+
+/// A message-only window to own the clipboard through a write, destroyed when
+/// the value drops.
+///
+/// Created per write on the writing thread and gone straight after it. A
+/// window that stayed alive on a thread that never pumps messages would stall
+/// the next application to empty the clipboard: that sends the old owner
+/// `WM_DESTROYCLIPBOARD` and waits for the reply. The data stays on the
+/// clipboard after the owner is destroyed, since nothing here uses delayed
+/// rendering. Uses the predefined `STATIC` class, so there is nothing to
+/// register.
+struct OwnerWindow(HWND);
+
+impl OwnerWindow {
+    fn new() -> io::Result<Self> {
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        // SAFETY: the class name is NUL terminated and outlives the call; a
+        // system class needs no module handle, and every other pointer is
+        // optional.
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if window.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(window))
+    }
+}
+
+impl Drop for OwnerWindow {
+    fn drop(&mut self) {
+        // SAFETY: this thread created the window, which is destroyed once.
+        unsafe { DestroyWindow(self.0) };
     }
 }
 
@@ -86,7 +151,10 @@ pub(crate) fn set_text(text: &str) -> io::Result<()> {
 
 /// Replaces the clipboard with `bytes`, offered under a single format.
 fn set_format(format: u32, bytes: &[u8]) -> io::Result<()> {
-    let _guard = ClipboardGuard::open()?;
+    // Declared first so it drops last: the clipboard closes before its owner
+    // window goes away.
+    let owner = OwnerWindow::new()?;
+    let _guard = ClipboardGuard::open(owner.0)?;
     // SAFETY: the clipboard is open, which is what taking ownership of it
     // requires.
     if unsafe { EmptyClipboard() } == 0 {
@@ -194,7 +262,7 @@ fn png_format() -> u32 {
 /// what the writer asked for. Every format read here ends at a terminator its
 /// own parse honours, and an image decoder ignores what follows the last chunk.
 fn format_bytes(format: u32) -> Option<Vec<u8>> {
-    let _guard = ClipboardGuard::open().ok()?;
+    let _guard = ClipboardGuard::open(std::ptr::null_mut()).ok()?;
     // SAFETY: the clipboard is open. The handle belongs to whoever set it and
     // is only borrowed until the clipboard is closed, so it is never freed
     // here.
@@ -237,6 +305,10 @@ fn paths_from_dropfiles(bytes: &[u8]) -> Vec<PathBuf> {
         return Vec::new();
     };
     let offset = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    // `pFiles` pointing back into the header would read its fields as names.
+    if offset < DROPFILES_HEADER {
+        return Vec::new();
+    }
     let wide = u32::from_le_bytes([
         header[DROPFILES_WIDE],
         header[DROPFILES_WIDE + 1],
@@ -364,6 +436,13 @@ mod tests {
     #[test]
     fn ansi_dropfiles_list_is_ignored() {
         let bytes = dropfiles(false, &[r"C:\pictures\shot.png"]);
+        assert!(paths_from_dropfiles(&bytes).is_empty());
+    }
+
+    #[test]
+    fn dropfiles_offset_inside_the_header_yields_nothing() {
+        let mut bytes = dropfiles(true, &[r"C:\pictures\shot.png"]);
+        bytes[..4].copy_from_slice(&4u32.to_le_bytes());
         assert!(paths_from_dropfiles(&bytes).is_empty());
     }
 
