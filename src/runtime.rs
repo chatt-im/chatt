@@ -2934,10 +2934,14 @@ fn handle_rpc_command(
                 );
                 return;
             }
+            // The replaced viewer is dropped before anything else: its handle
+            // keeps the viewer registered with the fanout, which would both
+            // keep the old subscriber alive and refuse the new viewer.
             let replaced = clients
                 .get_mut(&id)
                 .and_then(|client| client.live_viewers.remove(&stream_id));
-            if replaced.is_some() {
+            if let Some(replaced) = replaced {
+                drop(replaced);
                 app.stop_rpc_live_share(stream_id);
             }
             let Some(delivery) = clients.get(&id).map(|client| client.sender.live_shares()) else {
@@ -5606,6 +5610,70 @@ mod tests {
             frontend.try_recv().unwrap(),
             FrontendEvent::Frame(DaemonFrame::RequestResult(_))
         ));
+    }
+
+    #[cfg(feature = "embedded-client")]
+    #[test]
+    fn embedded_live_share_of_a_new_generation_replaces_the_previous_viewer() {
+        use crate::embedded::FrontendEvent;
+        use local_rpc::frame::ClientFrame;
+
+        let mut app = crate::app::App::new(crate::config::Config::default(), None).unwrap();
+        let (_commands_tx, commands) = std::sync::mpsc::sync_channel(1);
+        let (ready, _ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (queue, frontend) = crate::embedded::test_event_queue();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let client_id = crate::client_channel::ClientId(81);
+        let client = super::spawn_direct_frontend(
+            &mut app,
+            client_id,
+            crate::embedded::DirectBootstrap {
+                commands,
+                events: queue,
+                ready,
+            },
+            crate::app::EventSender(event_tx),
+            daemon_instance_id(),
+        )
+        .unwrap();
+        while frontend.try_recv().is_ok() {}
+        let mut clients = std::collections::HashMap::new();
+        clients.insert(client_id, client);
+
+        let stream_id = rpc::ids::StreamId(82);
+        let room_id = local_rpc::ids::RoomId(83);
+        let mut previous = None;
+        for (request, generation) in [(84, 1), (85, 2)] {
+            app.publish_test_live_share(room_id, stream_id, generation);
+            super::handle_rpc_command(
+                &mut app,
+                &mut clients,
+                client_id,
+                ClientFrame::StartLiveShare {
+                    request_id: local_rpc::model::RequestId(request),
+                    stream_id,
+                    generation,
+                },
+                daemon_instance_id(),
+            );
+            let event = frontend.try_recv().unwrap();
+            let FrontendEvent::LiveShareOpened {
+                generation: opened,
+                frames,
+                ..
+            } = event
+            else {
+                panic!("expected generation {generation} to open, got {event:?}");
+            };
+            assert_eq!(opened, generation);
+            if let Some(previous) = previous.replace(frames) {
+                assert!(previous.recv().is_none(), "the replaced queue is closed");
+            }
+            assert_eq!(
+                clients[&client_id].live_viewers[&stream_id].generation,
+                generation
+            );
+        }
     }
 
     // The embedded frontend shares the core's process, so nothing it opens may
