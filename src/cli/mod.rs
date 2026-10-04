@@ -914,9 +914,10 @@ fn run_interactive_app(
         None => None,
     };
     // On Unix the control socket below is itself the mutual exclusion: a second
-    // `chatt` attaches instead of starting. Where there is no control socket,
+    // `chatt` attaches instead of starting. Windows has no control socket, and
     // nothing else stops two clients writing the same config, room catalog,
     // room history and receive store, none of which are locked.
+    #[cfg(windows)]
     let _instance = match chatt_platform::instance::claim(&crate::paths::client_instance_name(
         &crate::paths::canonical_client_config_path(config_path),
     ))? {

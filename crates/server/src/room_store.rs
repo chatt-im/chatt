@@ -86,6 +86,27 @@ pub enum MutationKind {
     Delete,
 }
 
+/// Why [`RoomStore::encode_history_chunk`] could not encode a planned chunk.
+#[derive(Debug)]
+pub enum HistoryChunkError {
+    /// Retention trimmed the messages the plan names out of memory after the
+    /// plan was made.
+    Trimmed,
+    /// Anything else: an out-of-range chunk index or an unencodable header.
+    Failed(String),
+}
+
+impl std::fmt::Display for HistoryChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HistoryChunkError::Trimmed => {
+                f.write_str("history fetch plan no longer matches retained history")
+            }
+            HistoryChunkError::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
 /// Why [`RoomStore::validate_mutation`] rejected a mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationDenied {
@@ -673,8 +694,7 @@ impl ResidentHistory {
         room_id: RoomId,
         before: Option<MessageId>,
         spec: &HistoryChunkSpec,
-    ) -> Result<Vec<u8>, String> {
-        let stale = || "history fetch plan no longer matches retained history".to_string();
+    ) -> Result<Vec<u8>, HistoryChunkError> {
         let entries = self.entries();
         let chunk_entries = match spec.first_id {
             None => &[] as &[HistoryEntry],
@@ -684,10 +704,10 @@ impl ResidentHistory {
                     .checked_add(spec.count)
                     .and_then(|end| entries.get(start..end))
                 else {
-                    return Err(stale());
+                    return Err(HistoryChunkError::Trimmed);
                 };
                 if chunk_entries.first().map(|entry| entry.message_id) != Some(first_id) {
-                    return Err(stale());
+                    return Err(HistoryChunkError::Trimmed);
                 }
                 chunk_entries
             }
@@ -700,7 +720,8 @@ impl ResidentHistory {
             spec.complete,
             chunk_entries.len(),
             &mut payload,
-        )?;
+        )
+        .map_err(HistoryChunkError::Failed)?;
         for entry in chunk_entries {
             payload.extend_from_slice(self.record(*entry));
         }
@@ -720,7 +741,10 @@ impl ResidentHistory {
         let specs = self.chunk_specs(self.entries(), at_start, target_bytes);
         let mut payloads = Vec::with_capacity(specs.len());
         for spec in &specs {
-            payloads.push(self.encode_chunk(room_id, before, spec)?);
+            let payload = self
+                .encode_chunk(room_id, before, spec)
+                .map_err(|error| error.to_string())?;
+            payloads.push(payload);
         }
         Ok(payloads)
     }
@@ -1491,9 +1515,11 @@ impl RoomStore {
         &self,
         plan: &HistoryFetchPlan,
         chunk_index: usize,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, HistoryChunkError> {
         let Some(spec) = plan.chunks.get(chunk_index) else {
-            return Err("history chunk index is out of range".to_string());
+            return Err(HistoryChunkError::Failed(
+                "history chunk index is out of range".to_string(),
+            ));
         };
         if spec.first_id.is_none() {
             let mut payload = Vec::with_capacity(history::CHUNK_HEADER_BYTES);
@@ -1504,11 +1530,12 @@ impl RoomStore {
                 spec.complete,
                 0,
                 &mut payload,
-            )?;
+            )
+            .map_err(HistoryChunkError::Failed)?;
             return Ok(payload);
         }
         self.resident(plan.room_id)
-            .ok_or_else(|| "history fetch plan no longer has retained messages".to_string())?
+            .ok_or(HistoryChunkError::Trimmed)?
             .encode_chunk(plan.room_id, plan.before, spec)
     }
 
@@ -2814,8 +2841,18 @@ mod tests {
         }
 
         assert!(
-            store.encode_history_chunk(&plan, 0).is_err(),
+            matches!(
+                store.encode_history_chunk(&plan, 0),
+                Err(HistoryChunkError::Trimmed)
+            ),
             "a plan trimmed out of residency must error, not serve newer ids"
+        );
+        assert!(
+            matches!(
+                store.encode_history_chunk(&plan, plan.chunk_count()),
+                Err(HistoryChunkError::Failed(_))
+            ),
+            "an out-of-range chunk is not a trim"
         );
     }
 

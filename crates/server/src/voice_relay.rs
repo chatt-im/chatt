@@ -1278,11 +1278,14 @@ impl VoiceRelay {
     /// [`PROBE_BIT`]. Re-arms `bit` and returns once the drain budget is spent
     /// so no single socket can hold the loop.
     ///
-    /// The loop only ever leaves on `WouldBlock` or with work retained. That is
-    /// load-bearing on Windows, where `mio` simulates edge triggering by
-    /// clearing a socket's interest after each readiness event and re-arming it
-    /// only when an I/O call returns `WouldBlock`; exiting on anything else
-    /// would silence the socket for the life of the process.
+    /// A per-datagram error (see [`chatt_platform::is_datagram_error`]) is
+    /// skipped and charged to the budget, so the loop leaves on `WouldBlock` or
+    /// with work retained. That is load-bearing on Windows, where `mio`
+    /// simulates edge triggering by clearing a socket's interest after each
+    /// readiness event and re-arming it only when an I/O call returns
+    /// `WouldBlock`. Any other error is a fault of the socket and ends the
+    /// burst without retaining work, so a socket that fails every receive
+    /// cannot spin the loop.
     fn receive(&mut self, bit: u32) {
         let probe = bit == PROBE_BIT;
         if probe && self.udp_probe.is_none() {
@@ -1310,16 +1313,19 @@ impl VoiceRelay {
             let (len, src) = match received {
                 Ok(Some(received)) => received,
                 Ok(None) => break,
-                Err(error) => {
-                    // A receive error describes a datagram, not the socket: an
-                    // ICMP port-unreachable from an earlier send, or a datagram
-                    // too large for the buffer, is reported by the receive that
-                    // follows it and says nothing about what comes next. Both
-                    // are remotely triggerable, so they are skipped and charged
-                    // to the drain budget rather than ending the burst.
+                Err(error) if chatt_platform::is_datagram_error(&error) => {
                     skipped += 1;
                     last_error = Some(error);
                     continue;
+                }
+                Err(error) => {
+                    kvlog::warn!(
+                        "udp receive failed",
+                        bind_index,
+                        probe = server_probe_id,
+                        error = %error
+                    );
+                    break;
                 }
             };
             if let Err(error) =

@@ -1,10 +1,12 @@
 //! Positional file reads, directory durability, and owner-private creation.
 //!
-//! Reading at an explicit offset without disturbing the file cursor is
-//! `pread(2)` on Unix and an overlapped `ReadFile` on Windows, which `std`
-//! exposes as `FileExt::read_at` and `FileExt::seek_read` respectively. Only
-//! the Unix side also provides the exact-length form, so it is written out here
-//! for both.
+//! Reading at an explicit offset is `pread(2)` on Unix and a `ReadFile` with
+//! an explicit offset on Windows, which `std` exposes as `FileExt::read_at` and
+//! `FileExt::seek_read` respectively. Each read names its own offset, so
+//! concurrent positional readers of one handle never disturb each other; only
+//! `pread` also leaves the file cursor alone, while `seek_read` moves it past
+//! the bytes read. Only the Unix side provides the exact-length form, so it is
+//! written out here for both.
 
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io;
@@ -12,9 +14,10 @@ use std::path::Path;
 
 /// Reads exactly `buf.len()` bytes starting at `offset`.
 ///
-/// Unlike a plain read, this does not move the file's cursor, so concurrent
-/// readers of the same handle cannot disturb each other. A short read before
-/// the buffer is filled is reported as [`io::ErrorKind::UnexpectedEof`].
+/// Every read names its offset, so concurrent positional readers of the same
+/// handle cannot disturb each other. On Windows the file's cursor still moves,
+/// so do not mix this with cursor-based reads of the same handle. A short read
+/// before the buffer is filled is reported as [`io::ErrorKind::UnexpectedEof`].
 pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -27,8 +30,8 @@ pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()>
 
         let mut filled = 0;
         while filled < buf.len() {
-            // `seek_read` is positional: the offset advances here, not on the
-            // handle, so this stays safe against a concurrent reader.
+            // Each `seek_read` names its own offset, so a concurrent reader
+            // moving the handle's cursor cannot redirect this one.
             match file.seek_read(&mut buf[filled..], offset + filled as u64) {
                 Ok(0) => {
                     return Err(io::Error::new(

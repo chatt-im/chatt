@@ -6216,14 +6216,13 @@ impl Server {
                         // terminal empty chunk instead would tell the client
                         // it had reached the start of history when it had not,
                         // stranding everything older.
-                        Err(error) => {
+                        Err(room_store::HistoryChunkError::Trimmed) => {
                             let (before, limit) = plan.resume_after(*next_chunk);
                             kvlog::info!(
                                 "history page trimmed mid-delivery; refetching from disk",
                                 session_id = delivery.session_id.0,
                                 room_id = delivery.room_id.0,
-                                limit,
-                                error = error.as_str()
+                                limit
                             );
                             let session_id = delivery.session_id;
                             let room_id = delivery.room_id;
@@ -6245,6 +6244,16 @@ impl Server {
                                 None => self.send_empty_history_chunk(token, room_id, before),
                             }
                             continue;
+                        }
+                        Err(room_store::HistoryChunkError::Failed(error)) => {
+                            kvlog::warn!(
+                                "history chunk encode failed",
+                                session_id = delivery.session_id.0,
+                                room_id = delivery.room_id.0,
+                                error = error.as_str()
+                            );
+                            *next_chunk = plan.chunk_count();
+                            history_reader::empty_chunk(delivery.room_id, plan.before())
                         }
                     }
                 }

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub(crate) fn client_config_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("CHATT_CONFIG").filter(|value| !value.is_empty()) {
@@ -16,7 +16,8 @@ pub(crate) fn client_config_path() -> Option<PathBuf> {
 /// configuration need not exist yet at first run, and because `save_runtime`
 /// replaces it by rename, so its own inode is not stable anyway. A directory
 /// that does not exist yet falls back to the lexical form.
-pub(crate) fn canonical_config_path(path: &Path) -> PathBuf {
+#[cfg(any(windows, feature = "embedded-client", test))]
+pub(crate) fn canonical_config_path(path: &std::path::Path) -> PathBuf {
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let Some(parent) = path.parent() else {
         return path;
@@ -31,6 +32,7 @@ pub(crate) fn canonical_config_path(path: &Path) -> PathBuf {
 }
 
 /// [`canonical_config_path`] over the selected configuration, or the default.
+#[cfg(any(windows, test))]
 pub(crate) fn canonical_client_config_path(config_path: Option<&str>) -> PathBuf {
     let path = match config_path {
         Some(path) => PathBuf::from(path),
@@ -44,7 +46,8 @@ pub(crate) fn canonical_client_config_path(config_path: Option<&str>) -> PathBuf
 /// Scoped by canonical config path so independent configurations may run side
 /// by side while aliases of the same path contend for one claim. SHA-256 is
 /// stable across separate processes and Rust toolchain versions.
-pub(crate) fn client_instance_name(config_path: &Path) -> String {
+#[cfg(any(windows, feature = "embedded-client", test))]
+pub(crate) fn client_instance_name(config_path: &std::path::Path) -> String {
     use aws_lc_rs::digest;
 
     let digest = digest::digest(

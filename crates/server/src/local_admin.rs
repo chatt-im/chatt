@@ -26,6 +26,12 @@ const MAX_REQUEST_BYTES: u32 = 1024;
 const MAX_RESPONSE_BYTES: u32 = 8 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a client waits for the response once its request is written.
+///
+/// Longer than the server's [`STREAM_TIMEOUT`] wait for the event loop plus its
+/// own response write, so a slow command such as `MlsCompact` reaches the
+/// client as the server's answer rather than as a client-side timeout.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A request from the control channel, consumed by the server event loop.
 pub enum AdminCommand {
@@ -179,6 +185,7 @@ fn dispatch(
 fn request(stream: &impl ControlStream, opcode: u8, body: &[u8]) -> Result<String, String> {
     let deadline = Instant::now() + STREAM_TIMEOUT;
     write_frame(stream, opcode, body, MAX_REQUEST_BYTES, "request", deadline)?;
+    let deadline = Instant::now() + RESPONSE_TIMEOUT;
     let (status, body) = read_frame(stream, MAX_RESPONSE_BYTES, "response", deadline)?;
     let message = String::from_utf8(body)
         .map_err(|error| format!("server control response is not UTF-8: {error}"))?;

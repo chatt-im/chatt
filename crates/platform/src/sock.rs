@@ -126,6 +126,31 @@ pub fn is_interrupted(error: &io::Error) -> bool {
     }
 }
 
+/// Whether a UDP receive error describes one datagram rather than the socket.
+///
+/// An ICMP port-unreachable drawn by an earlier send surfaces on the receive
+/// that follows it as `ConnectionRefused` (Linux, connected socket) or
+/// `ConnectionReset` (Windows, `WSAECONNRESET`), and a datagram larger than the
+/// buffer is `WSAEMSGSIZE` on Windows. All of them are remotely triggerable and
+/// say nothing about the next datagram, so a receive loop skips them; any other
+/// error is a fault of the socket itself.
+pub fn is_datagram_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EMSGSIZE)
+    }
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE)
+    }
+}
+
 /// The protocol level an option applies to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SockLevel {
@@ -250,11 +275,13 @@ pub fn set_reuse_addr(socket: RawSock, reuse: bool) -> io::Result<()> {
 /// Stops a UDP socket reporting ICMP delivery failures on its receive path.
 ///
 /// A datagram that draws an ICMP port-unreachable says something about the
-/// destination, not about this socket, but both stacks will surface it as an
-/// error from the *next* receive if left to: Linux through `IP_RECVERR`,
-/// Windows through `SIO_UDP_CONNRESET`, which turns it into `WSAECONNRESET`.
-/// Chatt probes addresses that may have nothing listening, so those reports are
-/// routine and are turned off wherever the platform allows it.
+/// destination, not about this socket. Windows surfaces it anyway, as
+/// `WSAECONNRESET` from the *next* receive, unless `SIO_UDP_CONNRESET` is
+/// cleared. Linux already reports nothing on an unconnected socket while
+/// `IP_RECVERR` is off, which is its default; clearing it here only undoes an
+/// option something else set. A connected Linux socket reports
+/// `ECONNREFUSED` regardless of `IP_RECVERR`, so receive loops still skip such
+/// errors through [`is_datagram_error`].
 ///
 /// Best-effort by design: a platform with no such reporting to disable, and a
 /// per-family option the socket's family does not accept, both count as
@@ -606,6 +633,35 @@ mod tests {
             "callers key their retry loops off WouldBlock, so the platform code \
              must normalise to it (got {error:?})"
         );
+    }
+
+    #[test]
+    fn a_refused_send_is_a_datagram_error_and_socket_faults_are_not() {
+        let closed = UdpSocket::bind("127.0.0.1:0").expect("bind closed");
+        let closed_addr = closed.local_addr().expect("closed addr");
+        drop(closed);
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        socket.connect(closed_addr).expect("connect");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("read timeout");
+        socket.send(b"probe").expect("send");
+
+        let mut buf = [0u8; 8];
+        let error = socket.recv(&mut buf).expect_err("nothing listens there");
+        assert!(
+            is_datagram_error(&error),
+            "a port-unreachable describes one datagram (got {error:?})"
+        );
+        #[cfg(unix)]
+        assert!(is_datagram_error(&io::Error::from_raw_os_error(libc::EMSGSIZE)));
+        #[cfg(windows)]
+        assert!(is_datagram_error(&io::Error::from_raw_os_error(
+            windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE
+        )));
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotConnected] {
+            assert!(!is_datagram_error(&io::Error::from(kind)));
+        }
     }
 
     #[test]

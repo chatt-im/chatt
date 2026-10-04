@@ -3157,9 +3157,11 @@ impl VoiceSession {
     /// Drains a bounded receive burst. `true` retains local work so an
     /// edge-triggered readable socket cannot strand datagrams after the budget.
     ///
-    /// The loop only ever leaves on `WouldBlock` or with work retained, which
+    /// A per-datagram error (see [`chatt_platform::is_datagram_error`]) is
+    /// skipped, so the loop leaves on `WouldBlock` or with work retained, which
     /// is what re-arms `mio`'s simulated edge triggering on Windows; see
-    /// [`super::super::client_net`].
+    /// [`super::super::client_net`]. Any other error is a fault of the socket:
+    /// it is reported and ends the burst without retaining work.
     fn read_udp(&mut self) -> bool {
         let Some(udp) = self.udp.as_ref() else {
             return false;
@@ -3179,16 +3181,19 @@ impl VoiceSession {
             let (len, src) = match recv_udp_datagram(&udp.socket, &mut buf) {
                 Ok(Some(value)) => value,
                 Ok(None) => break false,
-                Err(error) => {
-                    // A receive error describes a datagram, not the socket: an
-                    // ICMP port-unreachable drawn by an earlier P2P probe, or a
-                    // datagram too large for `buf`, is reported by the receive
-                    // that follows it. Skipping keeps the drain going, and the
-                    // budget bounds it. Not surfaced to the user, because a
-                    // probe to a closed port is routine, not a fault.
+                Err(error) if chatt_platform::is_datagram_error(&error) => {
+                    // Not surfaced to the user: a P2P probe to a closed port
+                    // is routine, not a fault.
                     skipped += 1;
                     last_error = Some(error);
                     continue;
+                }
+                Err(error) => {
+                    kvlog::warn!("udp receive failed", error = %error);
+                    let _ = self
+                        .events
+                        .send(NetworkEvent::Error(format!("UDP receive failed: {error}")));
+                    break false;
                 }
             };
             datagrams_this_wake += 1;

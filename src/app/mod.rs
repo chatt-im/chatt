@@ -7402,7 +7402,8 @@ impl App {
     }
 
     fn note_capture_failure(&mut self, now: Instant, kind: AudioErrorKind, message: String) {
-        self.note_audio_event(
+        kvlog::warn!("capture stream failure", reason = message.as_str());
+        self.audio_events.push(
             now,
             AudioDeviceEventKind::StreamError,
             format!("mic: {message}"),
@@ -7412,7 +7413,8 @@ impl App {
     }
 
     fn note_playback_failure(&mut self, now: Instant, kind: AudioErrorKind, message: String) {
-        self.note_audio_event(
+        kvlog::warn!("playback stream failure", reason = message.as_str());
+        self.audio_events.push(
             now,
             AudioDeviceEventKind::StreamError,
             format!("spk: {message}"),

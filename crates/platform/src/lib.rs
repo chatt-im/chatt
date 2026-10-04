@@ -26,5 +26,6 @@ pub use security::is_owner_only;
 pub use poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd, poll, pollfd};
 pub use sock::{
     AsRawSock, RawSock, SockLevel, SocketSource, apply_dscp, bind_udp_socket_with, dscp_option,
-    getsockopt_int, ignore_udp_icmp_errors, is_interrupted, set_reuse_addr, setsockopt_int,
+    getsockopt_int, ignore_udp_icmp_errors, is_datagram_error, is_interrupted, set_reuse_addr,
+    setsockopt_int,
 };
