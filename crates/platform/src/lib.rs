@@ -19,7 +19,7 @@ pub mod poll;
 pub mod security;
 pub mod sock;
 
-pub use file::{create_private_dir, open_private, read_at, read_exact_at, sync_dir};
+pub use file::{PrivateOpenOptions, create_private_dir, read_at, read_exact_at, sync_dir};
 pub use osstr::{os_str_to_bytes, os_string_from_bytes};
 pub use security::is_owner_only;
 

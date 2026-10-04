@@ -2387,9 +2387,10 @@ fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<(), String> {
     let temp_path = parent.join(format!(".{file_name}.tmp"));
 
     let write_temp = || -> Result<(), String> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = chatt_platform::open_private(&mut options, &temp_path)
+        let mut file = chatt_platform::PrivateOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
             .map_err(|err| format!("failed to create {}: {err}", temp_path.display()))?;
         file.write_all(contents)
             .map_err(|err| format!("failed to write {}: {err}", temp_path.display()))?;

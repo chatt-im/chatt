@@ -1,7 +1,7 @@
 use hashbrown::HashSet;
 use std::{
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -1405,9 +1405,10 @@ pub(crate) fn atomic_write_toml(path: &Path, content: &str) -> Result<(), String
 }
 
 fn create_temp_file(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    chatt_platform::open_private(&mut options, path)
+    chatt_platform::PrivateOpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 fn open_new_config_file(path: &Path) -> Result<File, String> {

@@ -438,9 +438,11 @@ fn open_append(path: &Path) -> Option<RoomHistoryStore> {
 /// Opens (creating it private) a room file for append, so chat contents are not
 /// exposed to other local users.
 fn open_append_file(path: &Path) -> Option<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    match chatt_platform::open_private(&mut options, path) {
+    match chatt_platform::PrivateOpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         Ok(file) => Some(file),
         Err(error) => {
             kvlog::warn!(
@@ -1032,9 +1034,11 @@ fn create_unique_sibling(path: &Path, kind: &str) -> Option<(PathBuf, File)> {
     let timestamp = now_millis();
     for counter in 0..10_000 {
         let candidate = parent.join(format!("{stem}.{kind}-{timestamp}-{counter}.kvlog"));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        match chatt_platform::open_private(&mut options, &candidate) {
+        match chatt_platform::PrivateOpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&candidate)
+        {
             Ok(file) => return Some((candidate, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {

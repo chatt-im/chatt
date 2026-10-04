@@ -18,6 +18,8 @@ windows-sys = { version = "0.61", features = [
     # Owner-only DACLs on files and directories; see src/security.rs.
     "Win32_Security",
     "Win32_Security_Authorization",
+    # CreateFileW/CreateDirectoryW with owner-only security; see src/file.rs.
+    "Win32_Storage_FileSystem",
     # OpenProcessToken for the token user's SID, and the single-instance mutex.
     "Win32_System_Threading",
 ] }

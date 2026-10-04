@@ -1691,25 +1691,24 @@ impl Persistence {
     ) -> Result<Self, String> {
         let sealed_wal_path = wal_path.with_extension("wal.sealed");
         let lock_path = checkpoint_path.with_extension("lock");
-        let lock = chatt_platform::open_private(
-            OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false),
-            &lock_path,
-        )
-        .map_err(|error| format!("failed to open {}: {error}", lock_path.display()))?;
+        let lock = chatt_platform::PrivateOpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| format!("failed to open {}: {error}", lock_path.display()))?;
         lock_store(&lock, &lock_path)?;
         let (_, sealed_records) = replay_wal(&sealed_wal_path, state)?;
         let (valid_bytes, active_records) = replay_wal(&wal_path, state)?;
         let records_since_checkpoint = sealed_records.saturating_add(active_records);
         validate_memory(state)?;
-        let mut wal = chatt_platform::open_private(
-            OpenOptions::new().create(true).append(true).read(true),
-            &wal_path,
-        )
-        .map_err(|error| format!("failed to open {}: {error}", wal_path.display()))?;
+        let mut wal = chatt_platform::PrivateOpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&wal_path)
+            .map_err(|error| format!("failed to open {}: {error}", wal_path.display()))?;
         let wal_bytes = if valid_bytes == 0 {
             wal.write_all(WAL_MAGIC)
                 .and_then(|()| wal.write_all(&WAL_VERSION.to_le_bytes()))
@@ -1783,10 +1782,11 @@ impl Persistence {
     /// only one behaviour to reason about.
     fn reset_wal(&mut self) -> Result<(), String> {
         let reset = (|| -> std::io::Result<()> {
-            let mut truncating = chatt_platform::open_private(
-                OpenOptions::new().create(true).write(true).truncate(true),
-                &self.wal_path,
-            )?;
+            let mut truncating = chatt_platform::PrivateOpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.wal_path)?;
             truncating.write_all(WAL_MAGIC)?;
             truncating.write_all(&WAL_VERSION.to_le_bytes())?;
             truncating.sync_data()?;
@@ -1843,10 +1843,11 @@ impl Persistence {
             )
         })?;
         let replacement = (|| {
-            let mut file = chatt_platform::open_private(
-                OpenOptions::new().create_new(true).append(true).read(true),
-                &self.wal_path,
-            )?;
+            let mut file = chatt_platform::PrivateOpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .read(true)
+                .open(&self.wal_path)?;
             file.write_all(WAL_MAGIC)?;
             file.write_all(&WAL_VERSION.to_le_bytes())?;
             file.sync_data()?;
@@ -2116,11 +2117,12 @@ fn write_checkpoint(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     // The rename below carries this file's access with it, so creating the
     // temporary privately is what makes the checkpoint private.
-    let mut file = chatt_platform::open_private(
-        OpenOptions::new().create(true).truncate(true).write(true),
-        &tmp,
-    )
-    .map_err(|error| format!("failed to create {}: {error}", tmp.display()))?;
+    let mut file = chatt_platform::PrivateOpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)
+        .map_err(|error| format!("failed to create {}: {error}", tmp.display()))?;
     file.write_all(bytes)
         .map_err(|error| format!("failed to write {}: {error}", tmp.display()))?;
     file.sync_data()

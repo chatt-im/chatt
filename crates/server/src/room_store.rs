@@ -1979,10 +1979,11 @@ fn rotate_log(
 }
 
 fn open_active_log(path: &Path) -> std::io::Result<File> {
-    chatt_platform::open_private(
-        OpenOptions::new().create(true).append(true).read(true),
-        path,
-    )
+    chatt_platform::PrivateOpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)
 }
 
 fn segment_path(path: &Path, first_id: MessageId) -> PathBuf {

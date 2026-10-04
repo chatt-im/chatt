@@ -7,7 +7,6 @@
 
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
@@ -58,9 +57,11 @@ pub(super) fn open(path: &Path) -> Result<(LoadedState, StateWriter), String> {
 /// owner-only access rather than whatever its directory grants. An existing
 /// file has that access reasserted rather than assumed.
 fn ensure_private_file(path: &Path) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    chatt_platform::open_private(&mut options, path)
+    chatt_platform::PrivateOpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
         .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
     // The creation-time restriction does not apply to a file that already
     // existed, and this one outlives many runs.

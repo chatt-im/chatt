@@ -18,10 +18,9 @@ use std::path::Path;
 /// Restricts an existing file at `path` to the current user.
 ///
 /// Unix sets mode `0600`. Windows applies the protected DACL described above.
-/// Callers that are *creating* the file want [`crate::file::open_private`],
-/// which sets the Unix mode at creation so there is no window; the Windows DACL
-/// can only be applied afterwards either way, because `std::fs::OpenOptions`
-/// carries no `SECURITY_ATTRIBUTES`.
+/// Callers that are *creating* the file want
+/// [`crate::file::PrivateOpenOptions`], which applies the restriction at
+/// creation on both platforms so there is no window.
 pub fn restrict_to_owner(path: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
     {
@@ -30,21 +29,6 @@ pub fn restrict_to_owner(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         windows::set_protected_dacl(path, windows::Inheritance::None)
-    }
-}
-
-/// Restricts an existing directory at `path` to the current user.
-///
-/// Mode `0700` on Unix. On Windows the grant is inherited by what is created
-/// inside, matching what `0700` implies for what can be reached through it.
-pub fn restrict_dir_to_owner(path: &Path) -> io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        set_mode(path, 0o700)
-    }
-    #[cfg(windows)]
-    {
-        windows::set_protected_dacl(path, windows::Inheritance::ObjectsAndContainers)
     }
 }
 
@@ -68,8 +52,8 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 
 /// Whether `path` is reachable only by its owner.
 ///
-/// The inverse of what [`restrict_to_owner`] and [`restrict_dir_to_owner`]
-/// establish, so the crates that create private files can assert the guarantee
+/// The inverse of what [`restrict_to_owner`] and
+/// [`crate::file::create_private_dir`] establish, so the crates that create private files can assert the guarantee
 /// they document on both platforms rather than only on Unix. Unix reads the
 /// mode bits; Windows walks the DACL and rejects any allow-ACE naming someone
 /// other than the token user or `SYSTEM`.
@@ -165,6 +149,14 @@ pub use windows::OwnerOnlySecurity;
 #[cfg(windows)]
 pub use windows::current_user_sid;
 
+/// The user SID of the token of process `pid`, in the same form as
+/// [`current_user_sid`].
+///
+/// Lets a client check who is on the other end of a named pipe before trusting
+/// it: a pipe name is predictable, so another local user can create it first.
+#[cfg(windows)]
+pub use windows::process_user_sid;
+
 #[cfg(windows)]
 mod windows {
     use std::io;
@@ -225,7 +217,17 @@ mod windows {
     impl OwnerOnlySecurity {
         /// Builds the descriptor for the calling process's token user.
         pub fn new() -> io::Result<Self> {
-            let descriptor = owner_only_descriptor(Inheritance::None)?;
+            Self::with_inheritance(Inheritance::None)
+        }
+
+        /// As [`Self::new`], with the grant inherited by files and directories
+        /// created inside: the descriptor for creating a private directory.
+        pub fn for_directory() -> io::Result<Self> {
+            Self::with_inheritance(Inheritance::ObjectsAndContainers)
+        }
+
+        fn with_inheritance(inheritance: Inheritance) -> io::Result<Self> {
+            let descriptor = owner_only_descriptor(inheritance)?;
             let attributes = SECURITY_ATTRIBUTES {
                 nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: descriptor.0,
@@ -379,25 +381,47 @@ mod windows {
         Ok(true)
     }
 
+    struct OwnedHandle(windows_sys::Win32::Foundation::HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: opened by this module and closed once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+
     /// The current process token's user SID, in SDDL string form.
     pub fn current_user_sid() -> io::Result<String> {
-        struct OwnedToken(windows_sys::Win32::Foundation::HANDLE);
+        // SAFETY: the pseudo-handle from `GetCurrentProcess` needs no release.
+        process_token_user_sid(unsafe { GetCurrentProcess() })
+    }
 
-        impl Drop for OwnedToken {
-            fn drop(&mut self) {
-                // SAFETY: opened below and closed once.
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
-            }
+    /// The user SID of process `pid`'s token, in SDDL string form.
+    pub fn process_user_sid(pid: u32) -> io::Result<String> {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: a plain open by id; the result is checked for null.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
         }
+        let process = OwnedHandle(process);
+        process_token_user_sid(process.0)
+    }
 
+    fn process_token_user_sid(
+        process: windows_sys::Win32::Foundation::HANDLE,
+    ) -> io::Result<String> {
         let mut token = ptr::null_mut();
-        // SAFETY: the out-parameter is owned here and the pseudo-handle from
-        // `GetCurrentProcess` needs no release.
-        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        // SAFETY: the process handle is valid for the call and the
+        // out-parameter is owned here.
+        let ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        let token = OwnedToken(token);
+        let token = OwnedHandle(token);
 
         let mut len = 0;
         // SAFETY: the first call deliberately passes a null buffer to learn the
@@ -406,8 +430,10 @@ mod windows {
         if len == 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut buffer = vec![0u8; len as usize];
-        // SAFETY: the buffer is `len` bytes, the size the call just asked for.
+        // `u64` storage keeps the TOKEN_USER read below aligned.
+        let mut buffer = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
+        // SAFETY: the buffer is at least `len` bytes, the size the call just
+        // asked for.
         let ok = unsafe {
             GetTokenInformation(
                 token.0,

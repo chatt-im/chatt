@@ -11,7 +11,7 @@
 //! encrypted storage or authenticated record encryption with externally managed
 //! keys in production.
 
-use std::{fs::OpenOptions, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use redb::{CompactionError, Database, MultimapTableDefinition, ReadableTable, TableDefinition};
 use thiserror::Error;
@@ -217,14 +217,17 @@ impl RedbDataStorageEngine {
 /// user, so the access has to be stated rather than inherited on both
 /// platforms.
 fn ensure_private_file(path: &Path) -> Result<(), RedbDataStorageError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    let file = chatt_platform::open_private(&mut options, path).map_err(|error| {
-        RedbDataStorageError::DatabaseFile(format!(
-            "failed to create or open {}: {error}",
-            path.display()
-        ))
-    })?;
+    let file = chatt_platform::PrivateOpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .map_err(|error| {
+            RedbDataStorageError::DatabaseFile(format!(
+                "failed to create or open {}: {error}",
+                path.display()
+            ))
+        })?;
     drop(file);
 
     // Creation-time access does not apply to a file that already existed, and
