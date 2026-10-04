@@ -1751,10 +1751,7 @@ impl Persistence {
             }
         });
         if let Err(error) = result {
-            if let Err(rollback_error) = self
-                .wal
-                .set_len(original_len)
-                .and_then(|()| self.wal.sync_data())
+            if let Err(rollback_error) = truncate_through_write_handle(&self.wal_path, original_len)
             {
                 self.poisoned = true;
                 return Err(format!(
@@ -2106,6 +2103,21 @@ fn serialize_checkpoint(state: &MemoryState) -> Vec<u8> {
     bytes[..8].copy_from_slice(SNAPSHOT_MAGIC);
     bytes[8..12].copy_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
     bytes
+}
+
+/// Cuts `path` back to `len` bytes and makes that durable.
+///
+/// Goes through a handle of its own because the log's handle is in append
+/// mode: Windows grants an append handle `FILE_APPEND_DATA` but withholds
+/// `FILE_WRITE_DATA`, so `set_len` on it fails with "access is denied", which
+/// would turn every recoverable append failure into a poisoned store. The
+/// append handle needs no repositioning afterwards; its writes land at the end
+/// of the file wherever that is. Same path on Unix, as with
+/// [`Persistence::reset_wal`].
+fn truncate_through_write_handle(path: &Path, len: u64) -> std::io::Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(len)?;
+    file.sync_data()
 }
 
 fn write_checkpoint(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -2738,7 +2750,10 @@ mod tests {
         {
             let mut persistence = store.persistence.as_ref().unwrap().lock().unwrap();
             let wal_path = persistence.wal_path.clone();
-            persistence.wal = File::open(wal_path).unwrap();
+            persistence.wal = File::open(&wal_path).unwrap();
+            // With the file gone the rollback has nothing to open, so the
+            // failed append cannot be repaired.
+            fs::remove_file(&wal_path).unwrap();
         }
 
         let global = GlobalRecord {
@@ -2749,6 +2764,40 @@ mod tests {
         let error = store.replace_global(&global).unwrap_err();
         assert!(error.contains("earlier write failure"));
         assert_eq!(store.snapshot_state().global.next_welcome_delivery_id, 1);
+    }
+
+    /// The log handle is append-only, which on Windows cannot truncate; the
+    /// rollback must not depend on it, or every failed append would poison
+    /// the store.
+    #[test]
+    fn a_failed_append_that_rolls_back_leaves_the_store_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MlsStore::open(Some(temp.path())).unwrap();
+        let (wal_path, wal_len) = {
+            let mut persistence = store.persistence.as_ref().unwrap().lock().unwrap();
+            let wal_path = persistence.wal_path.clone();
+            persistence.wal = File::open(&wal_path).unwrap();
+            (wal_path.clone(), fs::metadata(&wal_path).unwrap().len())
+        };
+
+        let global = GlobalRecord {
+            next_welcome_delivery_id: 2,
+            ..GlobalRecord::default()
+        };
+        let error = store.replace_global(&global).unwrap_err();
+        assert!(!error.contains("roll the WAL back"), "{error}");
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), wal_len);
+
+        {
+            let mut persistence = store.persistence.as_ref().unwrap().lock().unwrap();
+            persistence.wal = OpenOptions::new()
+                .append(true)
+                .read(true)
+                .open(&wal_path)
+                .unwrap();
+        }
+        store.replace_global(&global).unwrap();
+        assert_eq!(store.snapshot_state().global.next_welcome_delivery_id, 2);
     }
 
     #[test]

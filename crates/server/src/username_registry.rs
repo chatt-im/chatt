@@ -151,7 +151,7 @@ impl UsernameRegistry {
             return Ok(());
         }
         if let Some((path, file)) = self.log.as_mut() {
-            write_record(file, user_id, name)
+            write_record(path, file, user_id, name)
                 .map_err(|err| format!("failed to append {}: {err}", path.display()))?;
         }
         self.apply_dynamic_claim(user_id, name)
@@ -297,14 +297,14 @@ pub(crate) fn persist_dynamic_claim(
         .read(true)
         .open(path)
         .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-    write_record(&mut file, user_id, name)
+    write_record(path, &mut file, user_id, name)
         .map_err(|error| format!("failed to append {}: {error}", path.display()))
 }
 
 /// Appends one `user_id | len:u8 | username` record. Usernames are capped at 64
 /// bytes upstream (`valid_username`); the `u8` length guard is a belt-and-braces
 /// check so an oversized name never writes a frame the loader cannot read back.
-fn write_record(file: &mut File, user_id: UserId, name: &str) -> std::io::Result<()> {
+fn write_record(path: &Path, file: &mut File, user_id: UserId, name: &str) -> std::io::Result<()> {
     let name = name.as_bytes();
     if name.len() > u8::MAX as usize {
         return Err(std::io::Error::new(
@@ -318,7 +318,10 @@ fn write_record(file: &mut File, user_id: UserId, name: &str) -> std::io::Result
     record.push(name.len() as u8);
     record.extend_from_slice(name);
     if let Err(error) = file.write_all(&record).and_then(|()| file.sync_data()) {
-        if let Err(rollback_error) = file.set_len(original_len).and_then(|()| file.sync_data()) {
+        // The log handle is in append mode, which on Windows cannot truncate
+        // (no FILE_WRITE_DATA), so the rollback opens a write handle of its
+        // own. The append handle's next write still lands at the new end.
+        if let Err(rollback_error) = truncate(path, original_len) {
             return Err(std::io::Error::new(
                 rollback_error.kind(),
                 format!(
@@ -344,7 +347,7 @@ fn read_record(bytes: &[u8], offset: usize) -> Option<(UserId, &str, usize)> {
     Some((UserId(user_id), name, end))
 }
 
-fn truncate(path: &PathBuf, valid_bytes: u64) -> std::io::Result<()> {
+fn truncate(path: &Path, valid_bytes: u64) -> std::io::Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;
     file.set_len(valid_bytes)?;
     file.sync_all()
