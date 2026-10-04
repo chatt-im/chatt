@@ -35,9 +35,11 @@ use local_rpc::frame::{DaemonFrame, NegotiatedLimits, StateDelta, StateEvent, We
 #[cfg(renderer_clients)]
 use parking_lot::Mutex;
 #[cfg(renderer_clients)]
-use crate::local_stream::{
-    FrameResource, InterruptibleStream, StreamInterrupt, interruptible, local_stream_pair,
-};
+use crate::local_stream::FrameResource;
+// Streams exist only for renderers across the Unix socket; an in-process
+// frontend never gets one.
+#[cfg(unix)]
+use crate::local_stream::{InterruptibleStream, StreamInterrupt, interruptible, local_stream_pair};
 
 #[cfg(feature = "embedded-client")]
 use crate::app::frontend::RpcCommandEffect;
@@ -227,6 +229,7 @@ struct RemoteRpcClient {
     pending_history: Option<RpcHistoryRequest>,
     last_snapshot: local_rpc::model::StateSnapshot,
     live_viewers: HashMap<rpc::ids::StreamId, RpcLiveViewer>,
+    #[cfg(unix)]
     attachment_streams: HashMap<local_rpc::model::RequestId, AttachmentStreamControl>,
     settings_device_generation: u64,
     next_settings_audio_event_at: Instant,
@@ -329,7 +332,7 @@ struct RpcLiveViewer {
     _handle: crate::video::NativeViewerHandle,
 }
 
-#[cfg(renderer_clients)]
+#[cfg(unix)]
 struct AttachmentStreamControl {
     shutdown: StreamInterrupt,
     worker: Option<JoinHandle<()>>,
@@ -530,6 +533,24 @@ struct RpcClientSender {
 #[cfg(renderer_clients)]
 trait FrontendSink: Send + Sync {
     fn send_frame(&self, frame: DaemonFrame, fds: Vec<FrameResource>) -> Result<(), SinkError>;
+    /// How this frontend can receive a memory-held attachment source.
+    fn memory_sources(&self) -> MemorySourceDelivery;
+    /// Hands an in-process frontend a memory-held attachment's bytes along
+    /// with its `AttachmentSourceTransport::Memory` open frame.
+    fn send_memory_source(
+        &self,
+        frame: DaemonFrame,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<(), SinkError>;
+    /// How this frontend can receive a live share's frames.
+    fn live_shares(&self) -> LiveShareDelivery;
+    /// Hands an in-process frontend the consumer end of its viewer queue along
+    /// with the `LiveShareOpened` frame.
+    fn send_live_share(
+        &self,
+        frame: DaemonFrame,
+        frames: crate::video::LiveFrames,
+    ) -> Result<(), SinkError>;
     fn start_bulk(
         &self,
         transfer_id: local_rpc::model::BulkTransferId,
@@ -539,6 +560,31 @@ trait FrontendSink: Send + Sync {
     fn end_session(&self, reason: &str);
     fn shutdown(&self);
     fn abort(&self);
+}
+
+/// How a memory-held attachment reaches a frontend.
+#[cfg(renderer_clients)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemorySourceDelivery {
+    /// The frontend shares the core's process and reads the buffer itself.
+    #[cfg_attr(not(feature = "embedded-client"), allow(dead_code))]
+    SharedBytes,
+    /// The frontend is across a socket and asks a core worker for ranges.
+    #[cfg(unix)]
+    RangeStream,
+}
+
+/// How a live share's frames reach a frontend.
+#[cfg(renderer_clients)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveShareDelivery {
+    /// The frontend shares the core's process and consumes the viewer queue.
+    #[cfg_attr(not(feature = "embedded-client"), allow(dead_code))]
+    FrameQueue,
+    /// The frontend is across a socket and reads frames a writer thread puts
+    /// on a local stream.
+    #[cfg(unix)]
+    Stream,
 }
 
 #[cfg(renderer_clients)]
@@ -591,6 +637,34 @@ impl FrontendSink for UnixFrontendSink {
         drop(state);
         self.outbound.ready.notify_one();
         Ok(())
+    }
+
+    fn memory_sources(&self) -> MemorySourceDelivery {
+        MemorySourceDelivery::RangeStream
+    }
+
+    fn send_memory_source(
+        &self,
+        _frame: DaemonFrame,
+        _bytes: Arc<Vec<u8>>,
+    ) -> Result<(), SinkError> {
+        Err(SinkError::Invalid(
+            "memory attachment bytes cannot cross the renderer socket".into(),
+        ))
+    }
+
+    fn live_shares(&self) -> LiveShareDelivery {
+        LiveShareDelivery::Stream
+    }
+
+    fn send_live_share(
+        &self,
+        _frame: DaemonFrame,
+        _frames: crate::video::LiveFrames,
+    ) -> Result<(), SinkError> {
+        Err(SinkError::Invalid(
+            "a live share frame queue cannot cross the renderer socket".into(),
+        ))
     }
 
     fn start_bulk(
@@ -658,57 +732,106 @@ impl FrontendSink for DirectFrontendSink {
     fn send_frame(&self, frame: DaemonFrame, mut fds: Vec<FrameResource>) -> Result<(), SinkError> {
         local_rpc::frame::validate_daemon(&frame).map_err(SinkError::Invalid)?;
         match frame {
-            DaemonFrame::LiveShareOpened {
-                request_id,
-                stream_id,
-                generation,
-                status,
-            } => {
-                if fds.len() != 1 {
-                    return Err(SinkError::Invalid(
-                        "live share event carries an invalid descriptor count".into(),
-                    ));
-                }
-                let stream = crate::local_stream::into_local_stream(
-                    fds.pop().expect("checked descriptor"),
-                )
-                .map_err(|_| {
-                    SinkError::Invalid("live share event carries a resource that is not a stream".into())
-                })?;
-                self.try_send(FrontendEvent::LiveShareOpened {
-                    request_id,
-                    stream_id,
-                    generation,
-                    status,
-                    stream,
-                })
-            }
+            DaemonFrame::LiveShareOpened { .. } => Err(SinkError::Invalid(
+                "embedded live share must carry its frame queue".into(),
+            )),
             DaemonFrame::AttachmentSourceOpened {
                 request_id,
                 room_id,
                 attachment_id,
                 byte_len,
-                transport,
+                transport: local_rpc::frame::AttachmentSourceTransport::DirectFile,
             } => {
                 if fds.len() != 1 {
                     return Err(SinkError::Invalid(
                         "attachment source event carries an invalid descriptor count".into(),
                     ));
                 }
+                let file = crate::local_stream::into_file(fds.pop().expect("checked descriptor"));
                 self.try_send(FrontendEvent::AttachmentSourceOpened {
                     request_id,
                     room_id,
                     attachment_id,
                     byte_len,
-                    transport,
-                    fd: fds.pop().expect("checked descriptor"),
+                    transport: local_rpc::frame::AttachmentSourceTransport::DirectFile,
+                    handle: crate::embedded::AttachmentSourceHandle::File(file),
                 })
             }
+            DaemonFrame::AttachmentSourceOpened { .. } => Err(SinkError::Invalid(
+                "embedded attachment source must be a file or shared memory".into(),
+            )),
             _ if !fds.is_empty() => Err(SinkError::Invalid(
                 "embedded frontend frame carries unexpected descriptors".into(),
             )),
             _ => self.try_send(FrontendEvent::Frame(frame)),
         }
+    }
+
+    fn memory_sources(&self) -> MemorySourceDelivery {
+        MemorySourceDelivery::SharedBytes
+    }
+
+    fn live_shares(&self) -> LiveShareDelivery {
+        LiveShareDelivery::FrameQueue
+    }
+
+    fn send_live_share(
+        &self,
+        frame: DaemonFrame,
+        frames: crate::video::LiveFrames,
+    ) -> Result<(), SinkError> {
+        local_rpc::frame::validate_daemon(&frame).map_err(SinkError::Invalid)?;
+        let DaemonFrame::LiveShareOpened {
+            request_id,
+            stream_id,
+            generation,
+            status,
+        } = frame
+        else {
+            return Err(SinkError::Invalid(
+                "a live share frame queue accompanies a frame that is not a live share".into(),
+            ));
+        };
+        self.try_send(FrontendEvent::LiveShareOpened {
+            request_id,
+            stream_id,
+            generation,
+            status,
+            frames,
+        })
+    }
+
+    fn send_memory_source(
+        &self,
+        frame: DaemonFrame,
+        bytes: Arc<Vec<u8>>,
+    ) -> Result<(), SinkError> {
+        local_rpc::frame::validate_daemon(&frame).map_err(SinkError::Invalid)?;
+        let DaemonFrame::AttachmentSourceOpened {
+            request_id,
+            room_id,
+            attachment_id,
+            byte_len,
+            transport: local_rpc::frame::AttachmentSourceTransport::Memory,
+        } = frame
+        else {
+            return Err(SinkError::Invalid(
+                "memory attachment bytes accompany a frame that is not a memory source".into(),
+            ));
+        };
+        if bytes.len() as u64 != byte_len {
+            return Err(SinkError::Invalid(
+                "memory attachment source length does not match its bytes".into(),
+            ));
+        }
+        self.try_send(FrontendEvent::AttachmentSourceOpened {
+            request_id,
+            room_id,
+            attachment_id,
+            byte_len,
+            transport: local_rpc::frame::AttachmentSourceTransport::Memory,
+            handle: crate::embedded::AttachmentSourceHandle::Memory(bytes),
+        })
     }
 
     fn start_bulk(
@@ -812,10 +935,46 @@ impl RpcClientSender {
         }
         let completed_request = completed_request_id(&frame);
         self.sink.send_frame(frame, fds)?;
-        if let Some(request_id) = completed_request {
+        self.complete_request(completed_request);
+        Ok(())
+    }
+
+    fn complete_request(&self, request_id: Option<local_rpc::model::RequestId>) {
+        if let Some(request_id) = request_id {
             self.outstanding.lock().remove(&request_id);
         }
-        Ok(())
+    }
+
+    fn memory_sources(&self) -> MemorySourceDelivery {
+        self.sink.memory_sources()
+    }
+
+    fn live_shares(&self) -> LiveShareDelivery {
+        self.sink.live_shares()
+    }
+
+    fn send_live_share_or_abort(
+        &self,
+        frame: DaemonFrame,
+        frames: crate::video::LiveFrames,
+    ) -> bool {
+        let metadata = FrameMetadata::new(&frame);
+        let completed_request = completed_request_id(&frame);
+        let result = self.sink.send_live_share(frame, frames);
+        if result.is_ok() {
+            self.complete_request(completed_request);
+        }
+        self.handle_send_result(metadata, result)
+    }
+
+    fn send_memory_source_or_abort(&self, frame: DaemonFrame, bytes: Arc<Vec<u8>>) -> bool {
+        let metadata = FrameMetadata::new(&frame);
+        let completed_request = completed_request_id(&frame);
+        let result = self.sink.send_memory_source(frame, bytes);
+        if result.is_ok() {
+            self.complete_request(completed_request);
+        }
+        self.handle_send_result(metadata, result)
     }
 
     fn start_bulk(
@@ -1496,7 +1655,7 @@ fn handle_runtime_event(
         AppEvent::RpcClientExited(id) => {
             retire_rpc_frontend(app, rpc_clients, id, "frontend transport stopped");
         }
-        #[cfg(renderer_clients)]
+        #[cfg(unix)]
         AppEvent::AttachmentStreamWorkerExited {
             client_id,
             request_id,
@@ -2020,6 +2179,7 @@ fn spawn_direct_frontend(
         pending_history: None,
         last_snapshot: retained_snapshot,
         live_viewers: HashMap::new(),
+        #[cfg(unix)]
         attachment_streams: HashMap::new(),
         settings_device_generation: 0,
         next_settings_audio_event_at: Instant::now(),
@@ -2780,55 +2940,17 @@ fn handle_rpc_command(
             if replaced.is_some() {
                 app.stop_rpc_live_share(stream_id);
             }
-            let (daemon_stream, frontend_stream) = match local_stream_pair() {
-                Ok(pair) => pair,
-                Err(error) => {
-                    send_live_share_rejection(
-                        clients,
-                        id,
-                        request_id,
-                        local_rpc::frame::Operation::StartLiveShare,
-                        500,
-                        &format!("cannot create screen share transport: {error}"),
-                    );
-                    return;
-                }
-            };
-            let open = match app.start_rpc_live_share(id, stream_id, generation, daemon_stream) {
-                Ok(open) => open,
-                Err(error) => {
-                    send_live_share_rejection(
-                        clients,
-                        id,
-                        request_id,
-                        local_rpc::frame::Operation::StartLiveShare,
-                        409,
-                        &error,
-                    );
-                    return;
-                }
-            };
-            let frontend_fd: FrameResource = frontend_stream.into();
-            let opened = DaemonFrame::LiveShareOpened {
-                request_id,
-                stream_id,
-                generation,
-                status: open.status,
-            };
-            let Some(client) = clients.get_mut(&id) else {
+            let Some(delivery) = clients.get(&id).map(|client| client.sender.live_shares()) else {
                 return;
             };
-            if client
-                .sender
-                .send_with_fds_or_abort(opened, vec![frontend_fd])
-            {
-                client.live_viewers.insert(
-                    stream_id,
-                    RpcLiveViewer {
-                        generation,
-                        _handle: open.handle,
-                    },
-                );
+            match delivery {
+                LiveShareDelivery::FrameQueue => {
+                    start_queued_live_share(app, clients, id, request_id, stream_id, generation);
+                }
+                #[cfg(unix)]
+                LiveShareDelivery::Stream => {
+                    start_streamed_live_share(app, clients, id, request_id, stream_id, generation);
+                }
             }
             return;
         }
@@ -3812,6 +3934,122 @@ fn broadcast_rpc_settings_events(
     }
 }
 
+/// Opens a live share for an in-process frontend: it takes the consumer end of
+/// its viewer queue, so no stream or writer thread exists for it.
+#[cfg(renderer_clients)]
+fn start_queued_live_share(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    stream_id: rpc::ids::StreamId,
+    generation: u64,
+) {
+    let attach = |fanout: &crate::video::VideoFrameFanout, viewer_id, wait| {
+        fanout.add_native_queue(viewer_id, stream_id, wait)
+    };
+    let open = match app.start_rpc_live_share(id, stream_id, generation, attach) {
+        Ok(open) => open,
+        Err(error) => {
+            send_live_share_rejection(
+                clients,
+                id,
+                request_id,
+                local_rpc::frame::Operation::StartLiveShare,
+                409,
+                &error,
+            );
+            return;
+        }
+    };
+    let (handle, frames) = open.viewer;
+    let opened = DaemonFrame::LiveShareOpened {
+        request_id,
+        stream_id,
+        generation,
+        status: open.status,
+    };
+    let Some(client) = clients.get_mut(&id) else {
+        return;
+    };
+    if client.sender.send_live_share_or_abort(opened, frames) {
+        client.live_viewers.insert(
+            stream_id,
+            RpcLiveViewer {
+                generation,
+                _handle: handle,
+            },
+        );
+    }
+}
+
+/// Opens a live share for a renderer across a socket: a writer thread
+/// serializes its viewer queue onto a local stream whose far end travels with
+/// the open frame.
+#[cfg(unix)]
+fn start_streamed_live_share(
+    app: &mut App,
+    clients: &mut HashMap<ClientId, RemoteRpcClient>,
+    id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    stream_id: rpc::ids::StreamId,
+    generation: u64,
+) {
+    let (daemon_stream, frontend_stream) = match local_stream_pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            send_live_share_rejection(
+                clients,
+                id,
+                request_id,
+                local_rpc::frame::Operation::StartLiveShare,
+                500,
+                &format!("cannot create screen share transport: {error}"),
+            );
+            return;
+        }
+    };
+    let attach = |fanout: &crate::video::VideoFrameFanout, viewer_id, wait| {
+        fanout.add_native(viewer_id, stream_id, daemon_stream, wait)
+    };
+    let open = match app.start_rpc_live_share(id, stream_id, generation, attach) {
+        Ok(open) => open,
+        Err(error) => {
+            send_live_share_rejection(
+                clients,
+                id,
+                request_id,
+                local_rpc::frame::Operation::StartLiveShare,
+                409,
+                &error,
+            );
+            return;
+        }
+    };
+    let frontend_fd: FrameResource = frontend_stream.into();
+    let opened = DaemonFrame::LiveShareOpened {
+        request_id,
+        stream_id,
+        generation,
+        status: open.status,
+    };
+    let Some(client) = clients.get_mut(&id) else {
+        return;
+    };
+    if client
+        .sender
+        .send_with_fds_or_abort(opened, vec![frontend_fd])
+    {
+        client.live_viewers.insert(
+            stream_id,
+            RpcLiveViewer {
+                generation,
+                _handle: open.viewer,
+            },
+        );
+    }
+}
+
 #[cfg(renderer_clients)]
 fn send_live_share_rejection(
     clients: &mut HashMap<ClientId, RemoteRpcClient>,
@@ -3865,6 +4103,7 @@ fn upload_staging_active<'a, T: 'a>(
 #[cfg(renderer_clients)]
 fn open_rpc_attachment_source(
     client: &mut RemoteRpcClient,
+    #[cfg_attr(not(unix), allow(unused_variables))]
     client_id: ClientId,
     request_id: local_rpc::model::RequestId,
     room_id: local_rpc::ids::RoomId,
@@ -3903,22 +4142,6 @@ fn open_rpc_attachment_source(
             client.sender.send_with_fds_or_abort(opened, vec![fd]);
         }
         crate::receive_store::Source::Memory { bytes, .. } => {
-            if client.attachment_streams.len() >= local_rpc::MAX_CONCURRENT_ATTACHMENT_STREAMS {
-                reject(
-                    client,
-                    429,
-                    "too many active attachment source streams".into(),
-                );
-                return;
-            }
-            if client.attachment_streams.contains_key(&request_id) {
-                reject(
-                    client,
-                    409,
-                    "attachment source request is already active".into(),
-                );
-                return;
-            }
             if bytes.len() as u64 != byte_len {
                 reject(
                     client,
@@ -3927,73 +4150,138 @@ fn open_rpc_attachment_source(
                 );
                 return;
             }
-            let (daemon_stream, frontend_stream) = match local_stream_pair() {
-                Ok(pair) => pair,
-                Err(error) => {
-                    reject(
-                        client,
-                        500,
-                        format!("attachment source transport cannot be created: {error}"),
-                    );
-                    return;
+            match client.sender.memory_sources() {
+                MemorySourceDelivery::SharedBytes => {
+                    let opened = DaemonFrame::AttachmentSourceOpened {
+                        request_id,
+                        room_id,
+                        attachment_id,
+                        byte_len,
+                        transport: AttachmentSourceTransport::Memory,
+                    };
+                    client.sender.send_memory_source_or_abort(opened, bytes);
                 }
-            };
-            let (daemon_stream, shutdown) = match interruptible(daemon_stream) {
-                Ok(pair) => pair,
-                Err(error) => {
-                    reject(
-                        client,
-                        500,
-                        format!("attachment source transport cannot be tracked: {error}"),
-                    );
-                    return;
-                }
-            };
-            let events = client.events.clone();
-            let worker_name = format!("chatt-attachment-{}-{}", client_id.0, request_id.0);
-            let worker = thread::Builder::new().name(worker_name).spawn(move || {
-                run_attachment_stream_worker(
-                    daemon_stream,
-                    bytes,
-                    events,
+                #[cfg(unix)]
+                MemorySourceDelivery::RangeStream => open_streamed_memory_source(
+                    client,
                     client_id,
                     request_id,
+                    room_id,
                     attachment_id,
-                )
-            });
-            let worker = match worker {
-                Ok(worker) => worker,
-                Err(error) => {
-                    reject(
-                        client,
-                        500,
-                        format!("attachment source worker cannot start: {error}"),
-                    );
-                    return;
-                }
-            };
-            client.attachment_streams.insert(
+                    byte_len,
+                    bytes,
+                ),
+            }
+        }
+    }
+}
+
+/// Serves a memory-held attachment to a renderer across the socket: a worker
+/// thread answers its range requests over a local stream whose far end travels
+/// with the open frame.
+#[cfg(unix)]
+fn open_streamed_memory_source(
+    client: &mut RemoteRpcClient,
+    client_id: ClientId,
+    request_id: local_rpc::model::RequestId,
+    room_id: local_rpc::ids::RoomId,
+    attachment_id: local_rpc::model::AttachmentId,
+    byte_len: u64,
+    bytes: Arc<Vec<u8>>,
+) {
+    use local_rpc::frame::{AttachmentSourceTransport, Operation, RequestOutcome, RequestResult};
+
+    let reject = |client: &RemoteRpcClient, code, message: String| {
+        client
+            .sender
+            .send_or_abort(DaemonFrame::RequestResult(RequestResult {
                 request_id,
-                AttachmentStreamControl {
-                    shutdown,
-                    worker: Some(worker),
-                },
+                operation: Operation::OpenAttachmentSource,
+                outcome: RequestOutcome::Rejected { code, message },
+            }));
+    };
+
+    if client.attachment_streams.len() >= local_rpc::MAX_CONCURRENT_ATTACHMENT_STREAMS {
+        reject(
+            client,
+            429,
+            "too many active attachment source streams".into(),
+        );
+        return;
+    }
+    if client.attachment_streams.contains_key(&request_id) {
+        reject(
+            client,
+            409,
+            "attachment source request is already active".into(),
+        );
+        return;
+    }
+    let (daemon_stream, frontend_stream) = match local_stream_pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            reject(
+                client,
+                500,
+                format!("attachment source transport cannot be created: {error}"),
             );
-            let opened = DaemonFrame::AttachmentSourceOpened {
-                request_id,
-                room_id,
-                attachment_id,
-                byte_len,
-                transport: AttachmentSourceTransport::ReadAtSocket,
-            };
-            let fd: FrameResource = frontend_stream.into();
-            if !client.sender.send_with_fds_or_abort(opened, vec![fd]) {
-                if let Some(mut stream) = client.attachment_streams.remove(&request_id) {
-                    stream.shutdown.interrupt();
-                    if let Some(worker) = stream.worker.take() {
-                        let _ = worker.join();
-                    }
-                }
+            return;
+        }
+    };
+    let (daemon_stream, shutdown) = match interruptible(daemon_stream) {
+        Ok(pair) => pair,
+        Err(error) => {
+            reject(
+                client,
+                500,
+                format!("attachment source transport cannot be tracked: {error}"),
+            );
+            return;
+        }
+    };
+    let events = client.events.clone();
+    let worker_name = format!("chatt-attachment-{}-{}", client_id.0, request_id.0);
+    let worker = thread::Builder::new().name(worker_name).spawn(move || {
+        run_attachment_stream_worker(
+            daemon_stream,
+            bytes,
+            events,
+            client_id,
+            request_id,
+            attachment_id,
+        )
+    });
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(error) => {
+            reject(
+                client,
+                500,
+                format!("attachment source worker cannot start: {error}"),
+            );
+            return;
+        }
+    };
+    client.attachment_streams.insert(
+        request_id,
+        AttachmentStreamControl {
+            shutdown,
+            worker: Some(worker),
+        },
+    );
+    let opened = DaemonFrame::AttachmentSourceOpened {
+        request_id,
+        room_id,
+        attachment_id,
+        byte_len,
+        transport: AttachmentSourceTransport::ReadAtSocket,
+    };
+    let fd: FrameResource = frontend_stream.into();
+    if !client.sender.send_with_fds_or_abort(opened, vec![fd]) {
+        if let Some(mut stream) = client.attachment_streams.remove(&request_id) {
+            stream.shutdown.interrupt();
+            if let Some(worker) = stream.worker.take() {
+                let _ = worker.join();
             }
         }
     }
@@ -4030,7 +4318,7 @@ fn open_direct_attachment_source(
     Ok(file.into())
 }
 
-#[cfg(renderer_clients)]
+#[cfg(unix)]
 struct AttachmentStreamWorkerGuard {
     events: EventSender,
     client_id: ClientId,
@@ -4042,7 +4330,7 @@ struct AttachmentStreamWorkerGuard {
     reason: String,
 }
 
-#[cfg(renderer_clients)]
+#[cfg(unix)]
 impl Drop for AttachmentStreamWorkerGuard {
     fn drop(&mut self) {
         kvlog::info!(
@@ -4065,7 +4353,7 @@ impl Drop for AttachmentStreamWorkerGuard {
     }
 }
 
-#[cfg(renderer_clients)]
+#[cfg(unix)]
 fn run_attachment_stream_worker(
     mut stream: InterruptibleStream,
     bytes: Arc<Vec<u8>>,
@@ -4417,12 +4705,15 @@ fn finish_rpc_upload(
 #[cfg(renderer_clients)]
 fn shutdown_rpc(client: &mut RemoteRpcClient) {
     client.live_viewers.clear();
-    for stream in client.attachment_streams.values() {
-        stream.shutdown.interrupt();
-    }
-    for (_, mut stream) in client.attachment_streams.drain() {
-        if let Some(worker) = stream.worker.take() {
-            let _ = worker.join();
+    #[cfg(unix)]
+    {
+        for stream in client.attachment_streams.values() {
+            stream.shutdown.interrupt();
+        }
+        for (_, mut stream) in client.attachment_streams.drain() {
+            if let Some(worker) = stream.worker.take() {
+                let _ = worker.join();
+            }
         }
     }
     client.sender.shutdown();
@@ -4708,6 +4999,34 @@ mod tests {
             local_rpc::frame::validate_daemon(&frame).map_err(super::SinkError::Invalid)?;
             self.frames.lock().push(frame);
             Ok(())
+        }
+
+        fn memory_sources(&self) -> super::MemorySourceDelivery {
+            super::MemorySourceDelivery::RangeStream
+        }
+
+        fn send_memory_source(
+            &self,
+            _frame: local_rpc::frame::DaemonFrame,
+            _bytes: Arc<Vec<u8>>,
+        ) -> Result<(), super::SinkError> {
+            Err(super::SinkError::Invalid(
+                "test sink holds no shared memory".into(),
+            ))
+        }
+
+        fn live_shares(&self) -> super::LiveShareDelivery {
+            super::LiveShareDelivery::Stream
+        }
+
+        fn send_live_share(
+            &self,
+            _frame: local_rpc::frame::DaemonFrame,
+            _frames: crate::video::LiveFrames,
+        ) -> Result<(), super::SinkError> {
+            Err(super::SinkError::Invalid(
+                "test sink takes no frame queues".into(),
+            ))
         }
 
         fn start_bulk(
@@ -5099,6 +5418,302 @@ mod tests {
             }
             _ => panic!("unexpected attachment worker event"),
         }
+    }
+
+    #[cfg(feature = "embedded-client")]
+    #[test]
+    fn embedded_memory_attachment_sources_share_the_store_buffer_without_streams() {
+        use crate::embedded::{AttachmentSourceHandle, FrontendEvent};
+        use local_rpc::frame::{AttachmentSourceTransport, DaemonFrame};
+
+        let mut app = crate::app::App::new(crate::config::Config::default(), None).unwrap();
+        let (_commands_tx, commands) = std::sync::mpsc::sync_channel(1);
+        let (ready, _ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (queue, frontend) = crate::embedded::test_event_queue();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let client_id = crate::client_channel::ClientId(51);
+        let mut client = super::spawn_direct_frontend(
+            &mut app,
+            client_id,
+            crate::embedded::DirectBootstrap {
+                commands,
+                events: queue,
+                ready,
+            },
+            crate::app::EventSender(event_tx),
+            daemon_instance_id(),
+        )
+        .unwrap();
+        while frontend.try_recv().is_ok() {}
+
+        let bytes = Arc::new((0..4099).map(|index| (index % 253) as u8).collect::<Vec<_>>());
+        let room_id = local_rpc::ids::RoomId(53);
+        let attachment_id = local_rpc::model::AttachmentId {
+            timestamp_ms: 54,
+            transfer_id: rpc::ids::FileTransferId(55),
+        };
+        let opens = local_rpc::MAX_CONCURRENT_ATTACHMENT_STREAMS as u64 + 2;
+        let mut handles = Vec::new();
+        for request in 1..=opens {
+            let request_id = local_rpc::model::RequestId(request);
+            super::open_rpc_attachment_source(
+                &mut client,
+                client_id,
+                request_id,
+                room_id,
+                attachment_id,
+                bytes.len() as u64,
+                crate::receive_store::Source::Memory {
+                    bytes: bytes.clone(),
+                    content_type: "video/mp4",
+                },
+            );
+            let event = frontend.try_recv().unwrap();
+            let FrontendEvent::AttachmentSourceOpened {
+                request_id: opened_request,
+                room_id: opened_room,
+                attachment_id: opened_attachment,
+                byte_len,
+                transport: AttachmentSourceTransport::Memory,
+                handle: AttachmentSourceHandle::Memory(shared),
+            } = event
+            else {
+                panic!("expected a shared memory source, got {event:?}");
+            };
+            assert_eq!(opened_request, request_id);
+            assert_eq!(opened_room, room_id);
+            assert_eq!(opened_attachment, attachment_id);
+            assert_eq!(byte_len, bytes.len() as u64);
+            assert!(Arc::ptr_eq(&shared, &bytes));
+            assert!(!client.sender.outstanding.lock().contains(&request_id));
+            handles.push(shared);
+        }
+        assert!(client.attachment_streams.is_empty());
+        assert_eq!(Arc::strong_count(&bytes), handles.len() + 1);
+
+        super::open_rpc_attachment_source(
+            &mut client,
+            client_id,
+            local_rpc::model::RequestId(opens + 1),
+            room_id,
+            attachment_id,
+            bytes.len() as u64 + 1,
+            crate::receive_store::Source::Memory {
+                bytes: bytes.clone(),
+                content_type: "video/mp4",
+            },
+        );
+        let event = frontend.try_recv().unwrap();
+        assert!(
+            matches!(
+                event,
+                FrontendEvent::Frame(DaemonFrame::RequestResult(local_rpc::frame::RequestResult {
+                    outcome: local_rpc::frame::RequestOutcome::Rejected { code: 409, .. },
+                    ..
+                }))
+            ),
+            "{event:?}"
+        );
+    }
+
+    #[cfg(feature = "embedded-client")]
+    #[test]
+    fn embedded_live_shares_hand_over_the_viewer_queue_and_close_it_on_stop() {
+        use crate::embedded::FrontendEvent;
+        use local_rpc::frame::{ClientFrame, DaemonFrame};
+
+        let mut app = crate::app::App::new(crate::config::Config::default(), None).unwrap();
+        let (_commands_tx, commands) = std::sync::mpsc::sync_channel(1);
+        let (ready, _ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (queue, frontend) = crate::embedded::test_event_queue();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let client_id = crate::client_channel::ClientId(61);
+        let client = super::spawn_direct_frontend(
+            &mut app,
+            client_id,
+            crate::embedded::DirectBootstrap {
+                commands,
+                events: queue,
+                ready,
+            },
+            crate::app::EventSender(event_tx),
+            daemon_instance_id(),
+        )
+        .unwrap();
+        while frontend.try_recv().is_ok() {}
+        let mut clients = std::collections::HashMap::new();
+        clients.insert(client_id, client);
+
+        let stream_id = rpc::ids::StreamId(62);
+        let fanout = app.publish_test_live_share(local_rpc::ids::RoomId(63), stream_id, 3);
+        let keyframe = rpc::video::encode_video_frame(10, true, stream_id.0, &[1, 2, 3]);
+        fanout.send(rpc::video::SharedVideoFrame::copy_from_slice(&keyframe));
+
+        let request_id = local_rpc::model::RequestId(64);
+        super::handle_rpc_command(
+            &mut app,
+            &mut clients,
+            client_id,
+            ClientFrame::StartLiveShare {
+                request_id,
+                stream_id,
+                generation: 3,
+            },
+            daemon_instance_id(),
+        );
+        let event = frontend.try_recv().unwrap();
+        let FrontendEvent::LiveShareOpened {
+            request_id: opened_request,
+            stream_id: opened_stream,
+            generation: 3,
+            frames,
+            ..
+        } = event
+        else {
+            panic!("expected a live share frame queue, got {event:?}");
+        };
+        assert_eq!(opened_request, request_id);
+        assert_eq!(opened_stream, stream_id);
+        assert!(!clients[&client_id].sender.outstanding.lock().contains(&request_id));
+        assert!(fanout.has_native(stream_id));
+
+        assert_eq!(frames.recv().unwrap().as_slice(), keyframe.as_slice());
+        let boundary = frames.recv().unwrap();
+        let (boundary, _) = rpc::video::parse_video_frame(boundary.as_slice())
+            .unwrap()
+            .unwrap();
+        assert!(boundary.bootstrap_end);
+        let delta = rpc::video::encode_video_frame(20, false, stream_id.0, &[4]);
+        fanout.send(rpc::video::SharedVideoFrame::copy_from_slice(&delta));
+        assert_eq!(frames.recv().unwrap().as_slice(), delta.as_slice());
+
+        let consumer = thread::spawn(move || frames.recv().is_none());
+        super::handle_rpc_command(
+            &mut app,
+            &mut clients,
+            client_id,
+            ClientFrame::StopLiveShare {
+                request_id: local_rpc::model::RequestId(65),
+                stream_id,
+                generation: 3,
+            },
+            daemon_instance_id(),
+        );
+        assert!(consumer.join().unwrap());
+        assert!(!fanout.has_native(stream_id));
+        assert!(clients[&client_id].live_viewers.is_empty());
+        assert!(matches!(
+            frontend.try_recv().unwrap(),
+            FrontendEvent::Frame(DaemonFrame::RequestResult(_))
+        ));
+    }
+
+    // The embedded frontend shares the core's process, so nothing it opens may
+    // cross a socket; a renderer across the Unix socket, on the same paths, is
+    // what does create stream pairs.
+    #[cfg(feature = "embedded-client")]
+    #[test]
+    fn the_embedded_frontend_opens_attachments_and_live_shares_without_a_socket() {
+        use crate::local_stream::pairs_created_on_this_thread;
+        use local_rpc::frame::ClientFrame;
+
+        fn open_both(
+            app: &mut crate::app::App,
+            clients: &mut std::collections::HashMap<
+                crate::client_channel::ClientId,
+                super::RemoteRpcClient,
+            >,
+            client_id: crate::client_channel::ClientId,
+            stream_id: rpc::ids::StreamId,
+        ) {
+            let bytes = Arc::new(vec![7; 4096]);
+            super::open_rpc_attachment_source(
+                clients.get_mut(&client_id).unwrap(),
+                client_id,
+                local_rpc::model::RequestId(1),
+                local_rpc::ids::RoomId(2),
+                local_rpc::model::AttachmentId {
+                    timestamp_ms: 3,
+                    transfer_id: rpc::ids::FileTransferId(4),
+                },
+                bytes.len() as u64,
+                crate::receive_store::Source::Memory {
+                    bytes,
+                    content_type: "video/mp4",
+                },
+            );
+            super::handle_rpc_command(
+                app,
+                clients,
+                client_id,
+                ClientFrame::StartLiveShare {
+                    request_id: local_rpc::model::RequestId(5),
+                    stream_id,
+                    generation: 1,
+                },
+                daemon_instance_id(),
+            );
+        }
+
+        let mut app = crate::app::App::new(crate::config::Config::default(), None).unwrap();
+        let stream_id = rpc::ids::StreamId(71);
+        let fanout = app.publish_test_live_share(local_rpc::ids::RoomId(72), stream_id, 1);
+        let mut clients = std::collections::HashMap::new();
+
+        let (_commands_tx, commands) = std::sync::mpsc::sync_channel(1);
+        let (ready, _ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (queue, frontend) = crate::embedded::test_event_queue();
+        let (event_tx, _event_rx) = std::sync::mpsc::channel();
+        let embedded_id = crate::client_channel::ClientId(73);
+        let pairs_before = pairs_created_on_this_thread();
+        let embedded = super::spawn_direct_frontend(
+            &mut app,
+            embedded_id,
+            crate::embedded::DirectBootstrap {
+                commands,
+                events: queue,
+                ready,
+            },
+            crate::app::EventSender(event_tx.clone()),
+            daemon_instance_id(),
+        )
+        .unwrap();
+        clients.insert(embedded_id, embedded);
+        open_both(&mut app, &mut clients, embedded_id, stream_id);
+        assert_eq!(pairs_created_on_this_thread(), pairs_before);
+        let opened = std::iter::from_fn(|| frontend.try_recv().ok()).collect::<Vec<_>>();
+        assert!(opened.iter().any(|event| matches!(
+            event,
+            crate::embedded::FrontendEvent::AttachmentSourceOpened { .. }
+        )));
+        assert!(opened.iter().any(|event| matches!(
+            event,
+            crate::embedded::FrontendEvent::LiveShareOpened { .. }
+        )));
+        assert!(fanout.has_native(stream_id));
+        let mut embedded = clients.remove(&embedded_id).unwrap();
+        super::shutdown_rpc(&mut embedded);
+        drop(embedded);
+        assert!(!fanout.has_native(stream_id));
+
+        let (daemon_end, frontend_end) = UnixStream::pair().unwrap();
+        let renderer_id = crate::client_channel::ClientId(74);
+        let renderer = super::spawn_rpc_client(
+            &mut app,
+            renderer_id,
+            daemon_end,
+            &local_rpc::frame::ClientHello::current("test"),
+            crate::app::EventSender(event_tx),
+            daemon_instance_id(),
+        )
+        .unwrap();
+        clients.insert(renderer_id, renderer);
+        let pairs_before = pairs_created_on_this_thread();
+        open_both(&mut app, &mut clients, renderer_id, stream_id);
+        assert_eq!(pairs_created_on_this_thread(), pairs_before + 2);
+        let mut renderer = clients.remove(&renderer_id).unwrap();
+        super::shutdown_rpc(&mut renderer);
+        drop(frontend_end);
     }
 
     #[test]

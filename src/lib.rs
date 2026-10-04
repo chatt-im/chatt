@@ -33,6 +33,7 @@ pub mod embedded;
 mod file_compression;
 mod fuzzy;
 mod local_control;
+#[cfg(renderer_clients)]
 mod local_stream;
 pub mod mdns;
 #[cfg(test)]

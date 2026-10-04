@@ -16,9 +16,15 @@
 //! - **Bootstrap ordering.** A native viewer attaching while a subscriber is
 //!   coming up must not begin its shallow live queue until the server's cached
 //!   GOP has arrived. It is seeded from the local cache, then waits for the
-//!   upstream `bootstrap_end` marker before the boundary is written to its
-//!   socket. Frames the daemon already cached are suppressed during that replay
-//!   so no decoder rewinds through a GOP it has seen.
+//!   upstream `bootstrap_end` marker before the boundary is queued for it.
+//!   Frames the daemon already cached are suppressed during that replay so no
+//!   decoder rewinds through a GOP it has seen.
+//!
+//! A native viewer's frames leave through its [`NativeQueue`]. A renderer
+//! across a socket gets them serialized onto a local stream by a writer thread
+//! ([`VideoFrameFanout::add_native`]); an in-process frontend takes the queue's
+//! consumer end itself ([`VideoFrameFanout::add_native_queue`]), so its frames
+//! never cross a socket and closing the queue is the whole teardown.
 //!
 //! Every path that drops a frame counts it and logs at a bounded rate: a
 //! picture that never reaches a renderer has to leave a trace somewhere, and a
@@ -26,15 +32,17 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    sync::{Arc, Condvar, Mutex},
+};
+// Only a renderer across the Unix socket needs its frames written to a stream.
+#[cfg(unix)]
+use std::{
     io::Write,
     net::Shutdown,
-    sync::{Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
 };
 
-// Native renderers read their viewer's frames from a local stream: the far end
-// of a socket passed over the renderer socket on Unix, or held directly by an
-// embedded frontend.
+#[cfg(unix)]
 use crate::local_stream::{InterruptibleStream, LocalStream, StreamInterrupt, interruptible};
 
 use rpc::{ids::StreamId, video::SharedVideoFrame};
@@ -123,13 +131,36 @@ struct QueueState {
     overflows: u64,
 }
 
+/// Keeps a native viewer registered with the fanout; dropping it unregisters
+/// the viewer and closes its queue.
+#[cfg(any(renderer_clients, test))]
 pub struct NativeViewerHandle {
     fanout: VideoFrameFanout,
     viewer_id: u64,
     stream_id: StreamId,
     queue: Arc<NativeQueue>,
+    #[cfg(unix)]
+    writer: Option<NativeWriter>,
+}
+
+/// The thread serializing a viewer's queue onto its local stream.
+#[cfg(unix)]
+struct NativeWriter {
     control: StreamInterrupt,
-    join: Option<JoinHandle<()>>,
+    join: JoinHandle<()>,
+}
+
+/// The consumer end of one native viewer's frame queue, held by a frontend in
+/// the core's process.
+///
+/// Frames arrive exactly as a renderer socket would carry them: the cached GOP,
+/// then a `bootstrap_end` boundary record, then live frames, with the queue's
+/// keyframe-led overflow recovery already applied. Dropping it, or calling
+/// [`LiveFrames::close`], closes the queue: the core stops queueing for this
+/// viewer and a blocked [`LiveFrames::recv`] returns at once.
+#[cfg(any(renderer_clients, test))]
+pub struct LiveFrames {
+    queue: Arc<NativeQueue>,
 }
 
 impl VideoFrameFanout {
@@ -271,6 +302,9 @@ impl VideoFrameFanout {
         }
     }
 
+    /// Registers a native viewer whose frames a writer thread serializes onto
+    /// `stream`, for a renderer across a socket.
+    #[cfg(unix)]
     pub fn add_native(
         &self,
         viewer_id: u64,
@@ -278,9 +312,63 @@ impl VideoFrameFanout {
         stream: LocalStream,
         wait_for_upstream_bootstrap: bool,
     ) -> Result<NativeViewerHandle, String> {
-        let key = (viewer_id, stream_id);
         let (stream, control) = interruptible(stream)
             .map_err(|error| format!("cannot clone native video socket: {error}"))?;
+        let queue = self.register_native(viewer_id, stream_id, wait_for_upstream_bootstrap)?;
+        let writer_queue = queue.clone();
+        let join = thread::Builder::new()
+            .name(format!("chatt-native-video-{}-{}", viewer_id, stream_id.0))
+            .spawn(move || native_writer_loop(stream, writer_queue))
+            .map_err(|error| {
+                self.inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .native
+                    .remove(&(viewer_id, stream_id));
+                format!("failed to start native video writer: {error}")
+            })?;
+        Ok(NativeViewerHandle {
+            fanout: self.clone(),
+            viewer_id,
+            stream_id,
+            queue,
+            writer: Some(NativeWriter { control, join }),
+        })
+    }
+
+    /// Registers a native viewer whose queue the caller consumes in process,
+    /// with no writer thread and no stream.
+    #[cfg(any(renderer_clients, test))]
+    pub fn add_native_queue(
+        &self,
+        viewer_id: u64,
+        stream_id: StreamId,
+        wait_for_upstream_bootstrap: bool,
+    ) -> Result<(NativeViewerHandle, LiveFrames), String> {
+        let queue = self.register_native(viewer_id, stream_id, wait_for_upstream_bootstrap)?;
+        let frames = LiveFrames {
+            queue: queue.clone(),
+        };
+        let handle = NativeViewerHandle {
+            fanout: self.clone(),
+            viewer_id,
+            stream_id,
+            queue,
+            #[cfg(unix)]
+            writer: None,
+        };
+        Ok((handle, frames))
+    }
+
+    #[cfg(any(renderer_clients, test))]
+    fn register_native(
+        &self,
+        viewer_id: u64,
+        stream_id: StreamId,
+        wait_for_upstream_bootstrap: bool,
+    ) -> Result<Arc<NativeQueue>, String> {
+        let key = (viewer_id, stream_id);
         let queue = Arc::new(NativeQueue {
             viewer_id,
             stream_id,
@@ -314,22 +402,7 @@ impl VideoFrameFanout {
             );
             state.native.insert(key, queue.clone());
         }
-        let writer_queue = queue.clone();
-        let join = thread::Builder::new()
-            .name(format!("chatt-native-video-{}-{}", viewer_id, stream_id.0))
-            .spawn(move || native_writer_loop(stream, writer_queue))
-            .map_err(|error| {
-                self.inner.state.lock().unwrap().native.remove(&key);
-                format!("failed to start native video writer: {error}")
-            })?;
-        Ok(NativeViewerHandle {
-            fanout: self.clone(),
-            viewer_id,
-            stream_id,
-            queue,
-            control,
-            join: Some(join),
-        })
+        Ok(queue)
     }
 
     #[cfg(test)]
@@ -423,6 +496,7 @@ impl NativeFastStart {
 }
 
 impl NativeQueue {
+    #[cfg(any(renderer_clients, test))]
     fn seed(&self, frames: Option<&VecDeque<SharedVideoFrame>>, bootstrap_complete: bool) {
         let mut state = self.state.lock().unwrap();
         if let Some(frames) = frames {
@@ -502,7 +576,7 @@ impl NativeQueue {
                 } else {
                     self.begin_awaiting_keyframe(
                         &mut state,
-                        "viewer is not draining its socket",
+                        "viewer is not draining its queue",
                         frame.retained_bytes(),
                     );
                     return;
@@ -561,6 +635,7 @@ impl NativeQueue {
         }
     }
 
+    #[cfg(any(renderer_clients, test))]
     fn pop(&self) -> Option<SharedVideoFrame> {
         let mut state = self.state.lock().unwrap();
         loop {
@@ -585,6 +660,7 @@ impl NativeQueue {
 
     /// Frames this viewer never received, and how many times the queue fell
     /// back to waiting for a keyframe.
+    #[cfg(any(unix, test))]
     fn drop_counts(&self) -> (u64, u64) {
         let state = self.state.lock().unwrap();
         (state.dropped_frames, state.overflows)
@@ -644,6 +720,7 @@ fn is_bootstrap_boundary(frame: &SharedVideoFrame) -> bool {
         .is_some_and(|header| header.bootstrap_end)
 }
 
+#[cfg(unix)]
 fn native_writer_loop(mut stream: InterruptibleStream, queue: Arc<NativeQueue>) {
     let mut written = 0u64;
     let mut write_error = None;
@@ -701,6 +778,7 @@ fn native_writer_loop(mut stream: InterruptibleStream, queue: Arc<NativeQueue>) 
     queue.close();
 }
 
+#[cfg(any(renderer_clients, test))]
 impl Drop for NativeViewerHandle {
     fn drop(&mut self) {
         self.fanout
@@ -711,18 +789,67 @@ impl Drop for NativeViewerHandle {
             .native
             .remove(&(self.viewer_id, self.stream_id));
         self.queue.close();
-        self.control.interrupt();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
+        #[cfg(unix)]
+        if let Some(writer) = self.writer.take() {
+            writer.control.interrupt();
+            let _ = writer.join.join();
         }
+    }
+}
+
+#[cfg(any(renderer_clients, test))]
+#[cfg_attr(not(feature = "embedded-client"), allow(dead_code))]
+impl LiveFrames {
+    /// Blocks for the viewer's next frame, or returns `None` once the queue is
+    /// closed by either side.
+    pub fn recv(&self) -> Option<SharedVideoFrame> {
+        self.queue.pop()
+    }
+
+    /// Closes the queue, waking a blocked [`LiveFrames::recv`] on any thread.
+    pub fn close(&self) {
+        self.queue.close();
+    }
+}
+
+#[cfg(any(renderer_clients, test))]
+impl std::fmt::Debug for LiveFrames {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveFrames")
+            .field("viewer_id", &self.queue.viewer_id)
+            .field("stream_id", &self.queue.stream_id.0)
+            .finish()
+    }
+}
+
+#[cfg(any(renderer_clients, test))]
+impl Drop for LiveFrames {
+    fn drop(&mut self) {
+        let (delivered_frames, dropped_frames, overflows) = {
+            let state = self.queue.state.lock().unwrap();
+            (state.written_frames, state.dropped_frames, state.overflows)
+        };
+        kvlog::info!(
+            "native video queue consumer finished",
+            viewer_id = self.queue.viewer_id,
+            stream_id = self.queue.stream_id.0,
+            delivered_frames,
+            dropped_frames,
+            overflows
+        );
+        self.queue.close();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::local_stream::local_stream_pair;
+    #[cfg(unix)]
     use std::io::Read;
+    use std::thread;
 
     fn frame(stream_id: u32, key: bool, marker: u8) -> SharedVideoFrame {
         SharedVideoFrame::copy_from_slice(&rpc::video::encode_video_frame(
@@ -762,6 +889,8 @@ mod tests {
         assert!(queue.state.lock().unwrap().frames.is_empty());
     }
 
+    // Serialized onto a stream for a renderer across the Unix socket.
+    #[cfg(unix)]
     #[test]
     fn late_native_viewer_is_seeded_from_latest_keyframe() {
         let fanout = VideoFrameFanout::new(None);
@@ -795,6 +924,75 @@ mod tests {
     }
 
     #[test]
+    fn queued_viewer_receives_the_cached_gop_and_boundary_in_process() {
+        let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(7));
+        fanout.send(frame(7, true, 1));
+        fanout.send(frame(7, false, 2));
+
+        let (_viewer, frames) = fanout.add_native_queue(11, StreamId(7), false).unwrap();
+        assert_eq!(frames.recv().unwrap().as_slice()[4], 1);
+        assert_eq!(frames.recv().unwrap().as_slice()[4], 2);
+        assert!(is_bootstrap_boundary(&frames.recv().unwrap()));
+        fanout.send(frame(7, false, 3));
+        assert_eq!(frames.recv().unwrap().as_slice()[4], 3);
+        assert!(
+            fanout
+                .add_native_queue(11, StreamId(7), false)
+                .is_err_and(|error| error.contains("already playing"))
+        );
+    }
+
+    #[test]
+    fn cold_queued_viewer_waits_for_the_upstream_boundary() {
+        let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(7));
+        let (_viewer, frames) = fanout.add_native_queue(11, StreamId(7), true).unwrap();
+        assert!(frames.queue.state.lock().unwrap().frames.is_empty());
+
+        fanout.begin_upstream_bootstrap(StreamId(7));
+        fanout.send(frame(7, true, 1));
+        fanout.send(SharedVideoFrame::from_vec(
+            rpc::video::encode_video_bootstrap_end(7),
+        ));
+        assert_eq!(frames.recv().unwrap().as_slice()[4], 1);
+        assert!(is_bootstrap_boundary(&frames.recv().unwrap()));
+    }
+
+    #[test]
+    fn dropping_the_viewer_handle_wakes_a_blocked_queue_consumer() {
+        let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(7));
+        let (viewer, frames) = fanout.add_native_queue(11, StreamId(7), false).unwrap();
+        assert!(is_bootstrap_boundary(&frames.recv().unwrap()));
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let consumer = thread::spawn(move || {
+            blocked_tx.send(()).unwrap();
+            frames.recv()
+        });
+        blocked_rx.recv().unwrap();
+        drop(viewer);
+        assert!(consumer.join().unwrap().is_none());
+        assert!(!fanout.has_native(StreamId(7)));
+    }
+
+    #[test]
+    fn a_closed_queue_consumer_stops_further_queueing() {
+        let fanout = VideoFrameFanout::new(None);
+        fanout.start_stream(StreamId(7));
+        let (_viewer, frames) = fanout.add_native_queue(11, StreamId(7), false).unwrap();
+        let queue = frames.queue.clone();
+        drop(frames);
+        fanout.send(frame(7, true, 1));
+        let state = queue.state.lock().unwrap();
+        assert!(state.closed);
+        assert!(state.frames.is_empty());
+        assert_eq!(state.received_frames, 0);
+    }
+
+    // Serialized onto a stream for a renderer across the Unix socket.
+    #[cfg(unix)]
+    #[test]
     fn native_viewer_without_a_cached_gop_starts_with_a_bootstrap_boundary() {
         let fanout = VideoFrameFanout::new(None);
         fanout.start_stream(StreamId(7));
@@ -812,6 +1010,8 @@ mod tests {
         assert_eq!(boundary.stream_id, 7);
     }
 
+    // Serialized onto a stream for a renderer across the Unix socket.
+    #[cfg(unix)]
     #[test]
     fn cold_native_viewer_waits_for_the_upstream_cached_gop_boundary() {
         let fanout = VideoFrameFanout::new(None);
@@ -857,6 +1057,8 @@ mod tests {
         );
     }
 
+    // Serialized onto a stream for a renderer across the Unix socket.
+    #[cfg(unix)]
     #[test]
     fn upstream_fast_start_skips_frames_already_in_the_daemon_cache() {
         let fanout = VideoFrameFanout::new(None);

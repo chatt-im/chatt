@@ -655,6 +655,11 @@ pub enum DaemonFrame {
 pub enum AttachmentSourceTransport {
     DirectFile,
     ReadAtSocket,
+    /// The receive store's bytes handed to an in-process frontend.
+    ///
+    /// Only the embedded topology produces it; the bytes have no wire
+    /// representation, so a socket client must treat it as a protocol error.
+    Memory,
 }
 
 pub fn encode_client(frame: &ClientFrame) -> Result<Vec<u8>, String> {

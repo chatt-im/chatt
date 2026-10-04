@@ -70,8 +70,9 @@ enum SnapshotScope {
 /// Result of opening a share for a renderer client; see the note in
 /// `runtime.rs`.
 #[cfg(renderer_clients)]
-pub(crate) struct RpcLiveShareOpen {
-    pub(crate) handle: crate::video::NativeViewerHandle,
+pub(crate) struct RpcLiveShareOpen<V> {
+    /// Whatever the caller's attach step registered with the fanout.
+    pub(crate) viewer: V,
     pub(crate) status: local_rpc::model::LiveShareViewStatus,
 }
 
@@ -445,16 +446,20 @@ impl App {
         self.voice_roster.expires_at
     }
 
-    /// Opens a live screen share for a renderer client, writing its video to
-    /// `stream`; see the note in `runtime.rs`.
+    /// Opens a live screen share for a renderer client; see the note in
+    /// `runtime.rs`.
+    ///
+    /// `attach` registers the client's native viewer with the fanout, given
+    /// the viewer id and whether it must wait for the upstream cached GOP. It
+    /// runs once the share is validated and before any subscriber starts.
     #[cfg(renderer_clients)]
-    pub(crate) fn start_rpc_live_share(
+    pub(crate) fn start_rpc_live_share<V>(
         &mut self,
         client_id: ClientId,
         stream_id: rpc::ids::StreamId,
         generation: u64,
-        stream: crate::local_stream::LocalStream,
-    ) -> Result<RpcLiveShareOpen, String> {
+        attach: impl FnOnce(&crate::video::VideoFrameFanout, u64, bool) -> Result<V, String>,
+    ) -> Result<RpcLiveShareOpen<V>, String> {
         let share = self
             .room
             .available_shares
@@ -480,21 +485,20 @@ impl App {
                 return Err("video transport is not ready".into());
             }
         }
-        let handle = self.video_fanout.add_native(
+        let viewer = attach(
+            &self.video_fanout,
             client_id.0 as u64,
-            stream_id,
-            stream,
             wait_for_upstream_bootstrap,
         )?;
         if own_share {
             return Ok(RpcLiveShareOpen {
-                handle,
+                viewer,
                 status: local_rpc::model::LiveShareViewStatus::WaitingForKeyframe,
             });
         }
         if let Some(subscriber) = self.subscribers.get(&stream_id) {
             return Ok(RpcLiveShareOpen {
-                handle,
+                viewer,
                 status: rpc_live_share_status(subscriber.view_state()),
             });
         }
@@ -512,7 +516,37 @@ impl App {
         )?;
         let status = rpc_live_share_status(subscriber.view_state());
         self.subscribers.insert(stream_id, subscriber);
-        Ok(RpcLiveShareOpen { handle, status })
+        Ok(RpcLiveShareOpen { viewer, status })
+    }
+
+    /// Makes `stream_id` this session's own screen share in `room_id`,
+    /// announced and joined, and returns the fanout its frames are delivered
+    /// through.
+    #[cfg(all(test, feature = "embedded-client"))]
+    pub(crate) fn publish_test_live_share(
+        &mut self,
+        room_id: RoomId,
+        stream_id: rpc::ids::StreamId,
+        generation: u64,
+    ) -> crate::video::VideoFrameFanout {
+        self.room.voice_room = Some(room_id);
+        self.room.available_shares.insert(
+            stream_id,
+            crate::app::AvailableShare {
+                room_id,
+                generation,
+                view_secret: vec![9; 32],
+                sender_id: rpc::ids::UserId(1),
+                sender_name: "self".into(),
+                codec: "avc1.42C00D".into(),
+                coded_width: 320,
+                coded_height: 240,
+                extradata: Vec::new(),
+            },
+        );
+        self.screencast_stream_id = Some(stream_id);
+        self.video_fanout.start_stream(stream_id);
+        self.video_fanout.clone()
     }
 
     pub(crate) fn stop_rpc_live_share(&mut self, stream_id: rpc::ids::StreamId) {

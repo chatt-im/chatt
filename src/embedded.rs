@@ -35,20 +35,26 @@ use crate::{
     config::{AppConfigLoad, Config},
 };
 
-/// A stream the core writes to and the frontend reads from: a `UnixStream` on
-/// Unix, a loopback `TcpStream` on Windows.
-pub use crate::local_stream::LocalStream;
-/// A resource the core hands the frontend with a frame: an `OwnedFd` on Unix,
-/// an enum of an open file or a [`LocalStream`] on Windows.
-pub use crate::local_stream::FrameResource;
+/// The consumer end of a live share's per-viewer frame queue, carried by
+/// [`FrontendEvent::LiveShareOpened`].
+pub use crate::video::LiveFrames;
+/// One encoded video frame record as [`LiveFrames::recv`] yields it: the
+/// renderer protocol's video frame header followed by its payload.
+pub use rpc::video::SharedVideoFrame;
 
 /// The resource of [`FrontendEvent::AttachmentSourceOpened`].
 ///
-/// On Unix it is an `OwnedFd`: an open file for
-/// [`AttachmentSourceTransport::DirectFile`], a socket for
-/// [`AttachmentSourceTransport::ReadAtSocket`]. On Windows it is
-/// `FrameResource::File` or `FrameResource::Stream` respectively.
-pub type AttachmentSourceHandle = FrameResource;
+/// An in-process frontend never receives a stream for an attachment: there is
+/// nothing to serve range requests across when both sides share the memory.
+#[derive(Debug)]
+pub enum AttachmentSourceHandle {
+    /// The attachment's file on disk, opened read-only, for
+    /// [`AttachmentSourceTransport::DirectFile`].
+    File(File),
+    /// The receive store's own buffer for [`AttachmentSourceTransport::Memory`],
+    /// read by slicing it.
+    Memory(Arc<Vec<u8>>),
+}
 
 const COMMAND_QUEUE_ITEMS: usize = 128;
 const EVENT_QUEUE_ITEMS: usize = 64;
@@ -599,7 +605,9 @@ pub enum FrontendEvent {
         stream_id: StreamId,
         generation: u64,
         status: LiveShareViewStatus,
-        stream: LocalStream,
+        /// The share's frames, delivered in process. Dropping it stops this
+        /// viewer's delivery.
+        frames: LiveFrames,
     },
     AttachmentSourceOpened {
         request_id: RequestId,
@@ -607,7 +615,7 @@ pub enum FrontendEvent {
         attachment_id: AttachmentId,
         byte_len: u64,
         transport: AttachmentSourceTransport,
-        fd: AttachmentSourceHandle,
+        handle: AttachmentSourceHandle,
     },
     /// The core retired this frontend session while the core itself remains
     /// available to its other work.
@@ -673,6 +681,17 @@ pub(crate) enum DirectRequest {
     },
     AttachmentConsumed(BulkTransferId),
     Detach,
+}
+
+/// An event queue with the embedded topology's capacity, and its consumer.
+#[cfg(all(test, unix))]
+pub(crate) fn test_event_queue() -> (EventQueue, Receiver<FrontendEvent>) {
+    let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_ITEMS + TERMINAL_QUEUE_ITEMS);
+    let queue = EventQueue {
+        sender,
+        outstanding: Arc::new(AtomicUsize::new(0)),
+    };
+    (queue, receiver)
 }
 
 pub(crate) struct DirectBootstrap {
