@@ -44,10 +44,15 @@ pub fn claim(name: &str) -> io::Result<Claim> {
         use windows_sys::Win32::System::Threading::CreateMutexW;
 
         let wide = crate::osstr::wide_null(format!(r"Local\{name}"));
+        // The claim is the named object's existence, not ownership of the
+        // mutex: it is created unowned, so nothing ever has to be released
+        // on the thread that acquired it, and dropping the guard from any
+        // thread is just closing the handle.
+        //
         // SAFETY: the name is NUL-terminated and the null security attributes
         // request the process token's default, which is adequate: the mutex
         // holds no data and the name is already session-scoped.
-        let handle = unsafe { CreateMutexW(std::ptr::null(), 1, wide.as_ptr()) };
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -71,18 +76,16 @@ struct Inner;
 struct Inner(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
-// SAFETY: a mutex handle is not thread-affine; ownership moves with the guard.
+// SAFETY: the mutex is never acquired, so the handle carries no thread-affine
+// ownership; it is only ever closed, which any thread may do.
 unsafe impl Send for Inner {}
 
 #[cfg(windows)]
 impl Drop for Inner {
     fn drop(&mut self) {
         // SAFETY: the handle is valid for this value's lifetime and closed once.
-        // Closing it both releases the mutex and destroys the name.
-        unsafe {
-            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
+        // Closing the last handle destroys the name, which frees the claim.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
     }
 }
 
