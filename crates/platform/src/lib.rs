@@ -24,6 +24,8 @@ pub use osstr::{os_str_to_bytes, os_string_from_bytes};
 pub use security::is_owner_only;
 
 pub use poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, PollFd, poll, pollfd};
+#[cfg(windows)]
+pub use sock::set_exclusive_addr_use;
 pub use sock::{
     AsRawSock, RawSock, SockLevel, SocketSource, apply_dscp, bind_udp_socket_with, dscp_option,
     getsockopt_int, ignore_udp_icmp_errors, is_datagram_error, is_interrupted, set_reuse_addr,

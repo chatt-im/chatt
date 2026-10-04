@@ -272,6 +272,25 @@ pub fn set_reuse_addr(socket: RawSock, reuse: bool) -> io::Result<()> {
     setsockopt_int(socket, SockLevel::Socket, option, i32::from(reuse))
 }
 
+/// Claims this socket's address exclusively, so no other socket can bind it
+/// while this one holds it.
+///
+/// Windows only. There, `SO_REUSEADDR` lets any later socket bind the same
+/// port and take over its traffic, regardless of who owns the first one, so a
+/// socket that does not need to share its address should say so with
+/// `SO_EXCLUSIVEADDRUSE`. Unix needs no counterpart: a port bound without
+/// `SO_REUSEADDR`/`SO_REUSEPORT` cannot be bound again, and a reuse-port group
+/// is limited to the same effective user. Set before the bind.
+#[cfg(windows)]
+pub fn set_exclusive_addr_use(socket: RawSock) -> io::Result<()> {
+    setsockopt_int(
+        socket,
+        SockLevel::Socket,
+        windows_sys::Win32::Networking::WinSock::SO_EXCLUSIVEADDRUSE,
+        1,
+    )
+}
+
 /// Stops a UDP socket reporting ICMP delivery failures on its receive path.
 ///
 /// A datagram that draws an ICMP port-unreachable says something about the
@@ -654,7 +673,9 @@ mod tests {
             "a port-unreachable describes one datagram (got {error:?})"
         );
         #[cfg(unix)]
-        assert!(is_datagram_error(&io::Error::from_raw_os_error(libc::EMSGSIZE)));
+        assert!(is_datagram_error(&io::Error::from_raw_os_error(
+            libc::EMSGSIZE
+        )));
         #[cfg(windows)]
         assert!(is_datagram_error(&io::Error::from_raw_os_error(
             windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE

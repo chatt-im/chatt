@@ -4,6 +4,11 @@ use crate::interfaces::LocalInterface;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpSocketOptions {
+    /// Let other sockets bind this address too. On Windows, leaving it off
+    /// claims the address exclusively (`SO_EXCLUSIVEADDRUSE`), since there
+    /// `SO_REUSEADDR` lets any later socket take the port over, so it
+    /// defaults off there and only sockets that must share a well-known
+    /// port, like mDNS, ask for it.
     pub reuse_addr: bool,
     pub reuse_port: bool,
     pub ignore_icmp_errors: bool,
@@ -13,7 +18,7 @@ pub struct UdpSocketOptions {
 impl Default for UdpSocketOptions {
     fn default() -> Self {
         Self {
-            reuse_addr: true,
+            reuse_addr: cfg!(not(windows)),
             reuse_port: true,
             ignore_icmp_errors: true,
             nonblocking: true,
@@ -43,6 +48,9 @@ fn bind_udp_socket_inner(
     let socket = chatt_platform::bind_udp_socket_with(addr, |socket| {
         if options.reuse_addr {
             chatt_platform::set_reuse_addr(socket, true)?;
+        } else {
+            #[cfg(windows)]
+            chatt_platform::set_exclusive_addr_use(socket)?;
         }
         if options.reuse_port {
             set_reuse_port(socket)?;

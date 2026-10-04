@@ -365,7 +365,9 @@ impl MdnsSystem {
 
 fn bind_group_v4() -> Option<UdpSocket> {
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, MDNS_PORT));
+    // The mDNS port is shared with every other responder on the machine.
     let options = UdpSocketOptions {
+        reuse_addr: true,
         ignore_icmp_errors: false,
         ..UdpSocketOptions::default()
     };
@@ -393,7 +395,9 @@ fn bind_group_v4() -> Option<UdpSocket> {
 
 fn bind_group_v6() -> (Option<UdpSocket>, u32) {
     let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, MDNS_PORT));
+    // The mDNS port is shared with every other responder on the machine.
     let options = UdpSocketOptions {
+        reuse_addr: true,
         ignore_icmp_errors: false,
         ..UdpSocketOptions::default()
     };
