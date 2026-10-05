@@ -90,6 +90,13 @@ impl std::fmt::Display for ConnectError {
 impl std::error::Error for ConnectError {}
 
 pub fn control_socket_path() -> Result<PathBuf, String> {
+    control_socket_path_in(None)
+}
+
+/// Resolves the control socket path, using `default_run_dir` in place of the
+/// `XDG_RUNTIME_DIR` fallback when neither [`SOCKET_ENV`] nor [`RUN_DIR_ENV`]
+/// is set.
+pub fn control_socket_path_in(default_run_dir: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(path) = env::var_os(SOCKET_ENV) {
         let path = PathBuf::from(path);
         if path.as_os_str().is_empty() {
@@ -99,6 +106,8 @@ pub fn control_socket_path() -> Result<PathBuf, String> {
     }
     let run_dir = if let Some(path) = env::var_os(RUN_DIR_ENV) {
         PathBuf::from(path)
+    } else if let Some(path) = default_run_dir {
+        path.to_path_buf()
     } else if let Some(path) = env::var_os("XDG_RUNTIME_DIR") {
         PathBuf::from(path).join("chatt")
     } else {

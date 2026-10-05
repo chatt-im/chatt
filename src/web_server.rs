@@ -2647,7 +2647,7 @@ impl UploadSink {
     /// directory, named from a sanitized `name` so the served file keeps a
     /// recognizable extension.
     fn create(client: u64, upload_id: u32, name: &str, expected_size: u64) -> io::Result<Self> {
-        let dir = std::env::temp_dir().join("chatt-web-uploads");
+        let dir = crate::paths::web_upload_dir();
         fs::create_dir_all(&dir)?;
         let name = sanitize_upload_name(name);
         let temp_id = NEXT_UPLOAD_TEMP_ID.fetch_add(1, Ordering::Relaxed);

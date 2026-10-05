@@ -68,3 +68,26 @@ cargo build --release -p chatt -p server
 
 This produces `target/release/chatt` and `target/release/chatt-server`. See the
 [build guide](BUILDING.md) for prerequisites and first-run instructions.
+
+## Portable and sandboxed use
+
+`--portable-root DIR` (or `CHATT_PORTABLE_ROOT=DIR`) keeps everything chatt
+writes under one directory instead of the platform config, data, and runtime
+locations, which makes it easy to run from removable storage or inside a
+sandbox that exposes a single writable path:
+
+```
+DIR/client.toml   config (web.css sits beside it)
+DIR/data/         keys, room history, received files
+DIR/run/          control socket and per-session state
+```
+
+```sh
+firejail --whitelist=~/chatt-portable chatt --portable-root ~/chatt-portable
+```
+
+Pass the same root to other commands (`chatt --portable-root DIR send hi`) so
+they reach that instance. `--config`, `CHATT_CONFIG`, `CHATT_CONTROL_SOCKET`,
+and `CHATT_RUN_DIR` still override their part of the layout. Unix socket paths
+are limited to about 100 bytes, so a deeply nested `DIR` needs
+`CHATT_CONTROL_SOCKET` pointed somewhere shorter.

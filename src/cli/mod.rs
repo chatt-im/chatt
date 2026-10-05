@@ -48,6 +48,14 @@ without a subcommand to launch the interactive client.",
             possible: &[],
         },
         Flag {
+            long: "portable-root",
+            short: "",
+            value_name: "DIR",
+            help: "Keep all config, data, and sockets under DIR (env: CHATT_PORTABLE_ROOT)",
+            global: true,
+            possible: &[],
+        },
+        Flag {
             long: "logfile",
             short: "",
             value_name: "PATH",
@@ -654,6 +662,14 @@ fn audio_report_output_path(value: Option<&str>) -> Result<PathBuf, String> {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
+    // Resolved ahead of the structured parser because the screencast
+    // passthrough below already needs the control socket it relocates.
+    let portable_root = config::value_arg(&args, "--portable-root")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os(crate::paths::PORTABLE_ROOT_ENV).map(PathBuf::from));
+    if let Some(root) = portable_root {
+        crate::paths::set_portable_root(&root)?;
+    }
     let logfile =
         config::value_arg(&args, "--logfile").or_else(|| std::env::var("CHATT_LOGFILE").ok());
     let _logger = crate::self_log::init_client_logging(logfile.as_deref());
@@ -1470,6 +1486,36 @@ mod tests {
         let (name, sub) = matches.subcommand().unwrap();
         assert_eq!(name, "join");
         assert_eq!(sub.value_of("specifier"), Some("my-server-label"));
+    }
+
+    #[test]
+    fn parses_portable_root_as_a_global_flag() {
+        for tokens in [
+            ["chatt", "--portable-root", "/p", "send", "hi"],
+            ["chatt", "send", "hi", "--portable-root", "/p"],
+        ] {
+            let matches = run_matches(&tokens);
+            assert_eq!(matches.value_of("portable-root"), Some("/p"));
+            assert_eq!(matches.subcommand().unwrap().0, "send");
+        }
+    }
+
+    #[test]
+    fn early_value_arg_accepts_split_and_inline_forms() {
+        let args = |tokens: &[&str]| tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            config::value_arg(&args(&["chatt", "--portable-root", "/p"]), "--portable-root"),
+            Some("/p".to_string())
+        );
+        assert_eq!(
+            config::value_arg(&args(&["chatt", "--portable-root=/p"]), "--portable-root"),
+            Some("/p".to_string())
+        );
+        assert_eq!(
+            config::value_arg(&args(&["chatt", "--portable-rootx=/p"]), "--portable-root"),
+            None
+        );
     }
 
     #[test]

@@ -2503,9 +2503,18 @@ fn is_default_output_volume_percent(value: &f32) -> bool {
     (snap_output_volume_percent(*value) - DEFAULT_OUTPUT_VOLUME_PERCENT).abs() < f32::EPSILON
 }
 
+/// Finds `key VALUE` or `key=VALUE` in `args` ahead of structured parsing.
 pub fn value_arg(args: &[String], key: &str) -> Option<String> {
-    args.windows(2)
-        .find_map(|window| (window[0] == key).then(|| window[1].clone()))
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == key {
+            return args.next().cloned();
+        }
+        if let Some(value) = arg.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')) {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 pub(crate) fn resolve_config_path(path: Option<&str>) -> Option<PathBuf> {

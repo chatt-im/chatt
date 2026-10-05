@@ -154,7 +154,8 @@ fn daemon_snapshot() -> Result<(FrameReader, StateSnapshot), String> {
         "chatt-video-stream/{}",
         env!("CARGO_PKG_VERSION")
     ));
-    let mut reader = local_rpc::unix::connect(&hello)
+    let path = crate::local_control::socket_path()?;
+    let mut reader = local_rpc::unix::connect_to(&path, &hello)
         .map_err(|error| format!("cannot connect to running Chatt daemon: {error}"))?;
     match reader
         .recv_daemon()

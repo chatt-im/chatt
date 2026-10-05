@@ -811,7 +811,8 @@ mod imp {
     }
 
     fn socket_config() -> Result<SocketConfig, String> {
-        let path = local_rpc::unix::control_socket_path()?;
+        let path =
+            local_rpc::unix::control_socket_path_in(crate::paths::portable_run_dir().as_deref())?;
         let private_dir = env::var_os(SOCKET_ENV).is_none().then(|| {
             path.parent()
                 .expect("default control socket has a parent")
@@ -2870,5 +2871,5 @@ pub use imp::{
     send_reload_web_css, send_report_bug, send_screencast, send_upload, send_voice,
 };
 #[cfg(unix)]
-pub(crate) use imp::{RpcPeer, write_attach_ack, write_rpc_ack};
+pub(crate) use imp::{RpcPeer, socket_path, write_attach_ack, write_rpc_ack};
 pub(crate) use imp::{is_live_socket_error, read_last_server_hint, write_last_server_hint};
