@@ -92,6 +92,7 @@ impl WapConfig {
                                 .gain_controller2_adaptive_digital_max_gain_change_db_per_second,
                             max_output_noise_level_dbfs: self
                                 .gain_controller2_adaptive_digital_max_output_noise_level_dbfs,
+                            ..Default::default()
                         })
                     } else {
                         None

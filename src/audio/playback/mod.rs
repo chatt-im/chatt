@@ -3,7 +3,7 @@ mod events;
 mod feedback;
 mod frame_combiner;
 mod mixer;
-mod neteq;
+pub(crate) mod neteq;
 #[cfg(test)]
 mod realtime_alloc_tests;
 mod sample_ring;

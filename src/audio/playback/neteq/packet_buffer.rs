@@ -360,11 +360,16 @@ mod tests {
         let mut buffer = PacketBuffer::new(100);
         let start = u32::MAX - 20 * 960;
         for seq in 0..40u32 {
-            buffer.insert_packet(opus(start.wrapping_add(seq * 960), seq, Priority::PRIMARY), &timer);
+            buffer.insert_packet(
+                opus(start.wrapping_add(seq * 960), seq, Priority::PRIMARY),
+                &timer,
+            );
         }
         let next = start.wrapping_add(21 * 960);
-        assert_eq!(buffer.next_lower_timestamp(next), Some(start.wrapping_add(20 * 960)));
-
+        assert_eq!(
+            buffer.next_lower_timestamp(next),
+            Some(start.wrapping_add(20 * 960))
+        );
     }
 
     #[test]

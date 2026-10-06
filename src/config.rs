@@ -2510,7 +2510,10 @@ pub fn value_arg(args: &[String], key: &str) -> Option<String> {
         if arg == key {
             return args.next().cloned();
         }
-        if let Some(value) = arg.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')) {
+        if let Some(value) = arg
+            .strip_prefix(key)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
             return Some(value.to_string());
         }
     }
@@ -4093,6 +4096,30 @@ media-transport = "tcp"
         assert_eq!(tuning, LiveAudioTuning::default());
         assert!(tuning.validate().is_ok());
         assert_eq!(Config::default().audio.bitrate_bps, 48_000);
+    }
+
+    #[test]
+    fn embedded_config_and_struct_defaults_agree_on_capture_dsp() {
+        // A user file that omits an [audio] key gets the struct default; the
+        // embedded chatt.toml must not ship something different (the typing
+        // gate used to be on in one and off in the other).
+        let embedded = Config::default().audio;
+        let structs = AudioConfig::default();
+        assert_eq!(
+            embedded.denoise_typing_suppression, structs.denoise_typing_suppression,
+            "typing gate default"
+        );
+        assert!(
+            !embedded.denoise_typing_suppression,
+            "typing gate is off by default"
+        );
+        assert_eq!(embedded.denoise, structs.denoise);
+        assert_eq!(embedded.max_amplification, structs.max_amplification);
+        assert_eq!(embedded.suppression(), structs.suppression());
+        assert_eq!(
+            embedded.suppression(),
+            crate::audio::DenoiseSuppression::IDENTITY
+        );
     }
 
     #[test]

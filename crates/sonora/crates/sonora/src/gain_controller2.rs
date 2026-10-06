@@ -55,6 +55,7 @@ pub(crate) struct Agc2AdaptiveDigitalConfig {
     pub initial_gain_db: f32,
     pub max_gain_change_db_per_second: f32,
     pub max_output_noise_level_dbfs: f32,
+    pub fast_initial_convergence: bool,
 }
 
 impl Default for Agc2AdaptiveDigitalConfig {
@@ -66,6 +67,7 @@ impl Default for Agc2AdaptiveDigitalConfig {
             initial_gain_db: 15.0,
             max_gain_change_db_per_second: 6.0,
             max_output_noise_level_dbfs: -50.0,
+            fast_initial_convergence: false,
         }
     }
 }
@@ -78,6 +80,7 @@ impl From<&Agc2AdaptiveDigitalConfig> for AdaptiveDigitalConfig {
             initial_gain_db: c.initial_gain_db,
             max_gain_change_db_per_second: c.max_gain_change_db_per_second,
             max_output_noise_level_dbfs: c.max_output_noise_level_dbfs,
+            fast_initial_convergence: c.fast_initial_convergence,
         }
     }
 }

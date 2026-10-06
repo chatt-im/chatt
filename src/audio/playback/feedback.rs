@@ -40,6 +40,9 @@ pub(crate) struct LivePlaybackFeedbackState {
     highest_arrived_sequence: Option<u32>,
     duplicate_packets: u32,
     reordered_packets: u32,
+    /// Sequences accepted this window that arrived after their media had
+    /// already been played out (concealed): received, but useless.
+    late: HashSet<u32>,
     max_output_ring_ms: u64,
     max_neteq_target_ms: u64,
     max_neteq_playout_delay_ms: u64,
@@ -47,6 +50,9 @@ pub(crate) struct LivePlaybackFeedbackState {
     max_interarrival_jitter_ms: u64,
     last_forward_arrival: Option<(u32, Instant)>,
     silence_hint_sequence: Option<u32>,
+    /// Sequence of the sender-silence marker the next
+    /// [`Self::take_sender_silence`] closes the window at.
+    silence_marker_sequence: Option<u32>,
 }
 
 impl LivePlaybackFeedbackState {
@@ -111,10 +117,21 @@ impl LivePlaybackFeedbackState {
         self.ensure_started(now);
         self.last_forward_arrival = Some((sequence, now));
         self.silence_hint_sequence = Some(sequence);
+        self.silence_marker_sequence = Some(sequence);
         self.highest_arrived_sequence = Some(
             self.highest_arrived_sequence
                 .map_or(sequence, |highest| sequence_max_forward(highest, sequence)),
         );
+    }
+
+    /// Records that `sequence`, already observed by [`Self::observe_insert`],
+    /// reached the jitter buffer after its playout time. It is reported in
+    /// `late_packets` when it falls inside the window's expected span; a
+    /// straggler from a closed window was already charged there as lost.
+    pub(crate) fn observe_late(&mut self, sequence: u32) {
+        if self.received.contains(&sequence) {
+            self.late.insert(sequence);
+        }
     }
 
     pub(crate) fn observe_playback_ms(
@@ -158,42 +175,18 @@ impl LivePlaybackFeedbackState {
     ) -> Option<LivePlaybackFeedback> {
         let started_at = self.window_started_at?;
         let (first, highest) = self.base_sequence.zip(self.highest_arrived_sequence)?;
-        // The expected span resumes where the previous report stopped; only when
-        // the stream has never reported does it anchor at the first arrival. A
-        // window whose arrivals were all at or below the previous span (late
-        // stragglers, duplicates) has nothing new to account.
-        let base = match self.next_window_sequence {
-            Some(next) => {
-                if sequence_distance_forward(next, highest).is_none() {
-                    return None;
-                }
-                next
-            }
-            None => first,
-        };
-        let expected = sequence_distance_forward(base, highest).map_or(1, |distance| distance + 1);
-        if expected == 0 {
-            return None;
-        }
+        let (base, expected) = self.expected_span(first, highest)?;
         let elapsed = now.saturating_duration_since(started_at);
         if expected < LIVE_PLAYBACK_FEEDBACK_PACKETS && elapsed < LIVE_PLAYBACK_FEEDBACK_INTERVAL {
             return None;
         }
-        let received = self
-            .received
-            .iter()
-            .filter(|sequence| {
-                sequence_distance_forward(base, **sequence)
-                    .is_some_and(|distance| distance < expected)
-            })
-            .count() as u32;
-        let lost = expected.saturating_sub(received);
+        let (lost, late) = self.span_loss(base, expected);
         let feedback = LivePlaybackFeedback {
             stream_id,
             highest_contiguous_sequence: self.highest_contiguous_sequence(base),
             expected_packets: clamp_u16_from_u32(expected),
             lost_packets: clamp_u16_from_u32(lost),
-            late_packets: 0,
+            late_packets: clamp_u16_from_u32(late),
             duplicate_packets: clamp_u16_from_u32(self.duplicate_packets),
             reordered_packets: clamp_u16_from_u32(self.reordered_packets),
             window_ms: clamp_u16_from_u64(duration_to_ms(elapsed)),
@@ -207,8 +200,38 @@ impl LivePlaybackFeedbackState {
         Some(feedback)
     }
 
-    /// Emits a window-closing report at a sender-silence boundary: no loss is
-    /// charged for the intentional pause, only the current queue depth is sent.
+    /// The window's expected span `(base, expected)` through `highest`. The
+    /// span resumes where the previous report stopped; only when the stream
+    /// has never reported does it anchor at the window's first arrival
+    /// (`first`). A window whose arrivals were all at or below the previous
+    /// span (late stragglers, duplicates) has nothing new to account.
+    fn expected_span(&self, first: u32, highest: u32) -> Option<(u32, u32)> {
+        let base = match self.next_window_sequence {
+            Some(next) => {
+                sequence_distance_forward(next, highest)?;
+                next
+            }
+            None => first,
+        };
+        let expected = sequence_distance_forward(base, highest).map_or(1, |distance| distance + 1);
+        (expected > 0).then_some((base, expected))
+    }
+
+    /// Lost and late packets among the `expected` sequences from `base`.
+    fn span_loss(&self, base: u32, expected: u32) -> (u32, u32) {
+        let in_span = |sequence: &&u32| {
+            sequence_distance_forward(base, **sequence).is_some_and(|distance| distance < expected)
+        };
+        let received = self.received.iter().filter(in_span).count() as u32;
+        let late = self.late.iter().filter(in_span).count() as u32;
+        (expected.saturating_sub(received), late)
+    }
+
+    /// Emits a window-closing report at a sender-silence boundary. No loss is
+    /// charged for the intentional pause, but voice the window carried up to
+    /// the marker is accounted (whatever its size): resetting the window
+    /// would otherwise drop that loss, e.g. speech lost right before a mute.
+    /// The queue depths are the current ones.
     pub(crate) fn take_sender_silence(
         &mut self,
         stream_id: u32,
@@ -221,14 +244,25 @@ impl LivePlaybackFeedbackState {
         self.ensure_started(now);
         let started_at = self.window_started_at.unwrap_or(now);
         let elapsed = now.saturating_duration_since(started_at);
+        // Voice arrived this window: its span runs up to the packet before
+        // the marker, so tail packets lost ahead of the marker count too.
+        let marker = self.silence_marker_sequence.take();
+        let (expected, lost, late) = self
+            .base_sequence
+            .zip(marker)
+            .and_then(|(first, marker)| self.expected_span(first, marker.wrapping_sub(1)))
+            .map_or((0, 0, 0), |(base, expected)| {
+                let (lost, late) = self.span_loss(base, expected);
+                (expected, lost, late)
+            });
         let feedback = LivePlaybackFeedback {
             stream_id,
             highest_contiguous_sequence: self.highest_arrived_sequence.unwrap_or(0),
-            expected_packets: 0,
-            lost_packets: 0,
-            late_packets: 0,
-            duplicate_packets: 0,
-            reordered_packets: 0,
+            expected_packets: clamp_u16_from_u32(expected),
+            lost_packets: clamp_u16_from_u32(lost),
+            late_packets: clamp_u16_from_u32(late),
+            duplicate_packets: clamp_u16_from_u32(self.duplicate_packets),
+            reordered_packets: clamp_u16_from_u32(self.reordered_packets),
             window_ms: clamp_u16_from_u64(duration_to_ms(elapsed)),
             max_output_ring_ms: clamp_u16_from_u64(output_ring_ms),
             max_neteq_target_ms: clamp_u16_from_u64(neteq_target_ms),
@@ -262,6 +296,7 @@ impl LivePlaybackFeedbackState {
     fn reset_window(&mut self, now: Instant) {
         self.window_started_at = Some(now);
         self.received.clear();
+        self.late.clear();
         self.base_sequence = None;
         self.next_window_sequence = self
             .highest_arrived_sequence
@@ -315,6 +350,44 @@ mod tests {
         assert_eq!(report.max_neteq_packet_buffer_ms, 60);
         // sequence 2 arrived 60 ms after sequence 0, two frames (40 ms) expected.
         assert_eq!(report.max_interarrival_jitter_ms, 20);
+    }
+
+    #[test]
+    fn late_packets_are_reported_once_and_only_inside_the_window() {
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+        for seq in [0u32, 1, 3, 2] {
+            feedback.observe_insert(seq, 0, start);
+        }
+        // Sequence 2 arrived after its slot was played; an unknown sequence is
+        // ignored.
+        feedback.observe_late(2);
+        feedback.observe_late(7);
+        let report = feedback
+            .take_if_ready(1, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+        assert_eq!(report.expected_packets, 4);
+        assert_eq!(report.lost_packets, 0);
+        assert_eq!(report.late_packets, 1);
+
+        // Sequence 5 is charged as lost when this window closes; when it
+        // straggles in late afterwards, it is not charged a second time.
+        for seq in [4u32, 6] {
+            feedback.observe_insert(seq, 0, start);
+        }
+        let report = feedback
+            .take_if_ready(1, start + 2 * LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+        assert_eq!((report.lost_packets, report.late_packets), (1, 0));
+        for seq in [5u32, 7] {
+            feedback.observe_insert(seq, 0, start);
+        }
+        feedback.observe_late(5);
+        let report = feedback
+            .take_if_ready(1, start + 3 * LIVE_PLAYBACK_FEEDBACK_INTERVAL)
+            .unwrap();
+        assert_eq!(report.expected_packets, 1);
+        assert_eq!((report.lost_packets, report.late_packets), (0, 0));
     }
 
     #[test]
@@ -425,7 +498,8 @@ mod tests {
         feedback.observe_sender_silence(1, start + Duration::from_millis(100));
         let report =
             feedback.take_sender_silence(9, start + Duration::from_millis(100), 20, 60, 80, 40);
-        assert_eq!(report.expected_packets, 0);
+        // Sequence 0 is voice, the marker (1) closes its span.
+        assert_eq!((report.expected_packets, report.lost_packets), (1, 0));
         assert_eq!(report.max_output_ring_ms, 20);
         assert_eq!(report.max_neteq_target_ms, 60);
         assert_eq!(report.max_neteq_playout_delay_ms, 80);
@@ -435,5 +509,56 @@ mod tests {
                 .take_if_ready(9, start + LIVE_PLAYBACK_FEEDBACK_INTERVAL)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn loss_in_a_window_closed_by_a_silence_marker_is_reported() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut feedback = LivePlaybackFeedbackState::default();
+        let mut reports = Vec::new();
+        // Keepalive silence marker (seq 0) at t=0, as during a gated pause.
+        feedback.observe_sender_silence(0, at(0));
+        reports.push(feedback.take_sender_silence(1, at(0), 0, 60, 60, 0));
+        // A 300 ms utterance from t=600 ms: seq 1..=15 every 20 ms, with 3, 7
+        // and 11 lost (20 %). The decode worker polls every 10 ms.
+        let mut now = 600;
+        for seq in 1u32..=15 {
+            if ![3, 7, 11].contains(&seq) {
+                feedback.observe_insert(seq, 0, at(now));
+            }
+            for _ in 0..2 {
+                reports.extend(feedback.take_if_ready(1, at(now)));
+                now += 10;
+            }
+        }
+        // The talker pauses (or mutes): silence marker seq 16.
+        feedback.observe_sender_silence(16, at(now));
+        reports.push(feedback.take_sender_silence(1, at(now), 0, 60, 60, 0));
+        let utterance = reports.iter().fold((0, 0), |(expected, lost), r| {
+            (expected + r.expected_packets, lost + r.lost_packets)
+        });
+        assert_eq!(utterance, (15, 3), "3 of 15 packets were lost");
+        // Talk resumes cleanly much later.
+        now += 2_000;
+        for seq in 17u32..=60 {
+            feedback.observe_insert(seq, 0, at(now));
+            reports.extend(feedback.take_if_ready(1, at(now)));
+            now += 20;
+        }
+        let lost: u32 = reports.iter().map(|r| u32::from(r.lost_packets)).sum();
+        assert_eq!(lost, 3, "the loss is charged once");
+    }
+
+    #[test]
+    fn keepalive_markers_alone_report_nothing_expected() {
+        let start = Instant::now();
+        let mut feedback = LivePlaybackFeedbackState::default();
+        for (i, seq) in [0u32, 1, 3].into_iter().enumerate() {
+            let now = start + Duration::from_secs(i as u64);
+            feedback.observe_sender_silence(seq, now);
+            let report = feedback.take_sender_silence(1, now, 0, 60, 60, 0);
+            assert_eq!((report.expected_packets, report.lost_packets), (0, 0));
+        }
     }
 }

@@ -11,6 +11,12 @@ use crate::common::{
 use crate::gain_applier::GainApplier;
 use crate::speech_level_estimator::AdaptiveDigitalConfig;
 
+/// Gain-increase rate while `AdaptiveDigitalConfig::fast_initial_convergence`
+/// is converging for the first time (not part of upstream WebRTC).
+pub const FAST_INITIAL_CONVERGENCE_DB_PER_SECOND: f32 = 30.0;
+/// The first convergence ends once the gain is this close to its target.
+const FAST_INITIAL_CONVERGENCE_DONE_DB: f32 = 1.0;
+
 /// Information about a frame to process.
 #[derive(Debug)]
 pub struct FrameInfo {
@@ -99,6 +105,12 @@ pub struct AdaptiveDigitalGainController {
     max_gain_change_db_per_10ms: f32,
     frames_to_gain_increase_allowed: i32,
     last_gain_db: f32,
+    /// True until the gain first reaches its target, when
+    /// `fast_initial_convergence` is enabled.
+    initial_convergence: bool,
+    /// The speech level estimate has been updated from speech at least once
+    /// (before that the target derives from the initial gain alone).
+    level_measured: bool,
 }
 
 impl AdaptiveDigitalGainController {
@@ -117,6 +129,8 @@ impl AdaptiveDigitalGainController {
             max_gain_change_db_per_10ms,
             frames_to_gain_increase_allowed: adjacent_speech_frames_threshold,
             last_gain_db: config.initial_gain_db,
+            initial_convergence: config.fast_initial_convergence,
+            level_measured: false,
         }
     }
 
@@ -150,9 +164,26 @@ impl AdaptiveDigitalGainController {
             first_confident_speech_frame = self.frames_to_gain_increase_allowed == 0;
         }
 
-        let gain_increase_allowed = self.frames_to_gain_increase_allowed == 0;
+        let mut gain_increase_allowed = self.frames_to_gain_increase_allowed == 0;
 
         let mut max_gain_increase_db = self.max_gain_change_db_per_10ms;
+        if first_confident_speech_frame {
+            // The speech level estimate has just been updated from speech.
+            self.level_measured = true;
+        }
+        if self.initial_convergence && self.level_measured {
+            if (target_gain_db - self.last_gain_db).abs() < FAST_INITIAL_CONVERGENCE_DONE_DB {
+                self.initial_convergence = false;
+            } else if info.speech_probability >= VAD_CONFIDENCE_THRESHOLD {
+                // First convergence: follow the level estimate on every
+                // confident speech frame instead of waiting for runs of
+                // adjacent ones, and faster than the steady-state rate.
+                gain_increase_allowed = true;
+                max_gain_increase_db = max_gain_increase_db.max(
+                    FAST_INITIAL_CONVERGENCE_DB_PER_SECOND * FRAME_DURATION_MS as f32 / 1000.0,
+                );
+            }
+        }
         if first_confident_speech_frame {
             // No gain increase happened while waiting for a long enough speech
             // sequence. Therefore, temporarily allow a faster gain increase.
@@ -213,6 +244,7 @@ mod tests {
             initial_gain_db: 15.0,
             max_gain_change_db_per_second: 6.0,
             max_output_noise_level_dbfs: -50.0,
+            fast_initial_convergence: false,
         }
     }
 
@@ -234,6 +266,55 @@ mod tests {
 
     fn as_mut_slices(frame: &mut [Vec<f32>]) -> Vec<&mut [f32]> {
         frame.iter_mut().map(|ch| ch.as_mut_slice()).collect()
+    }
+
+    /// Applied gain (dB) after `frames` frames of a quiet talker whose
+    /// confident speech comes in short runs (5 of every 8 frames) after one
+    /// long run, as for soft speech.
+    fn gain_after_sparse_speech(fast_initial_convergence: bool, frames: usize) -> f32 {
+        let config = AdaptiveDigitalConfig {
+            initial_gain_db: 0.0,
+            max_gain_db: 30.0,
+            fast_initial_convergence,
+            ..default_config()
+        };
+        let mut controller =
+            AdaptiveDigitalGainController::new(config, ADJACENT_SPEECH_FRAMES_THRESHOLD);
+        let mut gain_db = 0.0;
+        for index in 0..frames {
+            let confident = index < ADJACENT_SPEECH_FRAMES_THRESHOLD as usize || index % 8 < 5;
+            let info = FrameInfo {
+                speech_probability: if confident { 1.0 } else { 0.5 },
+                speech_level_dbfs: -35.0,
+                ..get_frame_info_to_not_adapt(&config)
+            };
+            let mut audio = make_frame(MONO, FRAME_LEN_10MS_48KHZ, 1.0);
+            let mut slices = as_mut_slices(&mut audio);
+            controller.process(&info, &mut slices);
+            gain_db = 20.0 * audio[0][FRAME_LEN_10MS_48KHZ - 1].log10();
+        }
+        gain_db
+    }
+
+    #[test]
+    fn fast_initial_convergence_reaches_a_quiet_talker() {
+        // Target: -headroom - (level + headroom) = -5 - (-35 + 5) = 25 dB.
+        let fast = gain_after_sparse_speech(true, 200);
+        let stock = gain_after_sparse_speech(false, 200);
+        assert!(
+            (fast - 25.0).abs() < 1.0,
+            "fast first convergence: {fast:.1} dB"
+        );
+        assert!(
+            stock < 3.0,
+            "stock waits for adjacent-speech runs: {stock:.1} dB"
+        );
+    }
+
+    #[test]
+    fn fast_initial_convergence_is_off_by_default() {
+        assert!(!default_config().fast_initial_convergence);
+        assert!(!AdaptiveDigitalConfig::default().fast_initial_convergence);
     }
 
     #[test]

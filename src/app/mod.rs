@@ -1642,7 +1642,7 @@ impl App {
             echo_control,
             voice_packets_received: 0,
             voice_bytes_received: 0,
-            encoder_profile: LiveEncoderProfile::DRED_20,
+            encoder_profile: LiveEncoderProfile::INITIAL,
             last_network_notice: None,
             pending_startup_join: pending_join,
             pending_after_welcome: None,
@@ -5726,7 +5726,9 @@ impl App {
             || self.session_id.is_none()
             || self.e2e_account_id.is_none()
         {
-            return Err("linked devices are unavailable until the encrypted account is ready".into());
+            return Err(
+                "linked devices are unavailable until the encrypted account is ready".into(),
+            );
         }
         Ok(())
     }
@@ -9329,6 +9331,9 @@ impl App {
         };
         match capture {
             Ok(capture) => {
+                // A rebuilt capture starts from the initial profile; carry the
+                // loss adaptation's current level over.
+                capture.set_encoder_profile(self.encoder_profile);
                 self.capture = Some(capture);
                 self.mic_error = None;
                 self.supervisor.capture.on_rebuild_ok(Instant::now());
@@ -10131,7 +10136,10 @@ mod tests {
         let second = crate::client_channel::ClientId(12);
 
         assert!(app.management_create_device_link(first).is_ok());
-        assert!(matches!(network.recv().unwrap(), NetworkCommand::CreateDeviceLink));
+        assert!(matches!(
+            network.recv().unwrap(),
+            NetworkCommand::CreateDeviceLink
+        ));
         assert!(app.management_create_device_link(first).is_err());
         assert!(app.management_create_device_link(second).is_err());
         assert!(
@@ -10142,7 +10150,10 @@ mod tests {
 
         // Listing is a separate round trip, so it is not blocked by the link.
         assert!(app.management_list_devices(second).is_ok());
-        assert!(matches!(network.recv().unwrap(), NetworkCommand::ListE2eDevices));
+        assert!(matches!(
+            network.recv().unwrap(),
+            NetworkCommand::ListE2eDevices
+        ));
         assert!(app.management_list_devices(second).is_err());
         assert!(app.management_list_devices(first).is_err());
         assert!(
@@ -10198,7 +10209,10 @@ mod tests {
         let first = crate::client_channel::ClientId(21);
         let second = crate::client_channel::ClientId(22);
         assert!(app.management_create_device_link(first).is_ok());
-        assert!(matches!(network.recv().unwrap(), NetworkCommand::CreateDeviceLink));
+        assert!(matches!(
+            network.recv().unwrap(),
+            NetworkCommand::CreateDeviceLink
+        ));
         app.handle_network_event(NetworkEvent::DeviceLinkCreated {
             redemption_secret_hash: vec![3; 32],
             pairing_string: "expired".into(),
@@ -10206,7 +10220,10 @@ mod tests {
         });
 
         assert!(app.management_create_device_link(second).is_ok());
-        assert!(matches!(network.recv().unwrap(), NetworkCommand::CreateDeviceLink));
+        assert!(matches!(
+            network.recv().unwrap(),
+            NetworkCommand::CreateDeviceLink
+        ));
         assert_eq!(app.device_link_owner, Some(second));
         assert!(app.device_link_expires_at_ms.is_none());
     }
@@ -10668,8 +10685,7 @@ mod tests {
         app.network = Some(NetworkClient::from_parts_for_test(network_tx));
         enter_test_room(&mut app);
         app.room.network_disconnected = true;
-        let upload = crate::test_temp::TempDir::new("rejected-rpc-upload")
-            .with_path("upload.txt");
+        let upload = crate::test_temp::TempDir::new("rejected-rpc-upload").with_path("upload.txt");
         std::fs::write(&upload, b"payload").unwrap();
 
         assert!(
@@ -10699,8 +10715,8 @@ mod tests {
         );
         assert!(app.pending_network_commands.is_empty());
 
-        let upload = crate::test_temp::TempDir::new("rejected-direct-upload")
-            .with_path("upload.txt");
+        let upload =
+            crate::test_temp::TempDir::new("rejected-direct-upload").with_path("upload.txt");
         std::fs::write(&upload, b"disk").unwrap();
         let file = std::fs::File::open(&upload).unwrap();
         assert!(

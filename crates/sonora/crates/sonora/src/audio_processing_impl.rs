@@ -1412,6 +1412,7 @@ impl AudioProcessingImpl {
                         initial_gain_db: ad.initial_gain_db,
                         max_gain_change_db_per_second: ad.max_gain_change_db_per_second,
                         max_output_noise_level_dbfs: ad.max_output_noise_level_dbfs,
+                        fast_initial_convergence: ad.fast_initial_convergence,
                     },
                     None => Agc2AdaptiveDigitalConfig {
                         enabled: false,

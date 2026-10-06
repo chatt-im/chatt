@@ -72,15 +72,17 @@ use crate::file_compression::{
 use crate::mdns::generate_mdns_name;
 use crate::receive_store::{DiskReservation, Reservation};
 
+mod loss_adaptation;
 mod mls_actor;
 mod voice;
 
+use loss_adaptation::EncoderFeedbackController;
+use voice::{GatheredP2p, PeerConnection};
 #[cfg(test)]
 use voice::{
-    EncoderFeedbackController, InterfaceMonitor, RecentVoiceSequenceResult, RecentVoiceSequences,
-    direct_path_healthy, relay_suppressed,
+    InterfaceMonitor, RecentVoiceSequenceResult, RecentVoiceSequences, direct_path_healthy,
+    direct_path_suspect, direct_suspect_idle, relay_suppressed,
 };
-use voice::{GatheredP2p, PeerConnection};
 
 const TCP: Token = Token(0);
 const WAKE: Token = Token(1);
@@ -120,6 +122,17 @@ const DIRECT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 /// degraded and the server relay resumes. Kept above [`P2P_KEEPALIVE_INTERVAL`]
 /// so ordinary speech silence does not trip it.
 const DIRECT_FAILOVER_IDLE: Duration = Duration::from_millis(1500);
+/// While we are talking over a confirmed direct path, the least time it may
+/// stay silent before voice is also sent on the relay (until direct inbound
+/// resumes). A healthy path answers within one feedback window plus a round
+/// trip (`voice::direct_suspect_idle` adds the peer's RTT) and carries a STUN
+/// keepalive about every 0.5 s from the two directions, so this catches a dead
+/// path ~1 s before [`DIRECT_FAILOVER_IDLE`] confirms it. A false suspicion
+/// only duplicates voice onto the relay for its duration.
+const DIRECT_SUSPECT_IDLE: Duration = Duration::from_millis(500);
+/// How recently a peer must have sent playback feedback on the direct path for
+/// its silence to count toward [`DIRECT_SUSPECT_IDLE`].
+const DIRECT_SUSPECT_ARM: Duration = Duration::from_secs(30);
 /// Cadence of the server keepalive sent while the relay is suppressed, to keep
 /// the on-path NAT binding warm so relay resumes instantly.
 const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -182,8 +195,6 @@ const TCP_WRITE_ATTEMPTS: usize = 32;
 /// smooth progress bar, coarse enough to keep the event channel and web feed from
 /// flooding on a fast transfer. First and final ticks are always emitted.
 const FILE_PROGRESS_STEP_BYTES: u64 = 256 * 1024;
-const ENCODER_FEEDBACK_ALPHA: f32 = 0.35;
-const ENCODER_PROFILE_HOLD: Duration = Duration::from_secs(10);
 const MAX_COMMANDS_PER_ITERATION: usize = 8;
 const DEFAULT_INITIAL_DEVICE_NAME: &str = "first-device";
 const MAX_PENDING_PLAYBACK_PACKETS: usize = 256;
@@ -7477,7 +7488,7 @@ mod tests {
         }
     }
 
-    fn test_peer_connection(
+    pub(super) fn test_peer_connection(
         connection_id: u64,
         remote_generation: u64,
         local_generation: u64,
@@ -7510,6 +7521,7 @@ mod tests {
             local_generation,
             direct_stable_since: None,
             last_direct_inbound: None,
+            last_direct_feedback: None,
             rtt_in_flight: VecDeque::new(),
             rtt_ms: None,
         }
@@ -7736,6 +7748,116 @@ mod tests {
 
         // Recovery: a new inbound at `later` is healthy again.
         assert!(direct_path_healthy(true, Some(later), later, idle));
+    }
+
+    #[test]
+    fn direct_path_suspect_needs_a_talking_reporting_peer_gone_quiet() {
+        let idle = Duration::from_millis(500);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // Talking since 0, the peer reported at 100 and has been quiet since.
+        assert!(!direct_path_suspect(
+            at(600),
+            Some(t0),
+            Some(at(100)),
+            Some(at(100)),
+            idle
+        ));
+        assert!(direct_path_suspect(
+            at(601),
+            Some(t0),
+            Some(at(100)),
+            Some(at(100)),
+            idle
+        ));
+
+        // Not talking: silence from the listener is expected.
+        assert!(!direct_path_suspect(
+            at(5_000),
+            None,
+            Some(at(100)),
+            Some(at(100)),
+            idle
+        ));
+
+        // A new talkspurt restarts the clock: feedback only flows while the
+        // peer receives our voice.
+        assert!(!direct_path_suspect(
+            at(3_400),
+            Some(at(3_000)),
+            Some(at(100)),
+            Some(at(100)),
+            idle
+        ));
+        assert!(direct_path_suspect(
+            at(3_501),
+            Some(at(3_000)),
+            Some(at(100)),
+            Some(at(100)),
+            idle
+        ));
+
+        // Keepalives or the peer's own voice count as evidence.
+        assert!(!direct_path_suspect(
+            at(3_501),
+            Some(at(3_000)),
+            Some(at(3_200)),
+            Some(at(100)),
+            idle
+        ));
+
+        // A peer that never reports (deafened, playback detached), or stopped
+        // reporting 30 s ago, keeps the plain failover.
+        assert!(!direct_path_suspect(
+            at(1_000),
+            Some(t0),
+            Some(t0),
+            None,
+            idle
+        ));
+        assert!(!direct_path_suspect(
+            at(40_000),
+            Some(at(39_000)),
+            Some(at(9_000)),
+            Some(at(9_000)),
+            idle
+        ));
+    }
+
+    #[test]
+    fn healthy_path_is_not_suspect_before_its_first_feedback() {
+        // A healthy listener's first feedback of a talkspurt is produced when
+        // its 25th packet arrives (480 ms after the first) and reaches us a
+        // round trip after we sent the first: `talking_since + 480 ms + RTT`.
+        // Keepalive evidence from just before the talkspurt does not cover it.
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let last_inbound = Some(t0 - Duration::from_millis(300));
+        let last_feedback = Some(t0 - Duration::from_secs(5));
+        for rtt in [0u64, 20, 80, 150, 250] {
+            let idle = direct_suspect_idle(Some(rtt as f32));
+            let first_feedback = 480 + rtt;
+            assert!(
+                (0..=first_feedback).all(|ms| !direct_path_suspect(
+                    at(ms),
+                    Some(t0),
+                    last_inbound,
+                    last_feedback,
+                    idle
+                )),
+                "rtt {rtt} ms: suspect before the first feedback"
+            );
+            // A dead path is still caught a frame after the feedback is due.
+            assert!(direct_path_suspect(
+                at(500 + rtt + 25),
+                Some(t0),
+                last_inbound,
+                last_feedback,
+                idle
+            ));
+        }
+        assert_eq!(direct_suspect_idle(None), Duration::from_millis(520));
     }
 
     #[test]
@@ -8134,44 +8256,6 @@ mod tests {
 
         advance_local_voice_sequence_past(&mut local_sequence, 20);
         assert_eq!(local_sequence, 21);
-    }
-
-    #[test]
-    fn encoder_feedback_controller_escalates_without_bitrate_policy() {
-        let start = Instant::now();
-        let mut controller = EncoderFeedbackController::new();
-
-        let profile = controller
-            .observe(feedback_window(100, 60, 0, 80, 120), start)
-            .unwrap();
-
-        assert_eq!(profile, LiveEncoderProfile::DRED_60);
-        assert_eq!(profile.packet_loss_percent, 60);
-    }
-
-    #[test]
-    fn encoder_feedback_controller_holds_and_decays_one_level() {
-        let start = Instant::now();
-        let mut controller = EncoderFeedbackController::new();
-        assert_eq!(
-            controller.observe(feedback_window(100, 60, 0, 80, 120), start),
-            Some(LiveEncoderProfile::DRED_60)
-        );
-
-        assert_eq!(
-            controller.observe(
-                feedback_window(100, 0, 0, 20, 20),
-                start + ENCODER_PROFILE_HOLD - Duration::from_millis(1)
-            ),
-            None
-        );
-        assert_eq!(
-            controller.observe(
-                feedback_window(100, 0, 0, 20, 20),
-                start + ENCODER_PROFILE_HOLD + Duration::from_millis(1)
-            ),
-            Some(LiveEncoderProfile::DRED_50)
-        );
     }
 
     fn encode_test_stream(data: &[u8], source_chunk: usize, wire_chunk: usize) -> Vec<u8> {
@@ -9054,30 +9138,6 @@ mod tests {
         assert!(first < second);
         assert_eq!(first.0, (1 << 63) | 2);
         assert_eq!(second.0, (1 << 63) | 3);
-    }
-
-    fn feedback_window(
-        expected_packets: u16,
-        lost_packets: u16,
-        late_packets: u16,
-        max_output_ring_ms: u16,
-        max_interarrival_jitter_ms: u16,
-    ) -> LivePlaybackFeedback {
-        LivePlaybackFeedback {
-            stream_id: 1,
-            highest_contiguous_sequence: 10,
-            expected_packets,
-            lost_packets,
-            late_packets,
-            duplicate_packets: 0,
-            reordered_packets: 0,
-            window_ms: 500,
-            max_output_ring_ms,
-            max_neteq_target_ms: max_output_ring_ms,
-            max_neteq_playout_delay_ms: max_output_ring_ms,
-            max_neteq_packet_buffer_ms: 0,
-            max_interarrival_jitter_ms,
-        }
     }
 
     fn test_remote_voice_packet(

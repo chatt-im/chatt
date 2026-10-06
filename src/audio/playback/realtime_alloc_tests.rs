@@ -270,6 +270,29 @@ fn two_stream_mix_with_limiter_never_allocates() {
 }
 
 #[test]
+fn boosted_single_stream_mix_never_allocates() {
+    // Output volume above 100 % runs the limiter on a single stream.
+    init_flags();
+    let tuning = test_tuning();
+    let now = Instant::now();
+    let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+    let only = shared_tone_source(tuning, &mut encoder, 20, now);
+
+    let mut mixer = LivePlaybackMixer::with_live_capacity(tuning);
+    mixer.set_playout_hints(Arc::new(LivePlaybackPlayoutHints::default()));
+    mixer.ensure_stream(1, MixerStreamSource::NetEq(only));
+    let mut out = [0.0f32; MIX_FRAME_SAMPLES];
+    let mut mix_now = now;
+    assert_no_alloc("boosted single-stream mix_10ms", || {
+        mixer.set_output_gain(2.197);
+        for _ in 0..30 {
+            mixer.mix_10ms(mix_now, &mut out);
+            mix_now += Duration::from_millis(10);
+        }
+    });
+}
+
+#[test]
 fn active_audio_report_mixer_tap_never_allocates() {
     init_flags();
     let tuning = test_tuning();

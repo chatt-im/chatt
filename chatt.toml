@@ -11,7 +11,9 @@
 bitrate-bps = 48000
 # Noise suppression engine: "none", "spectral" (WebRTC), or "rnn-noise" (RNNoise).
 denoise = "rnn-noise"
-# DRED redundancy in outgoing voice: "off", "auto" (default), or "on". Auto and on are currently identical.
+# Redundancy (in-band FEC + DRED) in outgoing voice: "off" (no DRED; in-band FEC still follows
+# listeners' loss reports), "auto" (default: FEC + DRED only while listeners report packet
+# loss, so a clean link gets the full bitrate), or "on" (always).
 dred = "auto"
 echo-cancellation = false
 max-amplification = 12.0
@@ -22,9 +24,11 @@ max-amplification = 12.0
 #   after a pause. Lower is stronger.
 denoise-suppression = 1.0
 denoise-release = 1.0
-# Desk-mounted mic guard. When enabled with RNNoise, ducks loud low-VAD,
-# low-derivative table/keyboard thumps after denoising.
-denoise-typing-suppression = true
+# Experimental desk-mounted mic guard. When enabled with RNNoise, ducks loud
+# low-VAD, low-derivative table/keyboard thumps after denoising. Off by default:
+# with the current RNNoise model it gains nothing on typing noise and cuts off
+# word endings.
+denoise-typing-suppression = false
 # Earshot VAD thresholds for the typing gate. Lower "enter" is less sensitive;
 # higher "release" keeps suppression held until speech confidence is clearer.
 denoise-typing-vad-enter = 0.80

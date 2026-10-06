@@ -31,11 +31,11 @@ use local_rpc::model::DaemonInstanceId;
 use std::collections::HashSet;
 
 #[cfg(renderer_clients)]
+use crate::local_stream::FrameResource;
+#[cfg(renderer_clients)]
 use local_rpc::frame::{DaemonFrame, NegotiatedLimits, StateDelta, StateEvent, Welcome};
 #[cfg(renderer_clients)]
 use parking_lot::Mutex;
-#[cfg(renderer_clients)]
-use crate::local_stream::FrameResource;
 // Streams exist only for renderers across the Unix socket; an in-process
 // frontend never gets one.
 #[cfg(unix)]
@@ -256,10 +256,7 @@ struct RpcServerDrafts {
 
 #[cfg(renderer_clients)]
 impl RpcServerDrafts {
-    fn open(
-        &mut self,
-        draft: crate::app::ServerEditDraft,
-    ) -> local_rpc::management::ServerDraft {
+    fn open(&mut self, draft: crate::app::ServerEditDraft) -> local_rpc::management::ServerDraft {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let draft_id = local_rpc::management::ServerDraftId(self.next_id);
         let document = draft.management_document(draft_id);
@@ -537,11 +534,7 @@ trait FrontendSink: Send + Sync {
     fn memory_sources(&self) -> MemorySourceDelivery;
     /// Hands an in-process frontend a memory-held attachment's bytes along
     /// with its `AttachmentSourceTransport::Memory` open frame.
-    fn send_memory_source(
-        &self,
-        frame: DaemonFrame,
-        bytes: Arc<Vec<u8>>,
-    ) -> Result<(), SinkError>;
+    fn send_memory_source(&self, frame: DaemonFrame, bytes: Arc<Vec<u8>>) -> Result<(), SinkError>;
     /// How this frontend can receive a live share's frames.
     fn live_shares(&self) -> LiveShareDelivery;
     /// Hands an in-process frontend the consumer end of its viewer queue along
@@ -801,11 +794,7 @@ impl FrontendSink for DirectFrontendSink {
         })
     }
 
-    fn send_memory_source(
-        &self,
-        frame: DaemonFrame,
-        bytes: Arc<Vec<u8>>,
-    ) -> Result<(), SinkError> {
+    fn send_memory_source(&self, frame: DaemonFrame, bytes: Arc<Vec<u8>>) -> Result<(), SinkError> {
         local_rpc::frame::validate_daemon(&frame).map_err(SinkError::Invalid)?;
         let DaemonFrame::AttachmentSourceOpened {
             request_id,
@@ -4107,8 +4096,7 @@ fn upload_staging_active<'a, T: 'a>(
 #[cfg(renderer_clients)]
 fn open_rpc_attachment_source(
     client: &mut RemoteRpcClient,
-    #[cfg_attr(not(unix), allow(unused_variables))]
-    client_id: ClientId,
+    #[cfg_attr(not(unix), allow(unused_variables))] client_id: ClientId,
     request_id: local_rpc::model::RequestId,
     room_id: local_rpc::ids::RoomId,
     attachment_id: local_rpc::model::AttachmentId,
@@ -4977,8 +4965,8 @@ mod tests {
 
     use super::{
         RemoteClient, RemoteShutdown, affects_rpc_projection, daemon_instance_id,
-        handle_runtime_event, panic_payload_message, rpc_frame_affects_projection,
-        shutdown_remote, upload_staging_active,
+        handle_runtime_event, panic_payload_message, rpc_frame_affects_projection, shutdown_remote,
+        upload_staging_active,
     };
     use crate::{attach, client_channel::ClientChannel};
     use parking_lot::Mutex;
@@ -5450,7 +5438,11 @@ mod tests {
         .unwrap();
         while frontend.try_recv().is_ok() {}
 
-        let bytes = Arc::new((0..4099).map(|index| (index % 253) as u8).collect::<Vec<_>>());
+        let bytes = Arc::new(
+            (0..4099)
+                .map(|index| (index % 253) as u8)
+                .collect::<Vec<_>>(),
+        );
         let room_id = local_rpc::ids::RoomId(53);
         let attachment_id = local_rpc::model::AttachmentId {
             timestamp_ms: 54,
@@ -5511,10 +5503,12 @@ mod tests {
         assert!(
             matches!(
                 event,
-                FrontendEvent::Frame(DaemonFrame::RequestResult(local_rpc::frame::RequestResult {
-                    outcome: local_rpc::frame::RequestOutcome::Rejected { code: 409, .. },
-                    ..
-                }))
+                FrontendEvent::Frame(DaemonFrame::RequestResult(
+                    local_rpc::frame::RequestResult {
+                        outcome: local_rpc::frame::RequestOutcome::Rejected { code: 409, .. },
+                        ..
+                    }
+                ))
             ),
             "{event:?}"
         );
@@ -5578,7 +5572,13 @@ mod tests {
         };
         assert_eq!(opened_request, request_id);
         assert_eq!(opened_stream, stream_id);
-        assert!(!clients[&client_id].sender.outstanding.lock().contains(&request_id));
+        assert!(
+            !clients[&client_id]
+                .sender
+                .outstanding
+                .lock()
+                .contains(&request_id)
+        );
         assert!(fanout.has_native(stream_id));
 
         assert_eq!(frames.recv().unwrap().as_slice(), keyframe.as_slice());

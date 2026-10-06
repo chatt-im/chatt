@@ -2297,6 +2297,7 @@ struct StreamActivityManifest {
 #[jsony(Json)]
 struct PlaybackCounters {
     receive_queue_max_us: u64,
+    input_queue_drops: u64,
     active_streams: usize,
     stream_activity: Vec<StreamActivityManifest>,
     output_ring_samples: usize,
@@ -2360,6 +2361,7 @@ impl From<&LivePlaybackSnapshot> for PlaybackCounters {
     fn from(s: &LivePlaybackSnapshot) -> Self {
         Self {
             receive_queue_max_us: s.receive_queue_max_us,
+            input_queue_drops: s.input_queue_drops,
             active_streams: s.active_streams,
             stream_activity: s
                 .stream_activity

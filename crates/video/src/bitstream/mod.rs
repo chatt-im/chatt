@@ -118,7 +118,9 @@ pub fn length_prefixed_to_annex_b(
         let length_bytes = remaining
             .get(..length_size)
             .ok_or_else(|| "truncated video NAL length".to_string())?;
-        let length = length_bytes.iter().fold(0usize, |len, byte| (len << 8) | usize::from(*byte));
+        let length = length_bytes
+            .iter()
+            .fold(0usize, |len, byte| (len << 8) | usize::from(*byte));
         remaining = &remaining[length_size..];
         if length == 0 || length > remaining.len() {
             return Err("invalid video NAL length".into());

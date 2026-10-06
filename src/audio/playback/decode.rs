@@ -449,9 +449,9 @@ impl LiveDecodeStreams {
         now: Instant,
     ) -> Option<InsertOutcome> {
         let queue_age = now.saturating_duration_since(packet.received_at);
-        self.receive_queue_max_us = self.receive_queue_max_us.max(
-            queue_age.as_micros().min(u128::from(u64::MAX)) as u64,
-        );
+        self.receive_queue_max_us = self
+            .receive_queue_max_us
+            .max(queue_age.as_micros().min(u128::from(u64::MAX)) as u64);
         let report_packet = self.audio_report.is_active().then(|| packet.clone());
         let RemoteVoicePacket {
             stream_id,
@@ -782,6 +782,8 @@ impl LiveDecodeStreams {
 
         LivePlaybackSnapshot {
             receive_queue_max_us: self.receive_queue_max_us,
+            // Counted by the sink (`LivePlayback::stats` fills it in).
+            input_queue_drops: 0,
             active_streams: self.streams.len(),
             stream_activity: self
                 .streams
@@ -1020,7 +1022,12 @@ impl LiveDecodeStream {
                 return false;
             }
         }
-        return shared.core.insert_prepared_packet(now, prepared);
+        let late = shared.core.insert_prepared_packet(now, prepared);
+        drop(shared);
+        if late {
+            self.feedback.observe_late(sequence);
+        }
+        late
     }
 
     pub(crate) fn observe_sender_silence(
@@ -1297,7 +1304,13 @@ mod tests {
         for seq in 0..10u32 {
             let opus = tone_packet(&mut encoder, seq as usize * LIVE_OPUS_FRAME_SAMPLES);
             let received = now + Duration::from_millis(u64::from(seq) * 20);
-            assert_eq!(streams.insert_packet(voice_packet(7, seq, 0, opus, received), now + Duration::from_millis(600)), Some(InsertOutcome::Accepted));
+            assert_eq!(
+                streams.insert_packet(
+                    voice_packet(7, seq, 0, opus, received),
+                    now + Duration::from_millis(600)
+                ),
+                Some(InsertOutcome::Accepted)
+            );
         }
         assert_eq!(streams.receive_queue_max_us, 600_000);
         let stream = streams.get(7).unwrap();

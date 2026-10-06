@@ -447,6 +447,12 @@ impl LivePlaybackMixer {
         self.streams.len()
     }
 
+    /// Master output volume as a linear gain, applied inside the mix ahead of
+    /// the limiter (see [`FrameCombiner::set_output_gain`]).
+    pub(crate) fn set_output_gain(&mut self, gain: f32) {
+        self.combiner.set_output_gain(gain);
+    }
+
     pub(crate) fn note_device_callback_frames(&mut self, block: usize) {
         if let Some(hints) = &self.hints {
             hints.note_block_samples(block);

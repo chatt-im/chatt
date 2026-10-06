@@ -1505,7 +1505,10 @@ mod tests {
         let args = |tokens: &[&str]| tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         assert_eq!(
-            config::value_arg(&args(&["chatt", "--portable-root", "/p"]), "--portable-root"),
+            config::value_arg(
+                &args(&["chatt", "--portable-root", "/p"]),
+                "--portable-root"
+            ),
             Some("/p".to_string())
         );
         assert_eq!(

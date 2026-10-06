@@ -13,6 +13,7 @@ use crate::{
     audio::{
         AudioReportHub,
         capture::{
+            clock::CaptureClock,
             dsp::{
                 CaptureGain, CaptureGateDecision, CaptureHighPass, CaptureProcessor, EarshotVad,
                 LongSilenceGate, TypingNoiseGate, is_capture_skip_safe_silence,
@@ -199,7 +200,7 @@ pub(crate) fn run_live_encoder_worker_inner(
         voice_state.load(Ordering::Relaxed).is_muted(),
         Arc::clone(&audio_report),
     );
-    let mut applied_loss_percent = LiveEncoderProfile::DRED_20.packet_loss_percent;
+    let mut applied_loss_percent = LiveEncoderProfile::INITIAL.packet_loss_percent;
 
     for chunk in receiver {
         let CapturedAudioChunk {
@@ -285,18 +286,6 @@ pub(crate) fn run_live_encoder_worker_inner(
     Ok(())
 }
 
-/// Anchor tying the counted media clock to cpal's authoritative capture
-/// timestamp. `last_effective_sample` is the media index (48 kHz) of the first
-/// sample of the callback captured at `last_capture_ns` nanoseconds since stream
-/// creation. Comparing the next callback's timestamp delta against how far the
-/// counted clock actually advanced reveals any span the hardware captured but the
-/// pipeline never saw.
-#[derive(Clone, Copy)]
-struct CaptureClock {
-    last_capture_ns: u64,
-    last_effective_sample: u32,
-}
-
 pub(crate) struct LiveEncoderPipeline {
     encoder: OpusVoiceEncoder,
     auto_gain_enabled: bool,
@@ -352,9 +341,14 @@ pub(crate) struct LiveEncoderPipeline {
     /// slot, including suppressed-silence slots, so an emitted packet's
     /// timestamp reflects true elapsed media time across pauses.
     next_capture_sample: u32,
-    /// Slaving anchor for [`Self::note_capture_timestamp`]. `None` until the
-    /// first callback establishes it.
-    capture_clock: Option<CaptureClock>,
+    /// Decides when capture timestamps reveal a real hole
+    /// ([`Self::note_capture_timestamp`]).
+    capture_clock: CaptureClock,
+    /// The capture clock has an unconfirmed hole open: packets encoded now
+    /// carry timestamps up to the hole's length early and are flagged
+    /// `SILENCE_RESUME`, keeping that apparent lateness out of the receiver's
+    /// delay statistics.
+    capture_hole_suspected: bool,
     audio_report: Arc<AudioReportHub>,
 }
 
@@ -386,6 +380,12 @@ impl LiveEncoderPipeline {
         audio_report: Arc<AudioReportHub>,
     ) -> Self {
         let echo_enabled = echo_source.as_ref().is_some_and(|source| source.enabled());
+        let mut encoder = encoder;
+        // Code the band the device carries, not what libopus'
+        // detector guesses from the denoised pauses (see set_input_bandwidth).
+        if let Err(error) = encoder.set_input_bandwidth(device_rate) {
+            kvlog::warn!("failed to set the opus coded bandwidth", error = %error);
+        }
         let gain_max_db = if auto_gain_enabled {
             max_amplification
         } else {
@@ -422,7 +422,8 @@ impl LiveEncoderPipeline {
             echo_source,
             echo_reference_active: false,
             next_capture_sample: 0,
-            capture_clock: None,
+            capture_clock: CaptureClock::new(),
+            capture_hole_suspected: false,
             audio_report,
         }
     }
@@ -474,35 +475,15 @@ impl LiveEncoderPipeline {
         self.encoder.apply_live_encoder_profile(profile)
     }
 
-    /// Accounts `gap_samples` (48 kHz) of capture dropped under load. The media
-    /// clock advances across the hole so the receiver sees the true elapsed time
-    /// as a concealable timestamp gap instead of a hard splice, and the Opus
-    /// stream re-anchors because the encoder state on either side of the hole is
-    /// no longer continuous. Partial samples accumulated before the hole are
-    /// discarded onto the clock rather than spliced against post-gap audio.
-    pub(crate) fn note_capture_gap(&mut self, gap_samples: u32) -> Result<(), String> {
-        if gap_samples == 0 {
-            return Ok(());
-        }
-        let pending = self.accumulator.pending.len() as u32;
-        self.accumulator.pending.clear();
-        self.next_capture_sample = self
-            .next_capture_sample
-            .wrapping_add(gap_samples)
-            .wrapping_add(pending);
-        self.reset_opus_stream()
-    }
-
-    /// Slaves the media clock to cpal's authoritative capture timestamp
-    /// (`capture_ns`, nanoseconds since stream creation). The counted clock
-    /// advances one 10 ms slot per accumulated frame, so any span the hardware
-    /// captured but the pipeline never processed — a capture xrun, or a callback
-    /// dropped under load before it reached the encoder — surfaces here as the
-    /// capture instant running ahead of what we counted. The shortfall is emitted
-    /// through [`Self::note_capture_gap`] so the drop reaches the receiver as a
-    /// concealable timestamp gap instead of a slow clock. Sub-frame jitter and a
-    /// leading counted clock are ignored: the clock only ever jumps forward, in
-    /// whole gaps, exactly as an under-load drop already does.
+    /// Slaves the media clock to cpal's capture timestamp (`capture_ns`,
+    /// nanoseconds on a monotonic clock). The counted clock advances one 10 ms
+    /// slot per accumulated frame, so any span the hardware captured but the
+    /// pipeline never processed (a capture xrun, or a callback dropped under
+    /// load before it reached the encoder) surfaces as the capture instant
+    /// running ahead of what we counted. [`CaptureClock`] decides when that is a
+    /// real hole rather than a late callback on a backend whose timestamp
+    /// follows the callback; the hole then reaches the receiver as a
+    /// concealable timestamp gap instead of a slow clock.
     pub(crate) fn note_capture_timestamp(&mut self, capture_ns: u64) -> Result<(), String> {
         // `effective` is the media index of the first sample of the incoming
         // chunk: accumulator `pending` holds the previous chunk's leftover, which
@@ -510,34 +491,30 @@ impl LiveEncoderPipeline {
         let effective = self
             .next_capture_sample
             .wrapping_add(self.accumulator.pending.len() as u32);
-        let Some(prev) = self.capture_clock else {
-            self.capture_clock = Some(CaptureClock {
-                last_capture_ns: capture_ns,
-                last_effective_sample: effective,
-            });
+        let gap_samples = self.capture_clock.observe(capture_ns, effective);
+        self.capture_hole_suspected = self.capture_clock.hole_suspected();
+        if gap_samples == 0 {
             return Ok(());
-        };
-        let dt_ns = capture_ns.saturating_sub(prev.last_capture_ns);
-        let expected = ((dt_ns * u64::from(crate::audio::shared::SAMPLE_RATE) + 500_000_000)
-            / 1_000_000_000) as u32;
-        let actual = effective.wrapping_sub(prev.last_effective_sample);
-        let shortfall = expected.saturating_sub(actual);
-        if shortfall >= FRAME_SAMPLES as u32 {
-            self.note_capture_gap(shortfall)?;
         }
-        // Re-lock the anchor to the authoritative timestamp. After a gap the
-        // recomputed `effective` has advanced by exactly `shortfall`, so the
-        // stored clock tracks `expected` and rounding never accumulates. Clamp the
-        // timestamp monotone so a transient backward blip cannot manufacture a
-        // later gap.
-        let last_effective_sample = self
-            .next_capture_sample
-            .wrapping_add(self.accumulator.pending.len() as u32);
-        self.capture_clock = Some(CaptureClock {
-            last_capture_ns: capture_ns.max(prev.last_capture_ns),
-            last_effective_sample,
-        });
-        Ok(())
+        // A confirmed hole lies a confirmation span in the past. The audio
+        // since then is mostly sent already, so it is kept and only the
+        // timeline jumps (at the next frame boundary). The Opus stream
+        // restarts there, dropping at most the partial packet pending:
+        // a continuing encoder's FEC and DRED describe the audio just before
+        // the jump, which the receiver would place inside the timestamp gap
+        // and play back over the hole instead of concealing it.
+        self.next_capture_sample = self.next_capture_sample.wrapping_add(gap_samples);
+        kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
+            "audio pop capture clock gap confirmed",
+            gap_samples,
+            next_capture_sample = self.next_capture_sample
+        );
+        // The packets around the jump reach the receiver off its arrival
+        // pattern; flag them out of its statistics as after a pause.
+        self.silence_resume_hint_packets = self
+            .silence_resume_hint_packets
+            .max(SILENCE_RESUME_HINT_PACKETS);
+        self.reset_opus_codec()
     }
 
     fn process_accumulated_frame(
@@ -817,7 +794,7 @@ impl LiveEncoderPipeline {
                 .record_capture_opus_input(&self.pending_opus_samples[..LIVE_OPUS_FRAME_SAMPLES]);
             let mut flags = self.next_opus_packet_flags;
             self.next_opus_packet_flags = 0;
-            if self.silence_resume_hint_packets > 0 {
+            if self.silence_resume_hint_packets > 0 || self.capture_hole_suspected {
                 flags |= LIVE_PACKET_FLAG_SILENCE_RESUME;
             }
             let encode_start = Instant::now();
@@ -918,7 +895,7 @@ impl LiveEncoderPipeline {
         self.sender_silence_active = true;
         self.silence_keepalive_frames = SILENCE_KEEPALIVE_CAPTURE_FRAMES;
         if entering_sender_silence {
-            self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
+            self.silence_resume_hint_packets = self.resume_hint_packets();
         }
         if entering_sender_silence {
             let flags = LIVE_PACKET_FLAG_SILENCE_HINT | extra_flags;
@@ -952,11 +929,34 @@ impl LiveEncoderPipeline {
         std::mem::replace(&mut self.accumulator, FrameAccumulator::empty(frame_size))
     }
 
-    fn reset_opus_stream(&mut self) -> Result<(), String> {
+    /// Packets flagged `SILENCE_RESUME` after a pause: at least
+    /// [`SILENCE_RESUME_HINT_PACKETS`], and always the whole back-dated preroll
+    /// burst plus the packet that completes it. Unflagged burst packets reach
+    /// the receiver's arrival statistics as late arrivals and inflate its
+    /// delay limits for the 2 s history window.
+    fn resume_hint_packets(&self) -> u8 {
+        let preroll_packets = self.tuning.capture_silence_preroll.as_millis().div_ceil(
+            LIVE_OPUS_FRAME_SAMPLES as u128 * 1000 / u128::from(crate::audio::shared::SAMPLE_RATE),
+        );
+        (preroll_packets + 2).clamp(u128::from(SILENCE_RESUME_HINT_PACKETS), 255) as u8
+    }
+
+    /// Restarts the Opus stream at the next queued frame: drops the partial
+    /// packet, resets the encoder (no FEC or DRED history crosses the restart)
+    /// and flags the next packet `OPUS_RESET` so the receiver resets its
+    /// decoder to match.
+    fn reset_opus_codec(&mut self) -> Result<(), String> {
         self.pending_opus_samples.clear();
         self.encoder.reset_state()?;
         self.next_opus_packet_flags = LIVE_PACKET_FLAG_OPUS_RESET;
-        self.silence_resume_hint_packets = SILENCE_RESUME_HINT_PACKETS;
+        Ok(())
+    }
+
+    /// Restarts the Opus stream for a resume from a sender pause: on top of
+    /// [`Self::reset_opus_codec`], the first packets advertise the resume.
+    fn reset_opus_stream(&mut self) -> Result<(), String> {
+        self.reset_opus_codec()?;
+        self.silence_resume_hint_packets = self.resume_hint_packets();
         self.sender_silence_active = true;
         self.silence_keepalive_frames = 0;
         kvlog::info!(AUDIO_DIAGNOSTICS_LOGS;
@@ -1713,8 +1713,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn capture_gap_advances_media_clock_and_resets_stream() {
+    /// End-to-end sender -> NetEQ trace across a real capture hole of
+    /// `hole_ms`. The pipeline keeps stamping post-hole audio as contiguous
+    /// until the hole is confirmed, then jumps. With `restamp`, every packet
+    /// is re-stamped with its true capture position (an immediate jump) for
+    /// comparison. Returns (wall ms, mouth-to-ear latency ms, expand blocks
+    /// so far).
+    fn capture_hole_receiver_trace(hole_ms: u64, restamp: bool) -> Vec<(u64, i64, u32)> {
+        use crate::audio::playback::neteq::{Mode, NetEqCore};
         let mut tuning = test_tuning();
         tuning.capture_silence_gate = false;
         let mut pipeline = build_live_encoder_pipeline(
@@ -1727,53 +1733,91 @@ mod tests {
         )
         .unwrap();
         let stats = AudioStats::new();
-        let speech = high_energy_speech_chunk();
-        let mut packets = Vec::new();
-        for _ in 0..4 {
+        let frames = sample_speech_frames();
+        // (arrival ms, timestamp, flags, payload, true capture ms of first sample)
+        let mut sent: Vec<(u64, u32, u8, Vec<u8>, u64)> = Vec::new();
+        let hole_at = 100u64;
+        let mut first_post_hole = true;
+        for k in 0..1_500u64 {
+            let capture_ms = k * 10 + if k >= hole_at { hole_ms } else { 0 };
+            pipeline
+                .note_capture_timestamp(capture_ms * 1_000_000)
+                .unwrap();
+            let chunk = normalized_to_i16_scale(&frames[k as usize % frames.len()]);
+            let mut out = Vec::new();
             pipeline
                 .push_chunk(
-                    &speech,
+                    &chunk,
                     DEFAULT_LIVE_MAX_AMPLIFICATION,
                     false,
                     &stats,
-                    &mut |packet| packets.push(packet),
+                    &mut |p| out.push(p),
                 )
                 .unwrap();
+            for packet in out {
+                let VoicePayload::Opus(bytes) = packet.payload else {
+                    continue;
+                };
+                let true_ms = capture_ms.saturating_sub(10);
+                let (ts, mut flags) = (packet.timestamp, packet.flags);
+                let ts = if restamp {
+                    if k > hole_at && first_post_hole {
+                        first_post_hole = false;
+                        flags |= LIVE_PACKET_FLAG_OPUS_RESET;
+                    }
+                    (true_ms * 48) as u32
+                } else {
+                    ts
+                };
+                sent.push((capture_ms + 10 + 20, ts, flags, bytes, true_ms));
+            }
         }
-        let last_pre_gap = opus_packets(&packets)
-            .last()
-            .expect("speech before the gap should emit Opus packets")
-            .timestamp;
-        let pre_gap_count = packets.len();
-
-        // One second of capture was dropped under load.
-        pipeline.note_capture_gap(SAMPLE_RATE).unwrap();
-
-        for _ in 0..4 {
-            pipeline
-                .push_chunk(
-                    &speech,
-                    DEFAULT_LIVE_MAX_AMPLIFICATION,
-                    false,
-                    &stats,
-                    &mut |packet| packets.push(packet),
-                )
-                .unwrap();
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let base = Instant::now();
+        let mut block = vec![0.0f32; FRAME_SAMPLES];
+        let mut next = 0usize;
+        let mut expands = 0u32;
+        let mut trace = Vec::new();
+        for t in (0..15_000 + hole_ms).step_by(10) {
+            let now = base + Duration::from_millis(t);
+            while next < sent.len() && sent[next].0 <= t {
+                let (_, ts, flags, ref bytes, _) = sent[next];
+                core.insert_packet(now, ts, next as u32, flags, bytes);
+                next += 1;
+            }
+            let result = core.get_audio(now, &mut block);
+            if matches!(result.mode, Mode::Expand) {
+                expands += 1;
+            }
+            let pts = core.diagnostics().playout_media_timestamp;
+            let latency = sent
+                .iter()
+                .find(|p| pts.wrapping_sub(p.1) < LIVE_OPUS_FRAME_SAMPLES as u32)
+                .map(|p| t as i64 - (p.4 + u64::from(pts.wrapping_sub(p.1)) / 48) as i64)
+                .unwrap_or(-1);
+            trace.push((t, latency, expands));
         }
-        let resumed = packets[pre_gap_count..]
-            .iter()
-            .find(|packet| matches!(packet.payload, VoicePayload::Opus(_)))
-            .expect("speech after the gap should emit Opus packets");
-        assert_ne!(
-            resumed.flags & LIVE_PACKET_FLAG_OPUS_RESET,
-            0,
-            "the stream must re-anchor rather than continue the encoder over the hole"
-        );
-        let jump = resumed.timestamp.wrapping_sub(last_pre_gap);
-        assert!(
-            jump >= SAMPLE_RATE,
-            "media clock spliced across the dropped capture: jump {jump}"
-        );
+        trace
+    }
+
+    #[test]
+    fn capture_hole_does_not_leave_the_listener_behind() {
+        // The packets stamped early while the hole awaits confirmation are
+        // flagged out of the receiver's statistics, so its delay settles
+        // back near an immediate jump's within a few seconds.
+        for hole_ms in [100u64, 300] {
+            let confirmed = capture_hole_receiver_trace(hole_ms, false);
+            let ideal = capture_hole_receiver_trace(hole_ms, true);
+            let at = |trace: &[(u64, i64, u32)], t: u64| trace.iter().find(|e| e.0 == t).unwrap().1;
+            for (t, slack) in [(3_000, 30), (4_000, 15), (8_000, 15)] {
+                assert!(
+                    at(&confirmed, t) <= at(&ideal, t) + slack,
+                    "hole {hole_ms} ms, t={t}: {} ms vs {} ms",
+                    at(&confirmed, t),
+                    at(&ideal, t)
+                );
+            }
+        }
     }
 
     /// Nanoseconds cpal advances the capture instant per 10 ms callback.
@@ -1820,7 +1864,7 @@ mod tests {
 
         let max_amplification_bits = AtomicU32::new(DEFAULT_LIVE_MAX_AMPLIFICATION.to_bits());
         let encoder_loss_percent =
-            AtomicU32::new(LiveEncoderProfile::DRED_20.packet_loss_percent as u32);
+            AtomicU32::new(LiveEncoderProfile::INITIAL.packet_loss_percent as u32);
         let voice_state = crate::audio::AtomicVoiceState::new(VoiceState::Live);
         let mut packets = Vec::new();
         run_live_encoder_worker_inner(
@@ -1846,12 +1890,73 @@ mod tests {
 
     /// The first Opus packet whose timestamp jumps by at least `SAMPLE_RATE` from
     /// the previous Opus packet, i.e. the packet that resumes after a gap.
-    fn resumed_after_gap(packets: &[LocalVoiceFrame]) -> &LocalVoiceFrame {
-        let opus = opus_packets(packets);
-        opus.windows(2)
-            .find(|pair| pair[1].timestamp.wrapping_sub(pair[0].timestamp) >= SAMPLE_RATE)
-            .map(|pair| pair[1])
-            .expect("a post-gap resume packet should be emitted")
+    #[test]
+    fn long_preroll_burst_is_flagged_as_resume_in_full() {
+        // 300 ms of preroll after a long pause is a 15-packet back-dated
+        // burst; the default 10-packet hint would leave its tail in the
+        // receiver's arrival statistics as late arrivals.
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = true;
+        tuning.capture_long_silence_stop = Duration::from_millis(20);
+        tuning.capture_silence_preroll = Duration::from_millis(300);
+        tuning.capture_silence_ramp = Duration::ZERO;
+        tuning.silence_vad_max = u8::MAX;
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let speech = high_energy_speech_chunk();
+        let silence = vec![0.0f32; FRAME_SAMPLES];
+        let mut packets = Vec::new();
+        let mut frames = 0u32;
+        let mut push = |frame: &[f32], packets: &mut Vec<LocalVoiceFrame>| {
+            pipeline
+                .push_chunk(
+                    frame,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
+                    &stats,
+                    &mut |p| packets.push(p),
+                )
+                .unwrap();
+            frames += 1;
+            frames
+        };
+        for _ in 0..4 {
+            push(&speech, &mut packets);
+        }
+        for _ in 0..60 {
+            push(&silence, &mut packets);
+        }
+        let resume_slot_start = push(&speech, &mut packets) * FRAME_SAMPLES as u32;
+        for _ in 0..10 {
+            push(&speech, &mut packets);
+        }
+        let opus = opus_packets(&packets);
+        let resume_index = opus
+            .iter()
+            .enumerate()
+            .position(|(index, packet)| {
+                index > 0 && packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0
+            })
+            .expect("resume");
+        let back_dated = opus[resume_index..]
+            .iter()
+            .take_while(|packet| (resume_slot_start.wrapping_sub(packet.timestamp) as i32) > 0)
+            .collect::<Vec<_>>();
+        assert!(back_dated.len() >= 14, "{}", back_dated.len());
+        assert!(
+            back_dated
+                .iter()
+                .all(|packet| packet.flags & LIVE_PACKET_FLAG_SILENCE_RESUME != 0),
+            "every back-dated packet must carry SILENCE_RESUME"
+        );
     }
 
     #[test]
@@ -1918,19 +2023,139 @@ mod tests {
             "sub-frame jitter that returns to grid must not emit a gap"
         );
 
-        // A full extra period the pipeline never saw: the capture instant runs one
-        // frame ahead of the counted clock, so the missing frame is inserted and
-        // the clock advances by the pushed frame plus the one-frame gap.
+        // A full extra period the pipeline never saw: from callback 11 on, the
+        // capture instant runs one frame ahead of the counted clock. Once that
+        // has persisted for the confirmation span (three callbacks, 20 ms) the
+        // missing frame is inserted on the clock.
         let before = pipeline.next_capture_sample;
-        pipeline
-            .note_capture_timestamp(11 * CALLBACK_PERIOD_NS)
-            .unwrap();
-        push(&mut pipeline);
+        for slot in 11..14u64 {
+            pipeline
+                .note_capture_timestamp(slot * CALLBACK_PERIOD_NS)
+                .unwrap();
+            push(&mut pipeline);
+        }
+        // The hole is measured against the clock's floor estimate, which the
+        // 3 ms blip above nudged by a few samples.
         let advanced = pipeline.next_capture_sample.wrapping_sub(before);
-        assert_eq!(
-            advanced,
-            2 * FRAME_SAMPLES as u32,
-            "a dropped period must advance the clock by the pushed frame plus the gap"
+        assert!(
+            (4 * FRAME_SAMPLES as u32 - 4..=4 * FRAME_SAMPLES as u32).contains(&advanced),
+            "a dropped period must advance the clock by the pushed frames plus the gap: {advanced}"
+        );
+    }
+
+    /// Drives 10 ms tone callbacks through a pipeline whose capture instant
+    /// jumps `hole_frames` periods ahead from callback `hole_at` on, returning
+    /// the emitted Opus packets.
+    fn packets_across_capture_hole(hole_at: u64, hole_frames: u64) -> Vec<LocalVoiceFrame> {
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = false;
+        let mut pipeline = build_live_encoder_pipeline(
+            tuning,
+            false,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            EncoderNetworkProfile::EXCELLENT,
+            None,
+        )
+        .unwrap();
+        let stats = AudioStats::new();
+        let frame: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|n| (n as f32 * 0.07).sin() * 8_000.0)
+            .collect();
+        let mut packets = Vec::new();
+        for slot in 0..30u64 {
+            let extra = if slot >= hole_at { hole_frames } else { 0 };
+            pipeline
+                .note_capture_timestamp((slot + extra) * CALLBACK_PERIOD_NS)
+                .unwrap();
+            pipeline
+                .push_chunk(
+                    &frame,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+        packets
+            .into_iter()
+            .filter(|packet| matches!(packet.payload, VoicePayload::Opus(_)))
+            .collect()
+    }
+
+    #[test]
+    fn confirmed_capture_hole_restarts_the_opus_stream() {
+        // The encoder carried across the jump would put FEC/DRED for the
+        // audio before it into the receiver's gap. Both confirmation phases:
+        // on a packet boundary and with half a packet pending.
+        for hole_at in [11, 12] {
+            let opus = packets_across_capture_hole(hole_at, 10);
+            let steps: Vec<u32> = opus
+                .windows(2)
+                .map(|pair| pair[1].timestamp.wrapping_sub(pair[0].timestamp))
+                .collect();
+            let jumps: Vec<usize> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| **step != LIVE_OPUS_FRAME_SAMPLES as u32)
+                .map(|(index, _)| index + 1)
+                .collect();
+            assert_eq!(jumps.len(), 1, "hole_at {hole_at}: steps {steps:?}");
+            let after = jumps[0];
+            assert!(
+                steps[after - 1] > 10 * FRAME_SAMPLES as u32,
+                "hole_at {hole_at}: jump {}",
+                steps[after - 1]
+            );
+            assert_ne!(
+                opus[after].flags & LIVE_PACKET_FLAG_OPUS_RESET,
+                0,
+                "hole_at {hole_at}: the first packet after the hole restarts the stream"
+            );
+            assert_ne!(
+                opus[after].flags & LIVE_PACKET_FLAG_SILENCE_RESUME,
+                0,
+                "hole_at {hole_at}: packets after the jump stay out of the receiver's statistics"
+            );
+            assert!(
+                opus.iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|(index, _)| *index != after)
+                    .all(|(_, packet)| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET == 0),
+                "hole_at {hole_at}: only the hole restarts the stream"
+            );
+        }
+    }
+
+    #[test]
+    fn late_callback_timestamp_is_not_a_capture_gap() {
+        // A backend that stamps capture from the callback wake-up: callback 5
+        // ran 15 ms late, callback 6 right after it. No audio was lost.
+        let packets = run_worker_with_capture_timestamps(
+            |sequence| {
+                let late = match sequence {
+                    5 => 15_000_000,
+                    6 => 5_000_000,
+                    _ => 0,
+                };
+                sequence * CALLBACK_PERIOD_NS + late
+            },
+            0,
+        );
+        let opus = opus_packets(&packets);
+        assert!(
+            opus.windows(2)
+                .all(|pair| pair[1].timestamp.wrapping_sub(pair[0].timestamp)
+                    == LIVE_OPUS_FRAME_SAMPLES as u32),
+            "a late callback must not jump the media clock"
+        );
+        assert!(
+            opus.iter()
+                .skip(1)
+                .all(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET == 0),
+            "a late callback must not reset the encoder"
         );
     }
 
@@ -1946,11 +2171,17 @@ mod tests {
             0,
         );
 
-        let resumed = resumed_after_gap(&packets);
-        assert_ne!(
-            resumed.flags & LIVE_PACKET_FLAG_OPUS_RESET,
-            0,
-            "the stream must re-anchor across the capture-timestamp gap"
+        // The hole reaches the receiver as a one-second timestamp jump (a
+        // concealable gap), confirmed a few callbacks after it happened.
+        let opus = opus_packets(&packets);
+        let jump = opus
+            .windows(2)
+            .map(|pair| pair[1].timestamp.wrapping_sub(pair[0].timestamp))
+            .max()
+            .expect("packets");
+        assert!(
+            (SAMPLE_RATE..SAMPLE_RATE + 2 * LIVE_OPUS_FRAME_SAMPLES as u32).contains(&jump),
+            "the media clock must jump over the lost second: {jump}"
         );
     }
 

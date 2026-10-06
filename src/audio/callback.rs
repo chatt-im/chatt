@@ -7,9 +7,23 @@ use cpal::{FromSample, Sample};
 
 use crate::audio::AudioReportDeviceTap;
 use crate::audio::shared::{
-    AUDIO_DIAGNOSTICS_LOGS, AudioStats, CaptureCallbackTiming, CapturedAudioChunk, duration_to_us,
-    optional_duration_to_us, peak_i16_scale, rms_i16_scale,
+    AUDIO_DIAGNOSTICS_LOGS, AudioStats, CALLBACK_QUEUE_CAPACITY, CaptureCallbackTiming,
+    CapturedAudioChunk, duration_to_us, optional_duration_to_us, peak_i16_scale, rms_i16_scale,
 };
+
+/// Fills a capture stream's recycle pool before the stream opens, so the
+/// realtime callback does not allocate while the encoder worker stalls: up
+/// to [`CALLBACK_QUEUE_CAPACITY`] chunks can be in flight before it returns
+/// any. Each buffer holds 50 ms of mono at `device_rate`, above common
+/// device periods.
+pub(super) fn prefill_recycle_pool(recycle: &SyncSender<Vec<f32>>, device_rate: u32) {
+    let capacity = device_rate as usize / 20;
+    for _ in 0..CALLBACK_QUEUE_CAPACITY {
+        if recycle.try_send(Vec::with_capacity(capacity)).is_err() {
+            break;
+        }
+    }
+}
 
 pub(super) struct CaptureCallbackCore {
     sender: SyncSender<CapturedAudioChunk>,
@@ -272,5 +286,15 @@ mod tests {
             "taking the dropped samples must drain the counter"
         );
         assert_eq!(stats.snapshot().dropped_chunks, 1);
+    }
+
+    #[test]
+    fn prefilled_recycle_pool_covers_a_full_queue_without_allocating() {
+        let (recycle_tx, recycle_rx) = std::sync::mpsc::sync_channel(CALLBACK_QUEUE_CAPACITY);
+        prefill_recycle_pool(&recycle_tx, SAMPLE_RATE);
+        let buffers: Vec<Vec<f32>> = recycle_rx.try_iter().collect();
+        assert_eq!(buffers.len(), CALLBACK_QUEUE_CAPACITY);
+        // A 1024-frame period (PipeWire's default quantum) fits.
+        assert!(buffers.iter().all(|buffer| buffer.capacity() >= 1024));
     }
 }

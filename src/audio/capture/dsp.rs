@@ -3,7 +3,8 @@ use std::collections::VecDeque;
 use earshot::Detector as EarshotDetector;
 use nnnoiseless::DenoiseState;
 use sonora::config::{
-    AdaptiveDigital, EchoCanceller as Aec3Config, GainController2, NoiseSuppression,
+    AdaptiveDigital, EchoCanceller as Aec3Config, GainController2, MaxProcessingRate,
+    NoiseSuppression, Pipeline,
 };
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig as ApmStreamConfig};
 
@@ -71,21 +72,10 @@ impl CaptureGain {
     /// Builds the gain stage for a positive `max_gain_db` ceiling, or `None`
     /// when it is zero (or non-finite), which bypasses auto gain entirely.
     pub(crate) fn new(max_gain_db: f32) -> Option<Self> {
-        if !(max_gain_db.is_finite() && max_gain_db > 0.0) {
-            return None;
-        }
-        let max_gain_db = max_gain_db.min(MAX_CAPTURE_GAIN_DB);
-        let default_adaptive = AdaptiveDigital::default();
+        let gain_controller2 = agc2_config(max_gain_db)?;
         let stream = ApmStreamConfig::new(crate::audio::shared::SAMPLE_RATE, 1);
         let config = ApmConfig {
-            gain_controller2: Some(GainController2 {
-                adaptive_digital: Some(AdaptiveDigital {
-                    max_gain_db,
-                    initial_gain_db: default_adaptive.initial_gain_db.min(max_gain_db),
-                    ..default_adaptive
-                }),
-                ..GainController2::default()
-            }),
+            gain_controller2: Some(gain_controller2),
             ..ApmConfig::default()
         };
         let apm = AudioProcessing::builder()
@@ -130,28 +120,64 @@ impl CaptureGain {
 /// both off (the default config). Filtering full-band outside the APM leaves the
 /// APM with no multi-band submodule in that case, so it processes natively at
 /// 48 kHz with no split and no resampler. When AEC or spectral NS *is* on the
-/// APM band-splits at its native 32 kHz for those passes, exactly as upstream.
+/// APM band-splits for those passes, at 48 kHz rather than upstream's 32 kHz
+/// cap.
 /// RNNoise denoising runs outside the APM too (see [`CaptureProcessor::process`]).
+/// With RNNoise, AGC2 is left out of the APM and runs after the denoiser
+/// instead ([`CaptureProcessor::post_gain`]).
 fn capture_apm_config(denoise: DenoiseConfig, echo: bool, max_gain_db: f32) -> ApmConfig {
-    let gain_controller2 = (max_gain_db.is_finite() && max_gain_db > 0.0).then(|| {
-        let max_gain_db = max_gain_db.min(MAX_CAPTURE_GAIN_DB);
-        let default_adaptive = AdaptiveDigital::default();
-        GainController2 {
-            adaptive_digital: Some(AdaptiveDigital {
-                max_gain_db,
-                initial_gain_db: default_adaptive.initial_gain_db.min(max_gain_db),
-                ..default_adaptive
-            }),
-            ..GainController2::default()
-        }
-    });
+    let gain_controller2 = if agc_after_denoise(denoise) {
+        None
+    } else {
+        agc2_config(max_gain_db)
+    };
     ApmConfig {
+        // Band-split passes (AEC3, spectral NS) run at 48 kHz instead of
+        // WebRTC's default 32 kHz cap, which low-passes the capture at 16 kHz
+        // whenever one of them is on.
+        pipeline: Pipeline {
+            maximum_internal_processing_rate: MaxProcessingRate::Rate48kHz,
+            ..Pipeline::default()
+        },
         echo_canceller: echo.then(Aec3Config::default),
         noise_suppression: matches!(denoise, DenoiseConfig::Spectral)
             .then(NoiseSuppression::default),
         gain_controller2,
         ..ApmConfig::default()
     }
+}
+
+/// AGC2's gain when a capture starts, in dB. The WebRTC default (15 dB,
+/// capped at the ceiling) boosted every normal talker into the limiter for
+/// about 2 s of every capture start; fast first convergence
+/// (`AdaptiveDigital::fast_initial_convergence`) instead raises it to a quiet
+/// talker's gain within about a second of speech. Only the rise is faster: a
+/// soft first phrase followed by louder speech unwinds its gain at WebRTC's
+/// 6 dB/s (the limiter catches the peaks), no worse than the stock start.
+const AGC_INITIAL_GAIN_DB: f32 = 0.0;
+
+/// AGC2 runs after RNNoise (the WebRTC and Mumble order), so it levels the
+/// denoised speech rather than lifting the noise RNNoise then has to remove.
+fn agc_after_denoise(denoise: DenoiseConfig) -> bool {
+    matches!(denoise, DenoiseConfig::RnnNoise)
+}
+
+/// AGC2 (adaptive digital + limiter) for a positive `max_gain_db` ceiling, or
+/// `None` when it is zero (or non-finite), which bypasses auto gain.
+fn agc2_config(max_gain_db: f32) -> Option<GainController2> {
+    if !(max_gain_db.is_finite() && max_gain_db > 0.0) {
+        return None;
+    }
+    let max_gain_db = max_gain_db.min(MAX_CAPTURE_GAIN_DB);
+    Some(GainController2 {
+        adaptive_digital: Some(AdaptiveDigital {
+            max_gain_db,
+            initial_gain_db: AGC_INITIAL_GAIN_DB.min(max_gain_db),
+            fast_initial_convergence: true,
+            ..AdaptiveDigital::default()
+        }),
+        ..GainController2::default()
+    })
 }
 
 /// Ring backlog setpoint for the paced render feed, in 10 ms frames (~40 ms).
@@ -165,7 +191,8 @@ const ECHO_MAX_FEED_FRAMES: usize = 2;
 
 /// Consolidated live capture front-end: a standalone full-band high-pass filter
 /// followed by one sonora WebRTC `AudioProcessing` instance running AEC3,
-/// optional spectral noise suppression, and AGC2 in the canonical WebRTC order.
+/// optional spectral noise suppression, and (without RNNoise) AGC2 in the
+/// canonical WebRTC order.
 /// The high-pass runs ahead of the APM (still first, still full-band, matching
 /// WebRTC's `apply_in_full_band` ordering) rather than as an APM submodule, so
 /// that with AEC and spectral NS off the APM has no multi-band pass and stays on
@@ -173,7 +200,7 @@ const ECHO_MAX_FEED_FRAMES: usize = 2;
 /// [`capture_apm_config`]). With the [`DenoiseConfig::RnnNoise`] engine, the
 /// higher-quality RNNoise denoiser runs after the APM instead of the APM's
 /// spectral suppressor, matching the historical "denoise last" ordering and
-/// supplying the VAD. Processes one 10 ms mono frame at 48 kHz per call inside
+/// supplying the VAD; AGC2 then runs after RNNoise as a separate pass. Processes one 10 ms mono frame at 48 kHz per call inside
 /// the capture worker, never a realtime callback. AEC and gain toggle at runtime
 /// through `apply_config`.
 pub(crate) struct CaptureProcessor {
@@ -183,6 +210,8 @@ pub(crate) struct CaptureProcessor {
     echo_enabled: bool,
     gain_max_db: f32,
     rnnoise: Option<Box<DenoiseState>>,
+    /// AGC2 after RNNoise (see [`agc_after_denoise`]).
+    post_gain: Option<CaptureGain>,
     denoised: Vec<f32>,
     render: Vec<f32>,
     render_out: Vec<f32>,
@@ -214,6 +243,7 @@ impl CaptureProcessor {
             denoise,
             echo_enabled,
             gain_max_db: max_gain_db,
+            post_gain: Self::build_post_gain(denoise, max_gain_db),
             rnnoise,
             denoised: vec![0.0; FRAME_SAMPLES],
             render: vec![0.0; FRAME_SAMPLES],
@@ -221,6 +251,12 @@ impl CaptureProcessor {
             near: vec![0.0; FRAME_SAMPLES],
             cleaned: vec![0.0; FRAME_SAMPLES],
         }
+    }
+
+    fn build_post_gain(denoise: DenoiseConfig, max_gain_db: f32) -> Option<CaptureGain> {
+        agc_after_denoise(denoise)
+            .then(|| CaptureGain::new(max_gain_db))
+            .flatten()
     }
 
     fn rebuild(&mut self) {
@@ -237,6 +273,7 @@ impl CaptureProcessor {
         if max_gain_db != self.gain_max_db {
             self.gain_max_db = max_gain_db;
             self.rebuild();
+            self.post_gain = Self::build_post_gain(self.denoise, max_gain_db);
         }
     }
 
@@ -290,6 +327,9 @@ impl CaptureProcessor {
         if let Some(rnnoise) = self.rnnoise.as_mut() {
             let vad = rnnoise.process_frame(&mut self.denoised, frame);
             frame.copy_from_slice(&self.denoised);
+            if let Some(gain) = self.post_gain.as_mut() {
+                gain.process(frame);
+            }
             return Some(vad);
         }
         None
@@ -1132,6 +1172,203 @@ mod tests {
                 .samples
                 .iter()
                 .all(|&s| (s - 9.0).abs() < f32::EPSILON)
+        );
+    }
+
+    /// The sample speech as i16-scale frames, scaled so its active frames
+    /// average `target_dbfs` RMS.
+    fn speech_at(target_dbfs: f32) -> Vec<Vec<f32>> {
+        let frames = sample_speech_frames();
+        // The sample frames are normalized; keep frames above -50 dBFS RMS.
+        let active: Vec<f32> = frames
+            .iter()
+            .map(|frame| (power(frame) / frame.len() as f32).sqrt())
+            .filter(|rms| *rms > 0.003)
+            .collect();
+        assert!(!active.is_empty(), "sample speech has no active frames");
+        let mean_power = active.iter().map(|rms| rms * rms).sum::<f32>() / active.len() as f32;
+        let gain = 10f32.powf(target_dbfs / 20.0) / mean_power.sqrt() * I16_SCALE;
+        frames
+            .iter()
+            .map(|frame| frame.iter().map(|sample| sample * gain).collect())
+            .collect()
+    }
+
+    fn power(frame: &[f32]) -> f32 {
+        frame.iter().map(|sample| sample * sample).sum::<f32>()
+    }
+
+    /// Output / input energy in dB over capture frames `range`, aligned for
+    /// RNNoise's two-frame delay when `denoise` is RNNoise.
+    fn agc_gain_db(
+        denoise: DenoiseConfig,
+        frames: &[Vec<f32>],
+        range: std::ops::Range<usize>,
+    ) -> f32 {
+        let delay = if matches!(denoise, DenoiseConfig::RnnNoise) {
+            2
+        } else {
+            0
+        };
+        let mut processor =
+            CaptureProcessor::new(denoise, 12.0, false, DenoiseSuppression::IDENTITY);
+        let (mut input, mut output) = (0.0, 0.0);
+        for (index, frame) in frames.iter().enumerate().take(range.end + delay) {
+            let mut processed = frame.clone();
+            processor.process(&mut processed, None);
+            if index >= delay && range.contains(&(index - delay)) {
+                input += power(&frames[index - delay]);
+                output += power(&processed);
+            }
+        }
+        10.0 * (output / input).log10()
+    }
+
+    #[test]
+    fn agc_does_not_boost_a_normal_talker_at_capture_start() {
+        // The WebRTC default AGC2 start (+12 dB here, capped at the ceiling)
+        // boosted every capture start into its limiter for about 2 s. AGC2
+        // starts at unity and leaves a normal-level talker alone.
+        let frames = speech_at(-24.0);
+        for denoise in [DenoiseConfig::None, DenoiseConfig::RnnNoise] {
+            let gain = agc_gain_db(denoise, &frames, 0..150);
+            assert!(
+                gain.abs() < 1.5,
+                "{denoise:?}: start must not boost: {gain:.1} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn agc_reaches_a_quiet_talker_within_seconds() {
+        // Starting at unity must not leave a quiet talker quiet: the fast first
+        // convergence follows the measured level on confident speech frames
+        // (WebRTC's own convergence was still under +3 dB here).
+        let frames = speech_at(-44.0);
+        for denoise in [DenoiseConfig::None, DenoiseConfig::RnnNoise] {
+            let gain = agc_gain_db(denoise, &frames, 300..500);
+            assert!(
+                gain > 9.0,
+                "{denoise:?}: quiet talker gain after 3 s: {gain:.1} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn agc_after_a_soft_first_phrase_overshoots_no_more_than_webrtc() {
+        // A soft first phrase earns the quiet-talker gain quickly; louder
+        // speech after it then unwinds that gain at WebRTC's symmetric 6 dB/s,
+        // leaning on the limiter meanwhile. Upstream is deliberately kept
+        // here, so the overshoot must stay within what stock AGC2 (12 dB
+        // start, no fast convergence) does from the same input.
+        fn gain_after_step_db(initial_gain_db: f32, fast_initial_convergence: bool) -> f32 {
+            let stream = ApmStreamConfig::new(SAMPLE_RATE, 1);
+            let mut apm = AudioProcessing::builder()
+                .config(ApmConfig {
+                    gain_controller2: Some(GainController2 {
+                        adaptive_digital: Some(AdaptiveDigital {
+                            max_gain_db: 12.0,
+                            initial_gain_db,
+                            fast_initial_convergence,
+                            ..AdaptiveDigital::default()
+                        }),
+                        ..GainController2::default()
+                    }),
+                    ..ApmConfig::default()
+                })
+                .capture_config(stream)
+                .render_config(stream)
+                .build();
+            let (soft, normal) = (speech_at(-44.0), speech_at(-20.0));
+            let mut output = vec![0.0; FRAME_SAMPLES];
+            let (mut input_power, mut output_power) = (0.0, 0.0);
+            // 1.5 s soft, then the first second of normal speech.
+            for index in 0..250 {
+                let frame = if index < 150 {
+                    &soft[index % soft.len()]
+                } else {
+                    &normal[index % normal.len()]
+                };
+                let input: Vec<f32> = frame.iter().map(|sample| sample / I16_SCALE).collect();
+                let _ = apm.process_capture_f32(&[&input], &mut [&mut output]);
+                if index >= 150 {
+                    input_power += power(&input);
+                    output_power += power(&output);
+                }
+            }
+            10.0 * (output_power / input_power).log10()
+        }
+        let shipped = gain_after_step_db(AGC_INITIAL_GAIN_DB, true);
+        let stock = gain_after_step_db(12.0, false);
+        assert!(
+            shipped <= stock + 0.5,
+            "shipped {shipped:.1} dB vs stock {stock:.1} dB over the first second after the step"
+        );
+    }
+
+    #[test]
+    fn agc_runs_after_rnnoise() {
+        let rnnoise = CaptureProcessor::new(
+            DenoiseConfig::RnnNoise,
+            12.0,
+            false,
+            DenoiseSuppression::IDENTITY,
+        );
+        assert!(rnnoise.post_gain.is_some());
+        assert!(
+            capture_apm_config(DenoiseConfig::RnnNoise, false, 12.0)
+                .gain_controller2
+                .is_none()
+        );
+        let mut plain = CaptureProcessor::new(
+            DenoiseConfig::None,
+            12.0,
+            false,
+            DenoiseSuppression::IDENTITY,
+        );
+        assert!(plain.post_gain.is_none());
+        assert!(
+            capture_apm_config(DenoiseConfig::None, false, 12.0)
+                .gain_controller2
+                .is_some()
+        );
+        plain.set_max_gain_db(0.0);
+        let mut rnnoise = rnnoise;
+        rnnoise.set_max_gain_db(0.0);
+        assert!(
+            rnnoise.post_gain.is_none(),
+            "0 dB ceiling bypasses the post-RNNoise pass"
+        );
+    }
+
+    #[test]
+    fn fullband_apm_keeps_the_top_band_with_echo_cancellation_on() {
+        // Any band-split pass (AEC3, spectral NS) used to run the APM at its
+        // 32 kHz default cap, which low-passes the capture at 16 kHz.
+        let reference = EchoReference::new();
+        let mut processor =
+            CaptureProcessor::new(DenoiseConfig::None, 0.0, true, DenoiseSuppression::IDENTITY);
+        let (mut input, mut output) = (0.0, 0.0);
+        for index in 0..300 {
+            // Idle far end: the playback side feeds silence.
+            reference.push_frame(&[0.0; FRAME_SAMPLES]);
+            let frame: Vec<f32> = (0..FRAME_SAMPLES)
+                .map(|n| {
+                    let t = (index * FRAME_SAMPLES + n) as f32 / SAMPLE_RATE as f32;
+                    (t * 18_000.0 * std::f32::consts::TAU).sin() * 0.1 * I16_SCALE
+                })
+                .collect();
+            let mut processed = frame.clone();
+            processor.process(&mut processed, Some(&reference));
+            if index >= 100 {
+                input += power(&frame);
+                output += power(&processed);
+            }
+        }
+        let top_band_db = 10.0 * (output / input).log10();
+        assert!(
+            top_band_db > -3.0,
+            "fullband APM must keep 18 kHz: {top_band_db:.1} dB"
         );
     }
 

@@ -1,3 +1,4 @@
+mod clock;
 mod dsp;
 mod echo;
 mod encoder;

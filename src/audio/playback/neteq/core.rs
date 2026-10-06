@@ -288,6 +288,10 @@ pub(crate) struct NetEqCore {
     /// read as far-future on the new one and would jam the buffer, so they are
     /// dropped as late.
     rebase_floor_sequence: Option<u32>,
+    /// Timestamp of the current resume burst's first packet, bounding the
+    /// decision logic's resume hold to the span the burst covers (and that by
+    /// the local preroll, see `ControllerConfig::resume_hold_max_ms`).
+    resume_burst_start: Option<u32>,
     dred_last_horizon_samples: usize,
     dred_missed_horizon_count: u64,
     dred_missed_horizon_samples: u64,
@@ -315,6 +319,11 @@ impl NetEqCore {
             min_delay_ms,
             base_min_delay_ms,
             max_delay_ms,
+            // A preroll burst is back-dated by at most the preroll plus the
+            // frame that completes it. The local tuning stands in for the
+            // sender's, which the wire does not carry.
+            resume_hold_max_ms: duration_to_i32_ms(tuning.capture_silence_preroll)
+                .saturating_add(LIVE_OPUS_FRAME_SAMPLES as i32 * 1000 / FS_HZ),
         };
         let mut decision_logic = DecisionLogic::new(config, &tick_timer);
         decision_logic.set_sample_rate(FS_HZ, OUTPUT_SIZE_SAMPLES);
@@ -356,6 +365,7 @@ impl NetEqCore {
             last_decision_reason: "startup",
             last_sequence: None,
             rebase_floor_sequence: None,
+            resume_burst_start: None,
             dred_last_horizon_samples: 0,
             dred_missed_horizon_count: 0,
             dred_missed_horizon_samples: 0,
@@ -449,6 +459,8 @@ impl NetEqCore {
         self.expand.reset();
         self.background_noise.reset();
         self.decision_logic.soft_reset(&self.tick_timer);
+        self.decision_logic.clear_resume_hold();
+        self.resume_burst_start = None;
         self.last_mode = Mode::Normal;
         self.timestamp = 0;
         self.first_packet = true;
@@ -602,6 +614,28 @@ impl NetEqCore {
             .packets
             .first()
             .map_or(timestamp, |packet| packet.timestamp);
+        if silence_resume {
+            if self.packet_buffer.num_packets() == 0 {
+                // The first packet of a resume burst into an idle stream.
+                self.resume_burst_start = Some(main_timestamp);
+                self.decision_logic.note_talkspurt_resume();
+            }
+            if let Some(start) = self.resume_burst_start {
+                // The burst's back-dating is at most the audio it carries.
+                let span = prepared
+                    .packets
+                    .iter()
+                    .map(|packet| {
+                        packet
+                            .timestamp
+                            .wrapping_add(packet.duration_samples as u32)
+                            .wrapping_sub(start) as i32
+                    })
+                    .max()
+                    .unwrap_or(0);
+                self.decision_logic.extend_resume_span(span.max(0) as usize);
+            }
+        }
         let was_first_packet = self.first_packet;
         if self.first_packet {
             self.packet_buffer.flush();
@@ -1838,7 +1872,8 @@ mod tests {
             let mut removed = 0;
             let mut failed = 0;
             for packet in 0..545 {
-                let payload = encode_tone(&mut encoder, sequence as usize * LIVE_OPUS_FRAME_SAMPLES);
+                let payload =
+                    encode_tone(&mut encoder, sequence as usize * LIVE_OPUS_FRAME_SAMPLES);
                 core.insert_packet(clock.now(), timestamp, sequence, 0, &payload);
                 for _ in 0..2 {
                     if packet >= 45 {
@@ -1851,10 +1886,17 @@ mod tests {
                 sequence = sequence.wrapping_add(1);
                 timestamp = timestamp.wrapping_add(LIVE_OPUS_FRAME_SAMPLES as u32);
             }
-            assert_eq!(core.diagnostics().packets_discarded, 0, "recovery must not discard speech");
+            assert_eq!(
+                core.diagnostics().packets_discarded,
+                0,
+                "recovery must not discard speech"
+            );
             assert!(removed > 0, "must actually time-compress speech");
-            assert!(core.diagnostics().playout_delay_ms < 250,
-                "episode {episode}, removed {removed}, failed {failed}: {:?}", core.diagnostics());
+            assert!(
+                core.diagnostics().playout_delay_ms < 250,
+                "episode {episode}, removed {removed}, failed {failed}: {:?}",
+                core.diagnostics()
+            );
         }
     }
 
@@ -1862,11 +1904,16 @@ mod tests {
     fn fast_acceleration_accounts_for_the_actual_pcm_removed() {
         let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
         for (index, sample) in core.decoded_buffer[..SAMPLES_30_MS].iter_mut().enumerate() {
-            *sample = (10_000.0 * (index as f32 * 2.0 * std::f32::consts::PI * 440.0 / 48_000.0).sin()) as i16;
+            *sample = (10_000.0
+                * (index as f32 * 2.0 * std::f32::consts::PI * 440.0 / 48_000.0).sin())
+                as i16;
         }
         let removed = core.do_accelerate(SAMPLES_30_MS, true);
         let actual = SAMPLES_30_MS - core.scratch.timescale.output.len();
-        assert!(actual > SAMPLES_10_MS, "must exercise multi-period acceleration");
+        assert!(
+            actual > SAMPLES_10_MS,
+            "must exercise multi-period acceleration"
+        );
         assert_eq!(removed as usize, actual);
         assert_eq!(core.sync_buffer.future_length(), SAMPLES_30_MS - actual);
     }
@@ -1885,7 +1932,11 @@ mod tests {
         for episode in 0..120 {
             let words = 5 + episode % 11;
             for packet in 0..words {
-                let flags = if packet < 3 { LIVE_PACKET_FLAG_SILENCE_RESUME } else { 0 };
+                let flags = if packet < 3 {
+                    LIVE_PACKET_FLAG_SILENCE_RESUME
+                } else {
+                    0
+                };
                 core.insert_packet(clock.now(), timestamp, sequence, flags, &payload);
                 for _ in 0..2 {
                     core.get_audio(clock.now(), &mut output);
@@ -1899,8 +1950,16 @@ mod tests {
                 clock.advance_block();
                 timestamp = timestamp.wrapping_add(OUTPUT_SIZE_SAMPLES as u32);
             }
-            assert!(core.diagnostics().target_ms <= 100, "episode {episode}: {:?}", core.diagnostics());
-            assert!(core.diagnostics().playout_delay_ms < 250, "episode {episode}: {:?}", core.diagnostics());
+            assert!(
+                core.diagnostics().target_ms <= 100,
+                "episode {episode}: {:?}",
+                core.diagnostics()
+            );
+            assert!(
+                core.diagnostics().playout_delay_ms < 250,
+                "episode {episode}: {:?}",
+                core.diagnostics()
+            );
         }
     }
 
@@ -2447,5 +2506,253 @@ mod tests {
             expand_after_drop, 0,
             "FEC should conceal the single drop without any expand",
         );
+    }
+
+    /// Continuous sample speech from a live encoder at the stream-start
+    /// (protected) profile; `reset_before` restarts the encoder before that
+    /// packet, as the capture pipeline does on a confirmed capture hole.
+    fn encode_protected_speech(count: usize, reset_before: Option<usize>) -> Vec<Vec<u8>> {
+        use crate::audio::shared::{DredConfig, FRAME_SAMPLES, normalized_to_i16_scale};
+        use crate::audio::test_support::{float_i16_scale_to_i16, sample_speech_frames};
+
+        let mut encoder = OpusVoiceEncoder::new_live(48_000, DredConfig::Auto).unwrap();
+        encoder.set_input_bandwidth(48_000).unwrap();
+        let frames = sample_speech_frames();
+        let mut out = vec![0u8; 4_000];
+        (0..count)
+            .map(|index| {
+                if reset_before == Some(index) {
+                    encoder.reset_state().unwrap();
+                }
+                let mut input = Vec::with_capacity(LIVE_OPUS_FRAME_SAMPLES);
+                while input.len() < LIVE_OPUS_FRAME_SAMPLES {
+                    let frame =
+                        &frames[(40 + index * 2 + input.len() / FRAME_SAMPLES) % frames.len()];
+                    input.extend_from_slice(&normalized_to_i16_scale(frame));
+                }
+                let n = encoder
+                    .encode(&float_i16_scale_to_i16(&input), &mut out)
+                    .unwrap();
+                out[..n].to_vec()
+            })
+            .collect()
+    }
+
+    /// Plays `packets` with a `gap`-sample timestamp jump after packet
+    /// `hole_after` (the wall clock runs over the hole too, as it was real
+    /// time), the post-hole packet flagged `OPUS_RESET` when `reset`. Returns
+    /// the decode source of every block from the post-hole packet on.
+    fn play_through_capture_hole(
+        packets: &[Vec<u8>],
+        hole_after: u32,
+        gap: u32,
+        reset: bool,
+    ) -> Vec<DecodedFrameSource> {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut block = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        let mut clock = WallClock::new();
+        let frame = LIVE_OPUS_FRAME_SAMPLES as u32;
+        let mut sources = Vec::new();
+        for seq in 0..packets.len() as u32 {
+            let after = seq > hole_after;
+            let timestamp = seq * frame + if after { gap } else { 0 };
+            let flags = if reset && seq == hole_after + 1 {
+                LIVE_PACKET_FLAG_OPUS_RESET
+            } else {
+                0
+            };
+            core.insert_packet(clock.now(), timestamp, seq, flags, &packets[seq as usize]);
+            let pulls = if seq == hole_after + 1 {
+                2 + gap / 480
+            } else {
+                2
+            };
+            for _ in 0..pulls {
+                let result = core.get_audio(clock.now(), &mut block);
+                clock.advance_block();
+                if after {
+                    sources.push(result.source);
+                }
+            }
+        }
+        sources
+    }
+
+    #[test]
+    fn capture_hole_after_an_opus_restart_is_concealed() {
+        // The sender restarts its encoder at a confirmed capture hole. Had it
+        // carried on, the post-hole packet's FEC/DRED would describe the audio
+        // just before the jump and land inside the timestamp gap: the hole
+        // would be played as a re-synthesis of speech already heard.
+        const HOLE_AFTER: u32 = 30;
+        const GAP: u32 = 4_800;
+        let count = |sources: &[DecodedFrameSource], kind: DecodedFrameSource| {
+            sources.iter().filter(|source| **source == kind).count()
+        };
+        let restarted = play_through_capture_hole(
+            &encode_protected_speech(60, Some(HOLE_AFTER as usize + 1)),
+            HOLE_AFTER,
+            GAP,
+            true,
+        );
+        assert_eq!(
+            count(&restarted, DecodedFrameSource::Dred)
+                + count(&restarted, DecodedFrameSource::Fec),
+            0
+        );
+        assert!(count(&restarted, DecodedFrameSource::Expand) > 0);
+
+        let continued =
+            play_through_capture_hole(&encode_protected_speech(60, None), HOLE_AFTER, GAP, false);
+        assert!(
+            count(&continued, DecodedFrameSource::Dred)
+                + count(&continued, DecodedFrameSource::Fec)
+                >= 5,
+            "a continuing encoder replays redundancy over the hole"
+        );
+    }
+
+    #[test]
+    fn back_dated_resume_burst_is_not_judged_late() {
+        // Late verdicts feed receiver loss feedback, so a sender's preroll
+        // burst after a gated pause must not read as late packets.
+        let packets = encode_protected_speech(80, None);
+        let frame = LIVE_OPUS_FRAME_SAMPLES as u32;
+        for preroll_packets in [2u32, 15] {
+            let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+            let mut block = vec![0.0; OUTPUT_SIZE_SAMPLES];
+            let mut clock = WallClock::new();
+            let mut seq = 0u32;
+            // 1 s of talk on time, then a 3 s gated pause.
+            for index in 0..50u32 {
+                core.insert_packet(clock.now(), index * frame, seq, 0, &packets[index as usize]);
+                seq += 1;
+                for _ in 0..2 {
+                    core.get_audio(clock.now(), &mut block);
+                    clock.advance_block();
+                }
+            }
+            for _ in 0..300 {
+                core.get_audio(clock.now(), &mut block);
+                clock.advance_block();
+            }
+            let resume_slot = (50 + 150) * frame;
+            let mut late = 0;
+            for k in 0..preroll_packets {
+                let timestamp = resume_slot - (preroll_packets - k) * frame;
+                let mut flags = LIVE_PACKET_FLAG_SILENCE_RESUME;
+                if k == 0 {
+                    flags |= LIVE_PACKET_FLAG_OPUS_RESET;
+                }
+                if core.insert_packet(
+                    clock.now(),
+                    timestamp,
+                    seq,
+                    flags,
+                    &packets[(60 + k) as usize],
+                ) {
+                    late += 1;
+                }
+                seq += 1;
+            }
+            assert_eq!(late, 0, "preroll {preroll_packets} packets");
+        }
+    }
+
+    /// End-to-end latency trace through a talkspurt resume: 1 s talk, a 3 s
+    /// gated pause, then the sender resumes with 2 back-dated preroll packets (shipped 30 ms preroll) and keeps talking for
+    /// `talk_s`. Packets sent before `4000 + stall_ms` are held by the network
+    /// and delivered together at that instant. `flagged(k)` decides which resume
+    /// packets (k = 0 is the oldest preroll packet) carry SILENCE_RESUME.
+    /// Returns (ms since resume, mouth-to-ear latency in ms) every 100 ms.
+    fn resume_latency_trace(
+        hold: bool,
+        stall_ms: u64,
+        talk_s: u64,
+        flagged: impl Fn(u32) -> bool,
+    ) -> Vec<(u64, i64)> {
+        const RESUME_SLOT: u32 = 200;
+        const PREROLL: u32 = 2;
+        let total = RESUME_SLOT + (talk_s as u32) * 50;
+        let packets =
+            encode_protected_speech(total as usize, Some((RESUME_SLOT - PREROLL) as usize));
+        let frame = LIVE_OPUS_FRAME_SAMPLES as u32;
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        core.decision_logic.set_resume_hold(hold);
+        let mut block = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        let mut clock = WallClock::new();
+        // (arrival ms, index)
+        let mut schedule: Vec<(u64, u32)> = Vec::new();
+        for i in 0..50u32 {
+            schedule.push((u64::from(i) * 20, i));
+        }
+        for i in (RESUME_SLOT - PREROLL)..total {
+            let send = (u64::from(i) * 20).max(u64::from(RESUME_SLOT) * 20);
+            let arrive = send.max(u64::from(RESUME_SLOT) * 20 + stall_ms);
+            schedule.push((arrive, i));
+        }
+        let mut next = 0usize;
+        let mut seq = 0u32;
+        let mut trace = Vec::new();
+        let end_ms = (u64::from(total) * 20) + 1000;
+        let mut t = 0u64;
+        while t < end_ms {
+            while next < schedule.len() && schedule[next].0 <= t {
+                let i = schedule[next].1;
+                let mut flags = 0;
+                if i >= RESUME_SLOT - PREROLL {
+                    let k = i - (RESUME_SLOT - PREROLL);
+                    if flagged(k) {
+                        flags |= LIVE_PACKET_FLAG_SILENCE_RESUME;
+                    }
+                    if k == 0 {
+                        flags |= LIVE_PACKET_FLAG_OPUS_RESET;
+                    }
+                }
+                core.insert_packet(clock.now(), i * frame, seq, flags, &packets[i as usize]);
+                seq += 1;
+                next += 1;
+            }
+            core.get_audio(clock.now(), &mut block);
+            clock.advance_block();
+            t += 10;
+            let resume_ms = u64::from(RESUME_SLOT) * 20;
+            if t > resume_ms + stall_ms && t % 100 == 0 && t < u64::from(total) * 20 {
+                let playout = core.diagnostics().playout_media_timestamp;
+                trace.push((t - resume_ms, t as i64 - i64::from(playout / 48)));
+            }
+        }
+        trace
+    }
+
+    fn latency_at(trace: &[(u64, i64)], since_resume_ms: u64) -> i64 {
+        trace
+            .iter()
+            .find(|(t, _)| *t >= since_resume_ms)
+            .map(|(_, latency)| *latency)
+            .unwrap()
+    }
+
+    #[test]
+    fn resume_hold_does_not_keep_an_onset_stall() {
+        // The shipped sender (30 ms preroll) flags max(preroll + 2, 10) = 10
+        // packets. A 400 ms stall at the onset bunches all ten ahead of the
+        // first decision: only the ~50 ms the preroll explains may be held,
+        // the stall is accelerated away as without a hold.
+        let flagged = |k: u32| k < 10;
+        let held = resume_latency_trace(true, 400, 10, flagged);
+        let plain = resume_latency_trace(false, 400, 10, flagged);
+        assert!(latency_at(&held, 2000) <= latency_at(&plain, 2000) + 50);
+        assert!(latency_at(&held, 4000) <= latency_at(&plain, 4000) + 20);
+    }
+
+    #[test]
+    fn resume_hold_is_bounded_when_every_packet_is_flagged() {
+        // A sender with a long preroll (or one flagging everything) cannot
+        // grow the hold past the local preroll either.
+        let held = resume_latency_trace(true, 1500, 10, |_| true);
+        let plain = resume_latency_trace(false, 1500, 10, |_| true);
+        assert!(latency_at(&held, 4000) <= latency_at(&plain, 4000) + 60);
+        assert!(latency_at(&held, 6000) <= latency_at(&plain, 6000) + 20);
     }
 }

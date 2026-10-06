@@ -360,12 +360,16 @@ mod tests {
             let ts = packet * 960 - packet / 10;
             let arrival = (packet as i64 * 2 + 1) * TICK;
             history.insert(ts, 960, arrival);
-            assert!(history.min_arrivals.len() <= history.size(),
-                "minimum queue outlived its history at packet {packet}");
+            assert!(
+                history.min_arrivals.len() <= history.size(),
+                "minimum queue outlived its history at packet {packet}"
+            );
             assert!(history.max_arrivals.len() <= history.size());
             if packet > 200 {
-                assert!(history.delay_ms(ts, arrival) <= 1,
-                    "expired baseline retained clock drift at packet {packet}");
+                assert!(
+                    history.delay_ms(ts, arrival) <= 1,
+                    "expired baseline retained clock drift at packet {packet}"
+                );
             }
         }
     }

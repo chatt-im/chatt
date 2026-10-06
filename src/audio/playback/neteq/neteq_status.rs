@@ -59,4 +59,7 @@ pub(crate) struct ControllerConfig {
     pub min_delay_ms: i32,
     pub base_min_delay_ms: i32,
     pub max_delay_ms: i32,
+    /// Chatt: the most excess delay a talkspurt's resume hold may keep, the
+    /// back-dating a sender's preroll burst can explain.
+    pub resume_hold_max_ms: i32,
 }

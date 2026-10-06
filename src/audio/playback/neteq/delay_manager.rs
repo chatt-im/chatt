@@ -119,5 +119,4 @@ mod tests {
             manager.target_delay_ms()
         );
     }
-
 }

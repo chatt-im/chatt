@@ -95,12 +95,15 @@ impl DenoiseConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Toml)]
 #[toml(FromToml, ToToml, rename_all = "kebab-case")]
 pub enum DredConfig {
-    /// Embed no DRED in outgoing audio.
+    /// Embed no DRED in outgoing audio. In-band FEC still follows the loss
+    /// adaptation: none on a clean link, on while listeners report loss.
     Off,
-    /// Adaptive DRED. Currently identical to [`DredConfig::On`].
+    /// Loss-adaptive redundancy: none while listeners report no loss (the
+    /// whole bitrate goes to the main codec), FEC + DRED as soon as they do.
     #[default]
     Auto,
-    /// Always embed DRED.
+    /// Always embed redundancy: FEC + DRED at least at the 20 % protection
+    /// level even on a clean network (costs quality at every bitrate).
     On,
 }
 
@@ -108,12 +111,23 @@ impl DredConfig {
     /// Settings in cycle order for the settings control.
     pub const ALL: [DredConfig; 3] = [DredConfig::Off, DredConfig::Auto, DredConfig::On];
 
-    /// DRED frame budget in 10 ms units applied to the encoder. `Auto` and `On`
-    /// keep the 100 (1 s) budget, `Off` disables DRED.
+    /// DRED frame budget in 10 ms units applied to the encoder. `Auto` uses
+    /// [`LIVE_DRED_DURATION_10MS`]; `On` keeps the 1 s budget (always-on
+    /// redundancy, unchanged); `Off` disables DRED.
     pub fn dred_duration_10ms(self) -> i32 {
         match self {
             DredConfig::Off => 0,
-            DredConfig::Auto | DredConfig::On => 100,
+            DredConfig::Auto => LIVE_DRED_DURATION_10MS,
+            DredConfig::On => 100,
+        }
+    }
+
+    /// Lowest expected loss the encoder protects against regardless of
+    /// receiver feedback.
+    pub fn min_loss_percent(self) -> i32 {
+        match self {
+            DredConfig::Off | DredConfig::Auto => 0,
+            DredConfig::On => LiveEncoderProfile::PROTECTED.packet_loss_percent,
         }
     }
 
@@ -127,6 +141,21 @@ impl DredConfig {
     }
 }
 
+/// DRED depth (10 ms units) of the loss-adaptive default: 400 ms.
+///
+/// libopus sizes the DRED budget as a share of the bitrate above 20 kb/s,
+/// capped by what the configured duration costs, and quantizes DRED more
+/// finely the higher the bitrate. With the former 1 s budget a protected
+/// 48 kb/s stream carried 200-265 ms of DRED (the share was the limit), while
+/// a 96 kb/s stream carried about 550 ms and left the main codec ~27 kb/s.
+/// The listener's jitter buffer can only use DRED that arrives before its
+/// playout point (40-300 ms on every simulated network tested), and NetEQ
+/// made exactly the same DRED recoveries at 96 kb/s with 200 ms as with
+/// 550 ms. 400 ms is above what any
+/// 48 kb/s stream reached, so low bitrates keep their DRED unchanged, and it
+/// stops high bitrates from spending the rest on depth nobody can play.
+pub const LIVE_DRED_DURATION_10MS: i32 = 40;
+
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 1;
 pub const FRAME_SAMPLES: usize = DenoiseState::FRAME_SIZE;
@@ -139,8 +168,9 @@ pub const DEFAULT_DENOISE_SUPPRESSION: f32 = 1.0;
 /// Default RNNoise release smoothing. `1.0` lets suppression release instantly,
 /// the stock behaviour.
 pub const DEFAULT_DENOISE_RELEASE: f32 = 1.0;
-/// Default post-RNNoise typing/table-thump ducking. Off by default because it is
-/// tuned for desk-mounted microphone setups rather than every capture path.
+/// Default post-RNNoise typing/table-thump ducking. Off by default (also in the
+/// embedded `chatt.toml`): it was tuned for an older RNNoise model, gains
+/// nothing on typing noise with the current one, and cuts off word endings.
 pub const DEFAULT_DENOISE_TYPING_SUPPRESSION: bool = false;
 /// Earshot VAD below this level may engage the typing gate when the acoustic
 /// guards also match.
@@ -234,7 +264,12 @@ pub(crate) const LIVE_PACKET_FLAG_SILENCE_RESUME: u8 = 0x04;
 /// an automatic silence-suppressed pause. The receiver uses this to fade the
 /// tail and to suppress loss concealment without waiting for the control stream.
 pub(crate) const LIVE_PACKET_FLAG_MUTE: u8 = 0x08;
-pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 8;
+/// Capture callback → encoder worker channel depth, in callback chunks (320 ms
+/// at 10 ms periods). The worker drains it immediately in normal operation; the
+/// depth only matters when the worker stalls (CPU contention, page faults).
+/// With 8 chunks a simulated 75-150 ms stall dropped captured speech: PESQ
+/// 3.51 and 176 ms/min of lost speech, against 4.03 and 15 with 16 or 32.
+pub(crate) const CALLBACK_QUEUE_CAPACITY: usize = 32;
 pub(crate) const LIVE_PLAYBACK_COMMAND_CAPACITY: usize = 256;
 pub(crate) const LIVE_NETEQ_START_DELAY: Duration = Duration::from_millis(60);
 pub(crate) const LIVE_NETEQ_MIN_DELAY: Duration = Duration::from_millis(20);
@@ -337,12 +372,23 @@ impl BufferRequest {
     }
 }
 
+/// Loss the encoder protects against, chosen by the sender's loss adaptation
+/// (`client_net::loss_adaptation`) from receiver feedback. The encoder maps it
+/// to in-band FEC, the Opus loss hint and the DRED budget
+/// (`OpusVoiceEncoder::apply_live_encoder_profile`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveEncoderProfile {
     pub packet_loss_percent: i32,
 }
 
 impl LiveEncoderProfile {
+    /// No listener has reported loss recently: no redundancy, the whole
+    /// bitrate goes to the main codec (CELT at high bitrates).
+    pub const CLEAN: Self = Self {
+        packet_loss_percent: 0,
+    };
+    /// Loss seen: in-band FEC (LBRR) plus DRED. The level production used
+    /// unconditionally before loss adaptation.
     pub const DRED_20: Self = Self {
         packet_loss_percent: 20,
     };
@@ -355,9 +401,23 @@ impl LiveEncoderProfile {
     pub const DRED_60: Self = Self {
         packet_loss_percent: 60,
     };
+    /// The first protected level, entered on the first reported loss.
+    pub const PROTECTED: Self = Self::DRED_20;
+    /// Stream start: protected until listeners have reported a short
+    /// loss-free probation (`client_net::loss_adaptation`).
+    pub const INITIAL: Self = Self::PROTECTED;
+    /// Every level, lightest first.
+    pub const LEVELS: [Self; 5] = [
+        Self::CLEAN,
+        Self::DRED_20,
+        Self::DRED_35,
+        Self::DRED_50,
+        Self::DRED_60,
+    ];
 
     pub fn label(self) -> &'static str {
         match self.packet_loss_percent {
+            0 => "clean",
             20 => "dred20",
             35 => "dred35",
             50 => "dred50",
@@ -840,6 +900,9 @@ pub struct LivePlaybackStreamActivity {
 pub struct LivePlaybackSnapshot {
     /// Worst receive-to-decoder handoff age over this playback instance.
     pub receive_queue_max_us: u64,
+    /// Packets dropped because the decode worker's input queue was full
+    /// ([`LIVE_PLAYBACK_COMMAND_CAPACITY`]; a stalled decode worker).
+    pub input_queue_drops: u64,
     pub active_streams: usize,
     pub stream_activity: Vec<LivePlaybackStreamActivity>,
     /// Mixed-but-unplayed samples staged after NetEQ: the device mix-adapter

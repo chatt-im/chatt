@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         mpsc::TrySendError,
         mpsc::{Receiver, Sender, SyncSender, sync_channel},
     },
@@ -20,6 +20,7 @@ use crate::{
     audio::{
         AudioReportHub,
         backend::with_audio_backend_stderr_suppressed,
+        callback::prefill_recycle_pool,
         capture::{
             EchoCancellationControl, EchoReferenceSource, OpusVoiceEncoder, run_encoder_worker,
             run_live_encoder_worker,
@@ -204,6 +205,9 @@ pub struct LivePlayback {
     worker: Option<JoinHandle<()>>,
     sender: Option<SyncSender<LivePlaybackCommand>>,
     shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
+    /// Packets the sinks dropped because the decode worker's input queue
+    /// was full.
+    input_queue_drops: Arc<AtomicU64>,
     /// See [`LiveCapture::buffer_fallback`].
     buffer_fallback: bool,
     /// Resolved backend, device, and buffer the playback stream opened.
@@ -214,6 +218,8 @@ pub struct LivePlayback {
 #[derive(Clone, Debug)]
 pub struct LivePlaybackSink {
     sender: SyncSender<LivePlaybackCommand>,
+    /// Shared with [`LivePlayback`]: packets dropped on a full queue.
+    input_queue_drops: Arc<AtomicU64>,
 }
 
 pub(crate) enum LivePlaybackCommand {
@@ -313,6 +319,7 @@ impl LivePlayback {
     pub fn sink(&self) -> Option<LivePlaybackSink> {
         self.sender.as_ref().map(|sender| LivePlaybackSink {
             sender: sender.clone(),
+            input_queue_drops: Arc::clone(&self.input_queue_drops),
         })
     }
 
@@ -379,7 +386,9 @@ impl LivePlayback {
     }
 
     pub fn stats(&self) -> LivePlaybackSnapshot {
-        self.shared_snapshot.snapshot()
+        let mut snapshot = self.shared_snapshot.snapshot();
+        snapshot.input_queue_drops = self.input_queue_drops.load(Ordering::Relaxed);
+        snapshot
     }
 
     pub fn worker_finished(&self) -> bool {
@@ -417,9 +426,20 @@ impl LivePlaybackSink {
 
     pub(crate) fn try_push(&self, packet: RemoteVoicePacket) -> bool {
         match self.sender.try_send(LivePlaybackCommand::Packet(packet)) {
-            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                // The decode worker is stalled past the queue depth; the
+                // packet is lost (NetEQ conceals it). Counted for the report.
+                self.input_queue_drops.fetch_add(1, Ordering::Relaxed);
+                true
+            }
             Err(TrySendError::Disconnected(_)) => false,
         }
+    }
+
+    /// Packets dropped so far because the decode worker's queue was full.
+    pub fn input_queue_drops(&self) -> u64 {
+        self.input_queue_drops.load(Ordering::Relaxed)
     }
 
     /// Constructs a sink whose receiver is immediately dropped, for tests in
@@ -427,7 +447,10 @@ impl LivePlaybackSink {
     #[doc(hidden)]
     pub fn for_test() -> Self {
         let (sender, _receiver) = sync_channel(1);
-        Self { sender }
+        Self {
+            sender,
+            input_queue_drops: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
 
@@ -509,6 +532,7 @@ pub fn start_recording(config: RecordingConfig) -> Result<Recording, String> {
     let stats = AudioStats::new();
     let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
     let (recycle_tx, recycle_rx) = sync_channel(CALLBACK_QUEUE_CAPACITY);
+    prefill_recycle_pool(&recycle_tx, selection.device_rate);
     let worker_stats = stats.clone();
     let worker = thread::Builder::new()
         .name("chatt-audio-record-enc".to_string())
@@ -714,18 +738,12 @@ where
     })?;
 
     let device_name = device.to_string();
-    let mut encoder =
-        OpusVoiceEncoder::new(config.bitrate_bps).map_err(AudioStartError::transient)?;
-    encoder
-        .set_configured_dred_10ms(config.dred.dred_duration_10ms())
-        .map_err(AudioStartError::transient)?;
-    encoder
-        .apply_live_encoder_profile(LiveEncoderProfile::DRED_20)
+    let encoder = OpusVoiceEncoder::new_live(config.bitrate_bps, config.dred)
         .map_err(AudioStartError::transient)?;
     let stats = AudioStats::new();
     let max_amplification_bits = Arc::new(AtomicU32::new(config.max_amplification.to_bits()));
     let encoder_loss_percent = Arc::new(AtomicU32::new(
-        LiveEncoderProfile::DRED_20.packet_loss_percent as u32,
+        LiveEncoderProfile::INITIAL.packet_loss_percent as u32,
     ));
 
     // The channel and worker are created only after a stream builds, so each rung
@@ -737,6 +755,7 @@ where
     > {
         let (sender, receiver) = sync_channel(CALLBACK_QUEUE_CAPACITY);
         let (recycle_tx, recycle_rx) = sync_channel(CALLBACK_QUEUE_CAPACITY);
+        prefill_recycle_pool(&recycle_tx, selection.device_rate);
         let stream = with_audio_backend_stderr_suppressed(|| {
             let audio_report = config.audio_report.device_tap(
                 crate::audio::AudioReportDeviceDirection::Capture,
@@ -1031,6 +1050,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
         worker: Some(worker),
         sender: Some(sender),
         shared_snapshot,
+        input_queue_drops: Arc::new(AtomicU64::new(0)),
         buffer_fallback,
         device_info,
         playback_recording,
@@ -1172,6 +1192,7 @@ mod tests {
         let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
         let _sink = LivePlaybackSink {
             sender: sender.clone(),
+            input_queue_drops: Arc::default(),
         };
         let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
             LIVE_PLAYBACK_COMMAND_CAPACITY,
@@ -1198,11 +1219,46 @@ mod tests {
     }
 
     #[test]
+    fn full_decoder_input_queue_counts_dropped_packets() {
+        let (sender, receiver) = sync_channel(2);
+        let sink = LivePlaybackSink {
+            sender,
+            input_queue_drops: Arc::default(),
+        };
+        let packet = |sequence| RemoteVoicePacket {
+            stream_id: 1,
+            sequence,
+            timestamp: sequence * 960,
+            flags: 0,
+            payload: crate::audio::shared::VoicePayload::Opus(vec![1]),
+            received_at: Instant::now(),
+        };
+        for sequence in 0..5 {
+            assert!(
+                sink.try_push(packet(sequence)),
+                "a full queue is not a closed sink"
+            );
+        }
+        assert_eq!(sink.input_queue_drops(), 3);
+        assert_eq!(
+            sink.clone().input_queue_drops(),
+            3,
+            "clones share the counter"
+        );
+        drop(receiver);
+        assert!(!sink.try_push(packet(5)));
+        assert_eq!(sink.input_queue_drops(), 3, "a closed sink is not a drop");
+    }
+
+    #[test]
     fn loopback_tap_emits_incrementing_sequence_on_loopback_stream() {
         use crate::audio::shared::{LOOPBACK_STREAM_ID, LoopbackTap, VoicePayload};
 
         let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
-        let sink = LivePlaybackSink { sender };
+        let sink = LivePlaybackSink {
+            sender,
+            input_queue_drops: Arc::default(),
+        };
         let tap = LoopbackTap::default();
 
         let frame = |timestamp| LocalVoiceFrame {

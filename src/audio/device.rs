@@ -2035,6 +2035,9 @@ fn live_playback_callback<T>(
     f32: FromSample<T>,
 {
     mixer.begin_output_callback_with_timing(callback_timing);
+    // The master volume is applied inside the mix, ahead of the limiter, so a
+    // volume above 100 % is limited rather than hard-clipped below.
+    mixer.set_output_gain(output_gain);
     let output_frames = channels.frames_for_interleaved(output.len());
     mix_adapter.begin_callback();
     let mut echo_writer = match echo_control {
@@ -2042,8 +2045,8 @@ fn live_playback_callback<T>(
         _ => None,
     };
     match resampler.as_mut() {
-        // Non-48 kHz device: pull 48 kHz blocks from the mixer, apply global
-        // output gain, then resample each to the device rate. The echo reference
+        // Non-48 kHz device: pull 48 kHz blocks from the mixer (master gain
+        // already applied), then resample each to the device rate. The echo reference
         // still receives 48 kHz samples, so AEC keeps working against a 48 kHz
         // render signal.
         Some(resampler) => {
@@ -2061,7 +2064,6 @@ fn live_playback_callback<T>(
                         .try_into()
                         .expect("playback resampler source block must be one mixer frame");
                     mixer.mix_10ms(block_start, block);
-                    apply_output_gain(block, output_gain);
                     for &mixed in block.iter() {
                         if let Some(writer) = echo_writer.as_mut() {
                             writer.push(mixed);
@@ -2091,7 +2093,7 @@ fn live_playback_callback<T>(
                 playback_record_block.clear();
             }
             for (index, frame) in output.chunks_mut(channels.get()).enumerate() {
-                let sample = mix_adapter.next_sample(mixer, now) * output_gain;
+                let sample = mix_adapter.next_sample(mixer, now);
                 if let Some(writer) = echo_writer.as_mut() {
                     writer.push(sample);
                 }
@@ -2115,15 +2117,6 @@ fn live_playback_callback<T>(
         writer.commit();
     }
     mixer.note_staged_samples(mix_adapter.staged_samples());
-}
-
-fn apply_output_gain(samples: &mut [f32], gain: f32) {
-    if (gain - 1.0).abs() < f32::EPSILON {
-        return;
-    }
-    for sample in samples {
-        *sample *= gain;
-    }
 }
 
 #[cfg(test)]

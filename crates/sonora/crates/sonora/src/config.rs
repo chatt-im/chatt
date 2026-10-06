@@ -262,7 +262,17 @@ pub struct AdaptiveDigital {
     pub max_gain_change_db_per_second: f32,
     /// Maximum output noise level in dBFS (default: -50.0).
     pub max_output_noise_level_dbfs: f32,
+    /// Fast first convergence (default: false, WebRTC behaviour). Until the
+    /// gain first reaches its target, it may rise on every confident speech
+    /// frame (no adjacent-speech-frame wait) at
+    /// [`FAST_INITIAL_CONVERGENCE_DB_PER_SECOND`]. Lets a low `initial_gain_db`
+    /// reach a quiet talker's gain within about a second of speech instead of
+    /// boosting every talker before their level is known.
+    pub fast_initial_convergence: bool,
 }
+
+/// Gain-increase rate during [`AdaptiveDigital::fast_initial_convergence`].
+pub use sonora_agc2::adaptive_digital_gain_controller::FAST_INITIAL_CONVERGENCE_DB_PER_SECOND;
 
 impl Default for AdaptiveDigital {
     fn default() -> Self {
@@ -272,6 +282,7 @@ impl Default for AdaptiveDigital {
             initial_gain_db: 15.0,
             max_gain_change_db_per_second: 6.0,
             max_output_noise_level_dbfs: -50.0,
+            fast_initial_convergence: false,
         }
     }
 }

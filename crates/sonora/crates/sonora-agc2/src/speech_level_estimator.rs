@@ -24,6 +24,10 @@ pub struct AdaptiveDigitalConfig {
     pub initial_gain_db: f32,
     pub max_gain_change_db_per_second: f32,
     pub max_output_noise_level_dbfs: f32,
+    /// See `AdaptiveDigitalGainController`: until the gain first reaches its
+    /// target, raise it on every confident speech frame at
+    /// `FAST_INITIAL_CONVERGENCE_DB_PER_SECOND`.
+    pub fast_initial_convergence: bool,
 }
 
 impl Default for AdaptiveDigitalConfig {
@@ -34,6 +38,7 @@ impl Default for AdaptiveDigitalConfig {
             initial_gain_db: 15.0,
             max_gain_change_db_per_second: 6.0,
             max_output_noise_level_dbfs: -50.0,
+            fast_initial_convergence: false,
         }
     }
 }

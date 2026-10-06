@@ -31,6 +31,12 @@ pub(crate) struct FrameCombiner {
     limiter: Limiter,
     mixing_buffer: [f32; MIX_FRAME_SAMPLES],
     use_limiter: bool,
+    /// Master output gain, applied to the mix *before* the limiter so a
+    /// volume above 100 % is limited instead of hard-clipped by the device.
+    output_gain: f32,
+    /// The limiter processed the previous frame. Its envelope is only
+    /// current while it runs, so it restarts fresh after being skipped.
+    limiter_active: bool,
 }
 
 impl Default for FrameCombiner {
@@ -45,7 +51,16 @@ impl FrameCombiner {
             limiter: Limiter::new(MIX_FRAME_SAMPLES),
             mixing_buffer: [0.0; MIX_FRAME_SAMPLES],
             use_limiter,
+            output_gain: 1.0,
+            limiter_active: false,
         }
+    }
+
+    /// Sets the master output gain for the following frames. Above unity the
+    /// limiter runs even for a single stream, since the gain can push it past
+    /// full scale.
+    pub(crate) fn set_output_gain(&mut self, gain: f32) {
+        self.output_gain = if gain.is_finite() { gain.max(0.0) } else { 1.0 };
     }
 
     #[cfg(test)]
@@ -79,8 +94,15 @@ impl FrameCombiner {
     ) where
         I: IntoIterator<Item = &'a [f32; MIX_FRAME_SAMPLES]>,
     {
-        if number_of_streams <= 1 {
+        let boost = self.output_gain > 1.0;
+        if number_of_streams <= 1 && !boost {
+            self.limiter_active = false;
             self.mix_few_frames_with_no_limiter(normal_frames, out);
+            if self.output_gain != 1.0 {
+                for sample in out.iter_mut() {
+                    *sample *= self.output_gain;
+                }
+            }
             return;
         }
 
@@ -90,9 +112,24 @@ impl FrameCombiner {
                 *mixed += normalized_to_float_s16(sample);
             }
         }
+        if self.output_gain != 1.0 {
+            for mixed in self.mixing_buffer.iter_mut() {
+                *mixed *= self.output_gain;
+            }
+        }
 
-        if self.use_limiter {
+        if self.use_limiter || boost {
+            if !self.limiter_active {
+                // Start fresh, not from the envelope and gain left from
+                // whenever it last ran (e.g. the volume was just raised above
+                // 100 % for a single stream). `Limiter::reset` keeps the last
+                // gain; a new limiter is all inline arrays, no allocation.
+                self.limiter = Limiter::new(MIX_FRAME_SAMPLES);
+                self.limiter_active = true;
+            }
             self.limiter.process_mono(&mut self.mixing_buffer);
+        } else {
+            self.limiter_active = false;
         }
 
         for (dst, &sample) in out.iter_mut().zip(self.mixing_buffer.iter()) {
@@ -268,6 +305,58 @@ mod tests {
     }
 
     #[test]
+    fn output_gain_above_unity_is_limited_instead_of_clipped() {
+        // A near-full-scale single stream at 130 % volume (x2.197): the gain
+        // runs ahead of the limiter, so the output stays inside full scale
+        // without the flat-topped runs a hard clip would produce.
+        let mut combiner = FrameCombiner::new(true);
+        combiner.set_output_gain(2.197);
+        let mut out = [0.0; MIX_FRAME_SAMPLES];
+        let mut flat_run = 0usize;
+        let mut longest_flat_run = 0usize;
+        let mut peak = 0.0f32;
+        for block in 0..50 {
+            let frame: [f32; MIX_FRAME_SAMPLES] = std::array::from_fn(|n| {
+                let t = (block * MIX_FRAME_SAMPLES + n) as f32 / SAMPLE_RATE as f32;
+                (t * 220.0 * std::f32::consts::TAU).sin() * 0.9
+            });
+            combiner.combine(&[MixerFrameRef::new(&frame)], 1, &mut out);
+            if block < 10 {
+                continue; // limiter attack
+            }
+            for &sample in &out {
+                peak = peak.max(sample.abs());
+                flat_run = if sample.abs() >= 0.999 {
+                    flat_run + 1
+                } else {
+                    0
+                };
+                longest_flat_run = longest_flat_run.max(flat_run);
+            }
+        }
+        assert!(peak <= 1.0, "peak {peak}");
+        assert!(
+            longest_flat_run < 8,
+            "clipped run of {longest_flat_run} samples"
+        );
+    }
+
+    #[test]
+    fn output_gain_at_or_below_unity_scales_a_single_stream() {
+        let mut combiner = FrameCombiner::new(true);
+        let frame: [f32; MIX_FRAME_SAMPLES] =
+            std::array::from_fn(|n| (n as f32 * 0.01).sin() * 0.5);
+        let mut unity = [0.0; MIX_FRAME_SAMPLES];
+        combiner.combine(&[MixerFrameRef::new(&frame)], 1, &mut unity);
+        combiner.set_output_gain(0.5);
+        let mut half = [0.0; MIX_FRAME_SAMPLES];
+        combiner.combine(&[MixerFrameRef::new(&frame)], 1, &mut half);
+        for (a, b) in unity.iter().zip(half.iter()) {
+            assert!((a * 0.5 - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn limiter_state_is_continuous_across_10ms_frames() {
         let mut combiner = FrameCombiner::new(true);
         let hot = [0.95; MIX_FRAME_SAMPLES];
@@ -288,5 +377,31 @@ mod tests {
             "previous hot frame should carry limiter state into the next 10 ms frame"
         );
         assert!(persistent_out.iter().all(|&sample| sample <= 1.0));
+    }
+
+    #[test]
+    fn boost_limiter_starts_fresh_after_being_skipped() {
+        let loud = [0.9f32; MIX_FRAME_SAMPLES];
+        let quiet = [0.2f32; MIX_FRAME_SAMPLES];
+        let mut combiner = FrameCombiner::new(false);
+        let mut out = [0.0; MIX_FRAME_SAMPLES];
+        // Boosted loud audio drives the limiter's envelope up...
+        combiner.set_output_gain(2.0);
+        for _ in 0..10 {
+            combiner.combine(&[MixerFrameRef::new(&loud)], 1, &mut out);
+        }
+        // ...then a while at unity, where the limiter is skipped...
+        combiner.set_output_gain(1.0);
+        for _ in 0..100 {
+            combiner.combine(&[MixerFrameRef::new(&quiet)], 1, &mut out);
+        }
+        // ...so boosting quiet audio again must behave like a fresh start.
+        combiner.set_output_gain(2.0);
+        combiner.combine(&[MixerFrameRef::new(&quiet)], 1, &mut out);
+        let mut fresh = FrameCombiner::new(false);
+        fresh.set_output_gain(2.0);
+        let mut expected = [0.0; MIX_FRAME_SAMPLES];
+        fresh.combine(&[MixerFrameRef::new(&quiet)], 1, &mut expected);
+        assert_eq!(out, expected);
     }
 }

@@ -29,6 +29,9 @@ const TARGET_LEVEL_WINDOW_MS: i32 = 100;
 const DELAY_ADJUSTMENT_GRANULARITY_MS: i64 = 20;
 const PACKET_HISTORY_SIZE_MS: i32 = 2000;
 const EXPAND_MUTE_FACTOR_HALF: i16 = 16384 / 2;
+/// How fast a talkspurt's resume hold decays (ms of allowance per second), so
+/// a long talkspurt still sheds the burst's excess, gently.
+const RESUME_HOLD_DECAY_MS_PER_S: u64 = 20;
 
 /// The NetEQ decision tree.
 #[derive(Debug)]
@@ -47,6 +50,20 @@ pub(crate) struct DecisionLogic {
     timescale_countdown: Countdown,
     time_stretched_cn_samples: i32,
     buffer_flush: bool,
+    /// Chatt: talkspurts that start from the sender's back-dated preroll burst
+    /// keep the burst's excess delay instead of time-compressing the onset
+    /// (see [`Self::note_talkspurt_resume`]).
+    resume_hold_enabled: bool,
+    resume_pending: bool,
+    /// Timestamp span of the pending resume burst so far, the most excess
+    /// delay its back-dating can explain.
+    resume_span_samples: usize,
+    resume_hold_ms: i64,
+    resume_hold_since: Option<super::tick_timer::Stopwatch>,
+    /// Upper bound of the resume hold: the back-dating the preroll explains.
+    /// The flagged span alone is no bound, since a network stall at the onset
+    /// bunches every flagged packet ahead of the first decision.
+    resume_hold_max_ms: i64,
 }
 
 impl DecisionLogic {
@@ -70,7 +87,66 @@ impl DecisionLogic {
             timescale_countdown: tick_timer.new_countdown(MIN_TIMESCALE_INTERVAL + 1),
             time_stretched_cn_samples: 0,
             buffer_flush: false,
+            resume_hold_enabled: true,
+            resume_pending: false,
+            resume_span_samples: 0,
+            resume_hold_ms: 0,
+            resume_hold_since: None,
+            resume_hold_max_ms: i64::from(config.resume_hold_max_ms.max(0)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resume_hold(&mut self, enabled: bool) {
+        self.resume_hold_enabled = enabled;
+        if !enabled {
+            self.resume_pending = false;
+            self.resume_hold_ms = 0;
+        }
+    }
+
+    /// The sender resumed from a gated pause: its first packets are a burst
+    /// of preroll back-dated by up to the preroll length, which starts the
+    /// talkspurt that much deeper than the target. WebRTC has no such burst
+    /// (DTX packets are never back-dated), so its controller sees plain excess
+    /// delay and accelerates, at 4x the high limit with `FastAccelerate`: it
+    /// time-compresses the word onset. Instead, the first in-talkspurt
+    /// decision records the excess as an allowance on the accelerate limit,
+    /// up to the burst's span ([`Self::extend_resume_span`]) and never more
+    /// than the preroll explains (`ControllerConfig::resume_hold_max_ms`):
+    /// excess beyond the back-dating (network bunching, a stall at the onset)
+    /// is accelerated away as usual. The allowance decays slowly and is
+    /// dropped when the talkspurt ends (no packet), so the excess drains in
+    /// the next pause, where removing it is free.
+    pub(crate) fn note_talkspurt_resume(&mut self) {
+        if self.resume_hold_enabled {
+            self.resume_pending = true;
+            self.resume_span_samples = 0;
+        }
+    }
+
+    /// The pending resume burst covers `span_samples` from its first packet's
+    /// timestamp so far.
+    pub(crate) fn extend_resume_span(&mut self, span_samples: usize) {
+        if self.resume_pending {
+            self.resume_span_samples = self.resume_span_samples.max(span_samples);
+        }
+    }
+
+    fn resume_hold_ms(&self, tick_timer: &TickTimer) -> i64 {
+        let elapsed = self
+            .resume_hold_since
+            .as_ref()
+            .map_or(0, |watch| watch.elapsed_ms(tick_timer));
+        (self.resume_hold_ms - (elapsed * RESUME_HOLD_DECAY_MS_PER_S / 1000) as i64).max(0)
+    }
+
+    /// Drops any pending or active resume hold (a hard stream restart).
+    pub(crate) fn clear_resume_hold(&mut self) {
+        self.resume_pending = false;
+        self.resume_span_samples = 0;
+        self.resume_hold_ms = 0;
+        self.resume_hold_since = None;
     }
 
     pub(crate) fn soft_reset(&mut self, tick_timer: &TickTimer) {
@@ -120,6 +196,10 @@ impl DecisionLogic {
         }
 
         if status.next_packet.is_none() {
+            // The talkspurt ended (or the buffer ran dry): any resume
+            // allowance has served its purpose, and a resume that never
+            // reached an eligible decision must not arm later on.
+            self.clear_resume_hold();
             return self.no_packet(status);
         }
 
@@ -272,7 +352,7 @@ impl DecisionLogic {
     }
 
     fn expected_packet_available(
-        &self,
+        &mut self,
         status: &NetEqStatus,
         tick_timer: &TickTimer,
         now_samples: i64,
@@ -280,9 +360,20 @@ impl DecisionLogic {
         if !self.disallow_time_stretching && status.last_mode != Mode::Expand && !status.play_dtmf {
             let playout_delay_ms = self.playout_delay_ms(status, now_samples) as i64;
             let low_limit = self.target_level_ms() as i64;
-            let high_limit = low_limit
+            let mut high_limit = low_limit
                 + self.packet_arrival_history.max_delay_ms() as i64
                 + DELAY_ADJUSTMENT_GRANULARITY_MS;
+            if self.resume_pending {
+                // Against the base limit: the arrival-history term is transient
+                // (2 s window) and would hand the excess back to accelerate
+                // mid-talkspurt when it ages out.
+                self.resume_pending = false;
+                let span_ms = (self.resume_span_samples / self.sample_rate_khz as usize) as i64;
+                let cap = span_ms.min(self.resume_hold_max_ms);
+                self.resume_hold_ms = (playout_delay_ms - low_limit).clamp(0, cap);
+                self.resume_hold_since = Some(tick_timer.new_stopwatch());
+            }
+            high_limit += self.resume_hold_ms(tick_timer);
             if playout_delay_ms >= high_limit * 4 {
                 return Operation::FastAccelerate;
             }
@@ -387,6 +478,7 @@ mod tests {
             min_delay_ms: 20,
             base_min_delay_ms: 0,
             max_delay_ms: 1_000,
+            resume_hold_max_ms: 1_000,
         }
     }
 
@@ -482,13 +574,22 @@ mod tests {
     fn delayed_forward_packet_keeps_network_delay_evidence() {
         let mut timer = TickTimer::new();
         let mut logic = logic(&timer);
-        assert_eq!(logic.packet_arrived(48000, true, &info(0, 0), &timer, 0), None);
+        assert_eq!(
+            logic.packet_arrived(48000, true, &info(0, 0), &timer, 0),
+            None
+        );
         timer.increment_by(2);
-        assert_eq!(logic.packet_arrived(48000, true, &info(960, 1), &timer, now_samples(&timer)), Some(0));
+        assert_eq!(
+            logic.packet_arrived(48000, true, &info(960, 1), &timer, now_samples(&timer)),
+            Some(0)
+        );
         // A receive gap cannot distinguish a source restart from queued speech.
         // The C++ reference retains the measured 1000 ms network delay.
         timer.increment_by(102);
-        assert_eq!(logic.packet_arrived(48000, true, &info(1920, 2), &timer, now_samples(&timer)), Some(1000));
+        assert_eq!(
+            logic.packet_arrived(48000, true, &info(1920, 2), &timer, now_samples(&timer)),
+            Some(1000)
+        );
     }
 
     #[test]
@@ -497,7 +598,10 @@ mod tests {
         let mut logic = logic(&timer);
         logic.packet_arrived(48000, true, &info(0, 0), &timer, 0);
         timer.increment_by(2);
-        let recovery = PacketArrivedInfo { packet_length_samples: 480, ..info(960, 1) };
+        let recovery = PacketArrivedInfo {
+            packet_length_samples: 480,
+            ..info(960, 1)
+        };
         logic.packet_arrived(48000, true, &recovery, &timer, now_samples(&timer));
         timer.increment_by(2);
         logic.packet_arrived(48000, true, &info(1920, 2), &timer, now_samples(&timer));
@@ -505,7 +609,10 @@ mod tests {
         timer.increment_by(20);
         // The 10 ms recovered unit must not hide this late 20 ms primary.
         // The actual C++ oracle returns 220 ms for this arrival.
-        assert_eq!(logic.packet_arrived(48000, true, &info(960, 1), &timer, now_samples(&timer)), Some(220));
+        assert_eq!(
+            logic.packet_arrived(48000, true, &info(960, 1), &timer, now_samples(&timer)),
+            Some(220)
+        );
         assert!(logic.target_level_ms() > before);
     }
 
@@ -563,6 +670,142 @@ mod tests {
         st.packet_buffer_info.span_samples_wait_time = 0;
         let op = logic.get_decision(&st, &timer, now_samples(&timer));
         assert_eq!(op, Operation::Expand);
+    }
+
+    /// On-time talkspurt, a 3 s pause, then a talkspurt whose playout starts
+    /// `excess_ms` behind the newest arrival. `burst_ms` is the span of the
+    /// sender's resume burst (`None`: no resume noted). Returns the decisions.
+    fn decide_after_resume(hold: bool, burst_ms: Option<usize>, excess_ms: i64) -> Vec<Operation> {
+        decide_after_resume_capped(hold, burst_ms, excess_ms, config().resume_hold_max_ms)
+    }
+
+    /// [`decide_after_resume`] with the hold capped at `cap_ms`.
+    fn decide_after_resume_capped(
+        hold: bool,
+        burst_ms: Option<usize>,
+        excess_ms: i64,
+        cap_ms: i32,
+    ) -> Vec<Operation> {
+        {
+            let mut timer = TickTimer::new();
+            let mut logic = DecisionLogic::new(
+                ControllerConfig {
+                    resume_hold_max_ms: cap_ms,
+                    ..config()
+                },
+                &timer,
+            );
+            logic.set_sample_rate(48000, 480);
+            logic.set_resume_hold(hold);
+            for seq in 0..50u32 {
+                let info = PacketArrivedInfo {
+                    packet_length_samples: 960,
+                    main_timestamp: seq * 960,
+                    is_cng_or_dtmf: false,
+                    buffer_flush: false,
+                };
+                logic.packet_arrived(48000, true, &info, &timer, now_samples(&timer));
+                timer.increment_by(2);
+            }
+            let mut idle = status(None, Mode::Expand);
+            for _ in 0..300 {
+                logic.get_decision(&idle, &timer, now_samples(&timer));
+                timer.increment();
+                idle.target_timestamp += 480;
+            }
+            if let Some(burst_ms) = burst_ms {
+                logic.note_talkspurt_resume();
+                logic.extend_resume_span(burst_ms * 48);
+            }
+            let resume_ts = (now_samples(&timer) - excess_ms * 48) as u32;
+            let mut ops = Vec::new();
+            for block in 0..100u32 {
+                let ts = resume_ts + block * 480;
+                let mut st = status(
+                    Some(PacketInfo {
+                        timestamp: ts,
+                        is_cng: false,
+                    }),
+                    if block == 0 {
+                        Mode::Merge
+                    } else {
+                        Mode::Normal
+                    },
+                );
+                st.target_timestamp = ts;
+                ops.push(logic.get_decision(&st, &timer, now_samples(&timer)));
+                timer.increment();
+            }
+            ops
+        }
+    }
+
+    fn stretched(ops: &[Operation]) -> usize {
+        ops.iter()
+            .filter(|op| matches!(op, Operation::Accelerate | Operation::FastAccelerate))
+            .count()
+    }
+
+    #[test]
+    fn resume_burst_holds_its_excess_instead_of_accelerating() {
+        // The sender's preroll burst back-dates playout by 300 ms.
+        assert!(
+            stretched(&decide_after_resume(false, Some(300), 300)) > 0,
+            "without the hold the onset is compressed"
+        );
+        assert!(
+            stretched(&decide_after_resume(true, None, 300)) > 0,
+            "the hold needs a resume to arm"
+        );
+        assert_eq!(
+            stretched(&decide_after_resume(true, Some(300), 300)),
+            0,
+            "the resume excess is held"
+        );
+    }
+
+    #[test]
+    fn resume_hold_is_capped_by_the_preroll() {
+        // A 300 ms flagged span with a 50 ms cap (shipped preroll plus a
+        // frame): the excess beyond the cap is accelerated away.
+        let capped = decide_after_resume_capped(true, Some(300), 300, 50);
+        let plain = decide_after_resume(true, None, 300);
+        assert!(stretched(&capped) > 0, "excess beyond the cap is drained");
+        assert!(
+            stretched(&capped) + 2 >= stretched(&plain),
+            "capped {} vs plain {}",
+            stretched(&capped),
+            stretched(&plain)
+        );
+    }
+
+    #[test]
+    fn resume_hold_covers_only_the_burst_span() {
+        // A 40 ms resume burst lands on 800 ms of network bunching: only the
+        // burst's back-dating is held, the bunching is accelerated as it
+        // would be without a resume.
+        let held = decide_after_resume(true, Some(40), 800);
+        let plain = decide_after_resume(true, None, 800);
+        assert!(stretched(&held) > 0, "bunching beyond the burst is drained");
+        assert!(
+            stretched(&held) + 2 >= stretched(&plain),
+            "held {} vs plain {}",
+            stretched(&held),
+            stretched(&plain)
+        );
+    }
+
+    #[test]
+    fn resume_without_a_decision_does_not_arm_the_next_talkspurt() {
+        let timer = TickTimer::new();
+        let mut logic = logic(&timer);
+        logic.note_talkspurt_resume();
+        logic.extend_resume_span(300 * 48);
+        // The buffer runs dry before any eligible decision.
+        logic.get_decision(&status(None, Mode::Expand), &timer, now_samples(&timer));
+        assert!(!logic.resume_pending);
+        logic.extend_resume_span(300 * 48);
+        assert_eq!(logic.resume_span_samples, 0);
     }
 
     #[test]

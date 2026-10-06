@@ -44,25 +44,28 @@ use std::{
 
 use crate::{
     app::NetworkEventSender,
-    audio::{LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame},
+    audio::{
+        LIVE_PLAYBACK_FEEDBACK_INTERVAL, LivePlaybackFeedback, LivePlaybackSink, LocalVoiceFrame,
+    },
     config::{CandidatePrivacy, MediaTransportSetting},
     mdns::MdnsSystem,
 };
 
 use super::{
-    DIRECT_CONFIRM_WINDOW, DIRECT_FAILOVER_IDLE, ENCODER_FEEDBACK_ALPHA, ENCODER_PROFILE_HOLD,
-    INTERFACE_POLL_INTERVAL, MAX_RECENT_VOICE_SEQUENCES, MediaTransportState, NetworkCommand,
-    NetworkEvent, P2P_CONSENT_TIMEOUT, P2P_KEEPALIVE_INTERVAL, RECENT_VOICE_SEQUENCE_WORD_BITS,
-    RECENT_VOICE_SEQUENCE_WORDS, RELAY_KEEPALIVE_INTERVAL, RTT_PROBE_INTERVAL, RestartPortPolicy,
-    UDP_BIND_FAILURE_ATTEMPTS, UDP_BIND_RETRY_INTERVAL, advance_local_voice_sequence_past,
-    allocate_local_voice_sequence, apply_candidate_privacy, audio_payload_from_media,
-    candidate_from_control, candidate_from_control_with_addr, clamp_rtt_ms, combined_relay_rtt,
-    configured_nat_kind, connection_id_from_p2p_username, control_nat_kind,
-    dispatch_voice_packet_to, fold_rtt_ewma, ice_role_from_control, key_from_control,
-    live_feedback_from_media, log_audio_pop_media_packet, media_feedback_from_live,
-    media_payload_from_audio, media_payload_kind, media_voice_payload_kind, nat_from_control,
-    p2p_peer_is_republish, p2p_username, push_rtt_in_flight, random_u64, rtt_sample_is_stale,
-    split_mdns_addr, take_rtt_sample, voice_payload_kind,
+    DIRECT_CONFIRM_WINDOW, DIRECT_FAILOVER_IDLE, DIRECT_SUSPECT_ARM, DIRECT_SUSPECT_IDLE,
+    EncoderFeedbackController, INTERFACE_POLL_INTERVAL, MAX_RECENT_VOICE_SEQUENCES,
+    MediaTransportState, NetworkCommand, NetworkEvent, P2P_CONSENT_TIMEOUT, P2P_KEEPALIVE_INTERVAL,
+    RECENT_VOICE_SEQUENCE_WORD_BITS, RECENT_VOICE_SEQUENCE_WORDS, RELAY_KEEPALIVE_INTERVAL,
+    RTT_PROBE_INTERVAL, RestartPortPolicy, UDP_BIND_FAILURE_ATTEMPTS, UDP_BIND_RETRY_INTERVAL,
+    advance_local_voice_sequence_past, allocate_local_voice_sequence, apply_candidate_privacy,
+    audio_payload_from_media, candidate_from_control, candidate_from_control_with_addr,
+    clamp_rtt_ms, combined_relay_rtt, configured_nat_kind, connection_id_from_p2p_username,
+    control_nat_kind, dispatch_voice_packet_to, fold_rtt_ewma, ice_role_from_control,
+    key_from_control, live_feedback_from_media, log_audio_pop_media_packet,
+    media_feedback_from_live, media_payload_from_audio, media_payload_kind,
+    media_voice_payload_kind, nat_from_control, p2p_peer_is_republish, p2p_username,
+    push_rtt_in_flight, random_u64, rtt_sample_is_stale, split_mdns_addr, take_rtt_sample,
+    voice_payload_kind,
 };
 
 const COMMANDS: Token = Token(0);
@@ -406,6 +409,41 @@ pub(super) fn direct_path_healthy(
     selected && last_inbound.is_some_and(|at| now.saturating_duration_since(at) <= failover_idle)
 }
 
+/// Whether a direct path we rely on looks dead before [`direct_path_healthy`]
+/// would say so: we have been talking over it (`talking_since`) and nothing
+/// arrived from the peer on it for longer than `suspect_idle`, counted from
+/// the later of the last inbound packet and the start of the talkspurt (the
+/// peer's feedback only flows while it receives our voice). Only a peer that
+/// sent us playback feedback within [`DIRECT_SUSPECT_ARM`] is judged this way:
+/// a peer that never reports (deafened, playback detached) leaves keepalives as
+/// the only evidence, whose gaps are normal, and keeps the plain failover.
+pub(super) fn direct_path_suspect(
+    now: Instant,
+    talking_since: Option<Instant>,
+    last_inbound: Option<Instant>,
+    last_feedback: Option<Instant>,
+    suspect_idle: Duration,
+) -> bool {
+    let Some(talking_since) = talking_since else {
+        return false;
+    };
+    if !last_feedback.is_some_and(|at| now.saturating_duration_since(at) <= DIRECT_SUSPECT_ARM) {
+        return false;
+    }
+    let evidence = last_inbound.map_or(talking_since, |at| at.max(talking_since));
+    now.saturating_duration_since(evidence) > suspect_idle
+}
+
+/// How long a direct path may stay silent while we talk before it is suspect.
+/// A healthy listener's first feedback of a talkspurt leaves it one feedback
+/// window after our first packet and arrives a round trip after that, so the
+/// [`DIRECT_SUSPECT_IDLE`] floor grows with the peer's RTT (plus one 20 ms
+/// frame of slack).
+pub(super) fn direct_suspect_idle(rtt_ms: Option<f32>) -> Duration {
+    let rtt = Duration::from_secs_f32(rtt_ms.unwrap_or(0.0).max(0.0) / 1000.0);
+    DIRECT_SUSPECT_IDLE.max(LIVE_PLAYBACK_FEEDBACK_INTERVAL + rtt + Duration::from_millis(20))
+}
+
 /// Whether the server relay can be dropped: there is at least one other online
 /// participant and every one of them has a peer whose direct path has been
 /// stable for at least `confirm_window`.
@@ -458,6 +496,10 @@ pub(super) struct PeerConnection {
     pub(super) direct_stable_since: Option<Instant>,
     /// Last inbound direct packet (media or STUN) from this peer.
     pub(super) last_direct_inbound: Option<Instant>,
+    /// Last playback feedback for our stream from this peer on the direct
+    /// path: whether it is a listener whose silence means something
+    /// ([`direct_path_suspect`]).
+    pub(super) last_direct_feedback: Option<Instant>,
     /// Outstanding RTT probe nonces sent over the direct path, paired with their
     /// send time. Bounded by [`RTT_IN_FLIGHT_CAP`].
     pub(super) rtt_in_flight: VecDeque<(u64, Instant)>,
@@ -488,95 +530,6 @@ enum P2pMediaPacket {
         rtt_ms: Option<u16>,
         action: Option<P2pAction>,
     },
-}
-
-pub(super) struct EncoderFeedbackController {
-    current: LiveEncoderProfile,
-    smoothed_loss: f32,
-    high_loss_windows: u8,
-    hold_until: Instant,
-}
-
-impl EncoderFeedbackController {
-    pub(super) fn new() -> Self {
-        Self {
-            current: LiveEncoderProfile::DRED_20,
-            smoothed_loss: 0.0,
-            high_loss_windows: 0,
-            hold_until: Instant::now(),
-        }
-    }
-
-    pub(super) fn observe(
-        &mut self,
-        feedback: LivePlaybackFeedback,
-        now: Instant,
-    ) -> Option<LiveEncoderProfile> {
-        if feedback.expected_packets == 0 {
-            return None;
-        }
-        let effective_loss = f32::from(feedback.lost_packets.saturating_add(feedback.late_packets))
-            / f32::from(feedback.expected_packets);
-        self.smoothed_loss = ENCODER_FEEDBACK_ALPHA * effective_loss
-            + (1.0 - ENCODER_FEEDBACK_ALPHA) * self.smoothed_loss;
-        if effective_loss >= 0.45 {
-            self.high_loss_windows = self.high_loss_windows.saturating_add(1).min(2);
-        } else {
-            self.high_loss_windows = 0;
-        }
-
-        let target = if effective_loss >= 0.55 || self.high_loss_windows >= 2 {
-            LiveEncoderProfile::DRED_60
-        } else if effective_loss >= 0.40 {
-            LiveEncoderProfile::DRED_50
-        } else if effective_loss >= 0.25 {
-            LiveEncoderProfile::DRED_35
-        } else {
-            LiveEncoderProfile::DRED_20
-        };
-
-        if target.packet_loss_percent > self.current.packet_loss_percent {
-            return self.set_current(target, now);
-        }
-        if target.packet_loss_percent == self.current.packet_loss_percent
-            && self.current.packet_loss_percent > LiveEncoderProfile::DRED_20.packet_loss_percent
-        {
-            self.hold_until = now + ENCODER_PROFILE_HOLD;
-            return None;
-        }
-        if now < self.hold_until {
-            return None;
-        }
-
-        let next = match self.current.packet_loss_percent {
-            60 if self.smoothed_loss < 0.45 => Some(LiveEncoderProfile::DRED_50),
-            50 if self.smoothed_loss < 0.30 => Some(LiveEncoderProfile::DRED_35),
-            35 if self.smoothed_loss < 0.15
-                && feedback.max_neteq_target_ms < 200
-                && feedback.max_neteq_playout_delay_ms < 200
-                && feedback.max_interarrival_jitter_ms < 50 =>
-            {
-                Some(LiveEncoderProfile::DRED_20)
-            }
-            _ => None,
-        };
-        next.and_then(|profile| self.set_current(profile, now))
-    }
-
-    fn set_current(
-        &mut self,
-        profile: LiveEncoderProfile,
-        now: Instant,
-    ) -> Option<LiveEncoderProfile> {
-        if profile == self.current {
-            return None;
-        }
-        self.current = profile;
-        if profile.packet_loss_percent > LiveEncoderProfile::DRED_20.packet_loss_percent {
-            self.hold_until = now + ENCODER_PROFILE_HOLD;
-        }
-        Some(profile)
-    }
 }
 
 struct MdnsPending {
@@ -2018,6 +1971,9 @@ struct VoiceSession {
     mdns: MdnsSystem,
     mdns_pending: HashMap<String, MdnsPending>,
     p2p_peers: HashMap<SessionId, PeerConnection>,
+    /// Start of the local talkspurt (first audio frame after a silence marker),
+    /// for [`direct_path_suspect`].
+    local_talking_since: Option<Instant>,
     inbound_streams: HashMap<StreamId, InboundVoiceStream>,
     voice_dedup: VoicePacketDeduplicator,
     voice_others: HashSet<UserId>,
@@ -2152,6 +2108,7 @@ impl VoiceSession {
             mdns,
             mdns_pending: HashMap::new(),
             p2p_peers: HashMap::new(),
+            local_talking_since: None,
             inbound_streams: HashMap::new(),
             voice_dedup: VoicePacketDeduplicator::new(),
             voice_others: HashSet::new(),
@@ -2353,7 +2310,7 @@ impl VoiceSession {
             self.local_sequence = 0;
             self.encoder_feedback = EncoderFeedbackController::new();
             let _ = self.events.send(NetworkEvent::EncoderProfileChanged(
-                crate::audio::LiveEncoderProfile::DRED_20,
+                self.encoder_feedback.current(),
             ));
             self.publish_p2p_candidates();
         } else if self.voice_room == Some(room_id) {
@@ -2946,6 +2903,7 @@ impl VoiceSession {
                 local_generation: self.p2p_generation,
                 direct_stable_since: None,
                 last_direct_inbound: None,
+                last_direct_feedback: None,
                 rtt_in_flight: VecDeque::new(),
                 rtt_ms: None,
             },
@@ -3015,6 +2973,19 @@ impl VoiceSession {
                 peer.direct_stable_since = None;
             }
         }
+    }
+
+    fn direct_path_suspect(&self, now: Instant) -> bool {
+        self.p2p_peers.values().any(|peer| {
+            peer.direct_stable_since.is_some()
+                && direct_path_suspect(
+                    now,
+                    self.local_talking_since,
+                    peer.last_direct_inbound,
+                    peer.last_direct_feedback,
+                    direct_suspect_idle(peer.rtt_ms),
+                )
+        })
     }
 
     fn relay_suppressed(&self, now: Instant) -> bool {
@@ -3383,7 +3354,17 @@ impl VoiceSession {
             frame.payload.len(),
             voice_payload_kind(&frame.payload),
         );
-        if !self.relay_suppressed(Instant::now()) {
+        let now = Instant::now();
+        match frame.payload {
+            crate::audio::VoicePayload::Opus(_) => {
+                self.local_talking_since.get_or_insert(now);
+            }
+            crate::audio::VoicePayload::Silence => self.local_talking_since = None,
+        }
+        // While suppressed, a direct path that has gone quiet mid-talkspurt
+        // gets the relay as a duplicate until it answers again (the receiver
+        // de-duplicates), instead of losing speech until the failover idle.
+        if !self.relay_suppressed(now) || self.direct_path_suspect(now) {
             self.send_media(&MediaPayload::Voice {
                 stream_id,
                 sequence,
@@ -4072,6 +4053,7 @@ impl VoiceSession {
                 )) if connection_id == peer.connection_id && active_stream == Some(stream_id) => {
                     let action = peer.agent.observe_authenticated_packet(now, src);
                     peer.last_direct_inbound = Some(now);
+                    peer.last_direct_feedback = Some(now);
                     Ok(P2pMediaPacket::Feedback {
                         stream_id,
                         feedback,
@@ -4350,7 +4332,7 @@ impl VoiceSession {
         if self.active_stream != Some(StreamId(feedback.stream_id)) {
             return;
         }
-        if let Some(profile) = self.encoder_feedback.observe(feedback, now) {
+        if let Some(profile) = self.encoder_feedback.observe(reporter.0, feedback, now) {
             let _ = self
                 .events
                 .send(NetworkEvent::EncoderProfileChanged(profile));
@@ -4777,6 +4759,85 @@ mod tests {
             StreamId(8),
             SessionId(6)
         ));
+    }
+
+    #[test]
+    fn quiet_direct_path_duplicates_talkspurt_voice_onto_the_relay() {
+        let actor_poll = Poll::new().unwrap();
+        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let udp = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let mut session = VoiceSession::new(
+            &actor_poll,
+            1,
+            Some(UdpMediaSetup {
+                socket: udp,
+                server_addr: server.local_addr().unwrap(),
+                server_probe_addr: None,
+            }),
+            protection(55),
+            false,
+            TransportMode::Encrypted,
+            server.local_addr().unwrap(),
+            MediaTransportSetting::Auto,
+            false,
+            CandidatePrivacy::Disabled,
+            false,
+            NetworkEventSender::for_test(event_tx),
+        )
+        .unwrap();
+        let relayed = |server: &StdUdpSocket| {
+            let mut buf = [0u8; 2048];
+            std::iter::from_fn(|| server.recv_from(&mut buf).ok()).count()
+        };
+        session.active_stream = Some(StreamId(5));
+        // One other participant, reachable over a confirmed direct path that
+        // reports our playback: the relay is suppressed.
+        let now = Instant::now();
+        let mut peer = crate::client_net::tests::test_peer_connection(14, 1, 1);
+        peer.direct_stable_since = Some(now - Duration::from_secs(10));
+        peer.last_direct_feedback = Some(now - Duration::from_secs(1));
+        peer.last_direct_inbound = Some(now - Duration::from_secs(1));
+        peer.rtt_ms = Some(40.0);
+        session.voice_others.insert(peer.user_id);
+        session.p2p_peers.insert(SessionId(9), peer);
+        assert!(session.relay_suppressed(now));
+        relayed(&server);
+
+        // A talkspurt starts: the path has had no chance to answer yet.
+        session.send_local_voice(frame(1), None);
+        assert!(session.local_talking_since.is_some());
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(relayed(&server), 0, "a fresh talkspurt stays direct");
+
+        // Talking for a second with nothing back on the direct path: the
+        // voice is duplicated onto the relay.
+        session.local_talking_since = Some(Instant::now() - Duration::from_secs(1));
+        session.send_local_voice(frame(2), None);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(relayed(&server), 1, "a quiet direct path gets the relay");
+
+        // The peer answers on the direct path: back to direct only.
+        session
+            .p2p_peers
+            .get_mut(&SessionId(9))
+            .unwrap()
+            .last_direct_inbound = Some(Instant::now());
+        session.send_local_voice(frame(3), None);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(relayed(&server), 0, "direct inbound ends the duplication");
+
+        // A silence marker ends the talkspurt.
+        session.send_local_voice(
+            LocalVoiceFrame {
+                timestamp: 4 * 960,
+                flags: 0,
+                payload: VoicePayload::Silence,
+            },
+            None,
+        );
+        assert!(session.local_talking_since.is_none());
     }
 
     #[test]
