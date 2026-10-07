@@ -927,6 +927,25 @@ impl Actor {
                 welcomes.sort_by_key(|welcome| welcome.delivery_id);
                 welcomes.retain(|welcome| welcome.delivery_id > welcome_cursor);
                 let delivered_any = !welcomes.is_empty();
+                let processed_head = welcomes
+                    .last()
+                    .map(|welcome| welcome.delivery_id)
+                    .unwrap_or(head_sequence);
+                // The device inbox is not filtered by current room access, so
+                // a Welcome can name a room this account has since lost. Skip
+                // it but still advance the cursor past it; otherwise every
+                // reconnect would fetch and fail on the same Welcome.
+                welcomes.retain(|welcome| {
+                    let known = self.room_kinds.contains_key(&welcome.descriptor.room_id);
+                    if !known {
+                        kvlog::warn!(
+                            "skipping MLS Welcome for an inaccessible room",
+                            room_id = welcome.descriptor.room_id.0,
+                            delivery_id = welcome.delivery_id,
+                        );
+                    }
+                    known
+                });
                 let mut missing_rosters = HashSet::new();
                 for welcome in &welcomes {
                     missing_rosters
@@ -943,10 +962,6 @@ impl Actor {
                 self.pending_mls_welcome_rosters = None;
                 let local_device = installation.bootstrap.device_id;
                 let mut fetches = Vec::new();
-                let processed_head = welcomes
-                    .last()
-                    .map(|welcome| welcome.delivery_id)
-                    .unwrap_or(head_sequence);
                 for welcome in welcomes {
                     if welcome.device_id != local_device {
                         return Err("server delivered a Welcome for another device".to_string());
@@ -3642,7 +3657,6 @@ mod tests {
     /// network session, the welcome cursor is not advanced, and the next
     /// reconnect fetches the same Welcome again — a permanent reconnect loop.
     #[test]
-    #[ignore = "BUG: Welcome for a room absent from room_kinds is session-fatal and never acknowledged → permanent reconnect loop — see review"]
     fn review_welcome_for_inaccessible_room_is_not_session_fatal() {
         let temp = tempfile::tempdir().unwrap();
         let (bob, welcome, _alice_id, bob_id) = review_welcome_for_bob(temp.path());
@@ -3662,6 +3676,10 @@ mod tests {
         assert!(
             result.is_ok(),
             "welcome for an inaccessible room failed the session: {result:?} (welcome cursor {cursor})"
+        );
+        assert_eq!(
+            cursor, 1,
+            "the skipped Welcome must still advance the cursor"
         );
     }
 
