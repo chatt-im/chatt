@@ -2443,7 +2443,6 @@ impl RoomSession {
         let accessible: HashSet<RoomId> = rooms.iter().map(|room| room.room_id).collect();
         self.archive_inaccessible_rooms(&accessible);
         for info in rooms {
-            self.restore_archived_room(info.room_id);
             self.upsert_room(info, local_user);
         }
         let view = preferred_view
@@ -2459,6 +2458,9 @@ impl RoomSession {
     /// buffer is materialized lazily when viewed or when background activity
     /// needs somewhere to land.
     pub(crate) fn upsert_room(&mut self, info: &RoomInfo, _local_user: Option<UserId>) {
+        // A room the server lists again is live: revive its archived meta
+        // (keeping `last_read`) rather than leaving a stale copy beside it.
+        self.restore_archived_room(info.room_id);
         self.clear_gap_marker(info.room_id);
         let kind = ClientRoomKind::from_wire(&info.kind);
         let name = self.display_room_name(&info.name, &kind);
@@ -8597,7 +8599,6 @@ mod tests {
     /// later upserts it again, the archived copy must not linger beside the
     /// live one.
     #[test]
-    #[ignore = "BUG: RoomUpserted for an archived room leaves it in both metas and archived_metas (duplicate catalog rows; disconnect restores the stale meta) — see review"]
     fn review_upsert_of_archived_room_does_not_duplicate_it() {
         let mut room = test_room();
         room.authenticated(
