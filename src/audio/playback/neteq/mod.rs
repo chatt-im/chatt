@@ -29,6 +29,8 @@ mod packet_arrival_history;
 mod packet_buffer;
 mod redundancy;
 #[cfg(test)]
+mod review_tests;
+#[cfg(test)]
 mod replay_repro;
 mod sync_buffer;
 mod tick_timer;

@@ -6,6 +6,8 @@ mod mixer;
 pub(crate) mod neteq;
 #[cfg(test)]
 mod realtime_alloc_tests;
+#[cfg(test)]
+mod review_tests;
 mod sample_ring;
 mod stream;
 mod swap_queue;
