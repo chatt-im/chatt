@@ -537,9 +537,14 @@ impl ClipboardBackend for PlatformBackend {
     fn file_uris(&self) -> Result<Vec<PathBuf>, ClipboardPasteError> {
         let read = read_first(&[
             ("wl-paste", &["--type", "text/uri-list"]),
-            ("xclip", &["-selection", "clipboard", "-t", "text/uri-list", "-o"]),
+            (
+                "xclip",
+                &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
+            ),
         ])?;
-        Ok(read.output().map_or_else(Vec::new, |bytes| parse_uri_list(&bytes)))
+        Ok(read
+            .output()
+            .map_or_else(Vec::new, |bytes| parse_uri_list(&bytes)))
     }
 
     fn image_mimes(&self) -> Result<Vec<String>, ClipboardPasteError> {
@@ -547,7 +552,9 @@ impl ClipboardBackend for PlatformBackend {
             ("wl-paste", &["--list-types"]),
             ("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]),
         ])?;
-        Ok(read.output().map_or_else(Vec::new, |bytes| parse_image_mimes(&bytes)))
+        Ok(read
+            .output()
+            .map_or_else(Vec::new, |bytes| parse_image_mimes(&bytes)))
     }
 
     fn image_bytes(&self, mime: &str) -> Result<Option<Vec<u8>>, ClipboardPasteError> {
@@ -834,7 +841,8 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn helper_output_larger_than_a_pipe_buffer_is_read_in_full() {
-        let Ok(HelperRun::Output(bytes)) = run_helper("/bin/sh", &["-c", "head -c 1000000 /dev/zero"])
+        let Ok(HelperRun::Output(bytes)) =
+            run_helper("/bin/sh", &["-c", "head -c 1000000 /dev/zero"])
         else {
             panic!("expected helper output");
         };

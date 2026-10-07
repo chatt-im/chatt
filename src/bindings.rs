@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use extui_bindings::{ActionId, InputKey, LayerId, NamedKey, Payload, Router, RouterBuilder, parse_sequence};
+use extui_bindings::{
+    ActionId, InputKey, LayerId, NamedKey, Payload, Router, RouterBuilder, parse_sequence,
+};
 use toml_spanner::Toml;
 use toml_spanner::{
     Arena, Context, Error, Failed, FromToml, Item, OwnedItem, Table, ToToml, ToTomlError,
@@ -359,7 +361,9 @@ pub fn resolve(
             Resolved::Action(id)
         }
         Payload::Layer(target) => {
-            let mut keys = pending.take().map_or_else(String::new, |chord| chord.keys + " ");
+            let mut keys = pending
+                .take()
+                .map_or_else(String::new, |chord| chord.keys + " ");
             keys.push_str(&key.to_string());
             *pending = Some(PendingChord {
                 layer: target,

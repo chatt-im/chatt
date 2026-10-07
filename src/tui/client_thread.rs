@@ -314,7 +314,9 @@ impl ClientThread {
                 copy_failure = clipboard.copy(&mut terminal, &text);
             }
             if let Some(text) = primary_clipboard_text {
-                copy_failure = clipboard.copy_primary(&mut terminal, &text).or(copy_failure);
+                copy_failure = clipboard
+                    .copy_primary(&mut terminal, &text)
+                    .or(copy_failure);
             }
             if let Some(failure) = copy_failure {
                 view.set_error(failure.to_string());

@@ -5235,7 +5235,10 @@ mod tests {
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
 
-        room.process_input(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
+        room.process_input(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+        );
 
         assert_eq!(
             app.view.take_pending_clipboard().as_deref(),

@@ -531,9 +531,17 @@ mod tests {
         let mut clipboard = Clipboard::new();
         let startup = start_clipboard_owner(attempt(COMMANDS, "copied text"));
         assert!(matches!(startup, Startup::Failed(Failed::Missing(_))));
-        assert!(clipboard.settle(ClipboardSelection::Clipboard, startup).is_some());
+        assert!(
+            clipboard
+                .settle(ClipboardSelection::Clipboard, startup)
+                .is_some()
+        );
         let startup = start_clipboard_owner(attempt(COMMANDS, "copied text"));
-        assert!(clipboard.settle(ClipboardSelection::Clipboard, startup).is_none());
+        assert!(
+            clipboard
+                .settle(ClipboardSelection::Clipboard, startup)
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
