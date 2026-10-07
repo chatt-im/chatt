@@ -9,12 +9,14 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::net::TcpStream;
-use std::sync::Arc;
+use std::net::{Shutdown, TcpStream};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use mio::Waker;
 
 use rpc::{
     bitstream::{self, Codec},
@@ -24,6 +26,7 @@ use rpc::{
 };
 
 use super::VideoFrameFanout;
+use crate::dial::{Dial, DialPoll};
 use crate::app::{AppEvent, EventSender, ScreencastProgress};
 use crate::client_net::{CommandSender, NetworkCommand};
 
@@ -47,6 +50,12 @@ const PROGRESS_WINDOW: Duration = Duration::from_secs(5);
 pub struct ScreencastHandle {
     attempt_id: ShareAttemptId,
     stop: Arc<AtomicBool>,
+    /// Interrupts the manager's dial so a stop never waits out a connect.
+    waker: Option<Arc<Waker>>,
+    /// The connected publisher socket, shut down on stop so a frame write
+    /// stalled against a dead server fails at once instead of after
+    /// [`VIDEO_WRITE_TIMEOUT`].
+    socket: Arc<Mutex<Option<TcpStream>>>,
     secret_tx: Sender<(SessionId, StreamId, Vec<u8>)>,
     join: Option<JoinHandle<()>>,
 }
@@ -64,6 +73,12 @@ impl ScreencastHandle {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(waker) = &self.waker {
+            let _ = waker.wake();
+        }
+        if let Some(socket) = &*lock_socket(&self.socket) {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -75,6 +90,8 @@ impl ScreencastHandle {
         Self {
             attempt_id,
             stop: Arc::new(AtomicBool::new(false)),
+            waker: None,
+            socket: Arc::default(),
             secret_tx,
             join: None,
         }
@@ -101,6 +118,11 @@ pub fn start(
     let stop = Arc::new(AtomicBool::new(false));
     let (frame_tx, frame_rx) = mpsc::channel();
     let (secret_tx, secret_rx) = mpsc::channel();
+    let dial_poll =
+        DialPoll::new().map_err(|error| format!("could not start screen share: {error}"))?;
+    let waker = Arc::clone(&dial_poll.waker);
+    let socket = Arc::new(Mutex::new(None));
+    let manager_socket = Arc::clone(&socket);
     let capture = capture::spawn(&argv, codec, frame_tx, stop.clone())?;
     let manager_stop = stop.clone();
     let join = thread::Builder::new()
@@ -116,6 +138,8 @@ pub fn start(
                 video_transport,
                 fanout,
                 events,
+                dial_poll,
+                manager_socket,
                 manager_stop,
             )
         })
@@ -123,6 +147,8 @@ pub fn start(
     Ok(ScreencastHandle {
         attempt_id,
         stop,
+        waker: Some(waker),
+        socket,
         secret_tx,
         join: Some(join),
     })
@@ -304,6 +330,8 @@ fn run_manager(
     video_transport: VideoTransport,
     fanout: VideoFrameFanout,
     events: EventSender,
+    mut dial_poll: DialPoll,
+    socket: Arc<Mutex<Option<TcpStream>>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut buffered = StartupBuffer::default();
@@ -337,7 +365,17 @@ fn run_manager(
         if conn.is_none()
             && let Ok((session_id, stream_id, secret)) = secret_rx.try_recv()
         {
-            match connect(session_id, stream_id, &secret, codec, video_transport) {
+            let mut dial = dial_poll.dial(Some(&stop));
+            let connected = connect(
+                &mut dial,
+                session_id,
+                stream_id,
+                &secret,
+                codec,
+                video_transport,
+            )
+            .and_then(|publisher| publish_socket(&socket, &stop, publisher));
+            match connected {
                 Ok(mut publisher) => {
                     let mut failed = false;
                     for frame in buffered.drain() {
@@ -509,6 +547,7 @@ fn encode_publish_frame(frame: &CapturedFrame, stream_id: u32, codec: Codec) -> 
 }
 
 fn connect(
+    dial: &mut Dial,
     session_id: SessionId,
     stream_id: StreamId,
     secret: &[u8],
@@ -516,6 +555,7 @@ fn connect(
     video_transport: VideoTransport,
 ) -> Result<PublisherConn, String> {
     let (stream, record_protection, _residual) = super::open_video_connection(
+        dial,
         session_id,
         stream_id,
         VideoRole::Publisher,
@@ -533,6 +573,31 @@ fn connect(
         copy_stats: CopyStats::new(),
         record: Vec::new(),
     })
+}
+
+/// Shares a handle to the connected socket with [`ScreencastHandle::stop`].
+///
+/// The stop flag is checked under the same lock `stop` takes, so either the
+/// handle sees the socket and shuts it down, or the stop is seen here.
+fn publish_socket(
+    socket: &Mutex<Option<TcpStream>>,
+    stop: &AtomicBool,
+    publisher: PublisherConn,
+) -> Result<PublisherConn, String> {
+    let clone = publisher
+        .stream
+        .try_clone()
+        .map_err(|error| format!("video socket clone failed: {error}"))?;
+    let mut slot = lock_socket(socket);
+    if stop.load(Ordering::SeqCst) {
+        return Err("video connection stopped".to_string());
+    }
+    *slot = Some(clone);
+    Ok(publisher)
+}
+
+fn lock_socket(socket: &Mutex<Option<TcpStream>>) -> MutexGuard<'_, Option<TcpStream>> {
+    socket.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Holds captured frames until the publish secret arrives, keeping the buffer
@@ -741,6 +806,55 @@ mod tests {
         // A frame no viewer can receive must not reach the self-view cache
         // either, or the sharer's own browser decodes against it alone.
         assert_eq!(fanout.cached_frames(StreamId(9)), 0);
+    }
+
+    #[test]
+    fn stop_interrupts_a_frame_write_stalled_on_a_dead_server() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // Accepted and never read, so the send buffer fills and the next
+        // write blocks the way it does against a server that went away.
+        let _accepted = listener.accept().unwrap();
+        stream.set_write_timeout(Some(VIDEO_WRITE_TIMEOUT)).unwrap();
+        let mut handle = ScreencastHandle::for_test(ShareAttemptId(1));
+        let mut conn = publish_socket(
+            &handle.socket,
+            &handle.stop,
+            PublisherConn {
+                stream,
+                record_protection: RecordProtection::clear(),
+                stream_id: 9,
+                codec: Codec::H264,
+                copy_stats: CopyStats::new(),
+                record: Vec::new(),
+            },
+        )
+        .unwrap();
+        handle.join = Some(thread::spawn(move || {
+            let fanout = VideoFrameFanout::new(None);
+            let mut data = vec![0, 0, 0, 1, 0x65];
+            data.resize(256 * 1024, 0xaa);
+            let frame = CapturedFrame {
+                ts_ms: 0,
+                is_key: true,
+                data,
+            };
+            while conn.send_frame(&frame, &fanout).is_ok() {}
+        }));
+        // Loopback fills the send buffer within milliseconds, leaving the
+        // writer blocked well before this elapses.
+        thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        handle.stop();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop blocked for {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

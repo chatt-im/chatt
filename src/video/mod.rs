@@ -13,10 +13,10 @@ mod nut;
 mod publisher;
 mod subscriber;
 
-use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::dial::{Dial, DialError};
 use rpc::{
     crypto::{
         CHANNEL_VIDEO, KEY_LEN, RecordProtection, TransportMode, VideoKeyRole, derive_video_keys,
@@ -45,10 +45,10 @@ const AUTH_PAYLOAD: &[u8] = b"chatt-video-auth-v1";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bound on a single connect attempt. Every video thread is joined from the
-/// render loop when its share is torn down, and the teardown that matters most
-/// is the one a lost server triggers, so an unreachable address must fail in
-/// seconds rather than waiting out the kernel's SYN retries.
+/// Bound on a single connect attempt, so an unreachable address fails in
+/// seconds rather than waiting out the kernel's SYN retries. A teardown never
+/// waits on it: every video thread is joined from the render loop, so its
+/// stop request interrupts the connect and handshake waits.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Deliberately not `Debug`: it carries the session's video auth key, and the
@@ -107,16 +107,15 @@ impl VideoTransport {
     }
 }
 
-/// Connects to the concrete peer selected by the live control connection.
-fn connect_within_timeout(addr: SocketAddr) -> Result<TcpStream, String> {
-    TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|error| format!("video connect failed: {error}"))
-}
-
 /// Brings up a dedicated video connection from the client side: connects, writes
 /// the magic, hello, and auth record, then reads the ack. Returns the stream,
 /// record protection, and any bytes already buffered past the ack.
+///
+/// Every wait goes through `dial`, so the owner's stop request abandons a
+/// connection to an unreachable server at once instead of after the connect
+/// and handshake timeouts.
 fn open_video_connection(
+    dial: &mut Dial,
     session_id: SessionId,
     stream_id: StreamId,
     role: VideoRole,
@@ -124,12 +123,40 @@ fn open_video_connection(
     transport: VideoTransport,
 ) -> Result<(TcpStream, RecordProtection, RecvBuffer), String> {
     let mut record = transport.record_protection(secret)?;
-    let mut stream = connect_within_timeout(transport.peer_addr())?;
+    let mut stream = dial
+        .connect(transport.peer_addr(), Instant::now() + CONNECT_TIMEOUT)
+        .map_err(|error| describe_dial_error("video connect failed", error))?;
+    let handshake = video_handshake(
+        dial,
+        &mut stream,
+        &mut record,
+        session_id,
+        stream_id,
+        role,
+        transport,
+    );
+    let _ = dial.poll.registry().deregister(&mut stream);
+    let recv = handshake?;
+    let stream = TcpStream::from(stream);
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
         .map_err(|error| error.to_string())?;
-    stream.set_nodelay(true).ok();
+    Ok((stream, record, recv))
+}
 
+fn video_handshake(
+    dial: &mut Dial,
+    stream: &mut mio::net::TcpStream,
+    record: &mut RecordProtection,
+    session_id: SessionId,
+    stream_id: StreamId,
+    role: VideoRole,
+    transport: VideoTransport,
+) -> Result<RecvBuffer, String> {
+    stream.set_nodelay(true).ok();
     let mut out = Vec::new();
     out.extend_from_slice(&video::VIDEO_MAGIC);
     let hello = VideoHello {
@@ -140,20 +167,26 @@ fn open_video_connection(
     };
     video::write_record(&mut out, &video::encode_video_hello(&hello))
         .map_err(|error| error.to_string())?;
-    let auth = transport.auth_record(&mut record, session_id, stream_id, role)?;
+    let auth = transport.auth_record(record, session_id, stream_id, role)?;
     video::write_record(&mut out, &auth).map_err(|error| error.to_string())?;
-    stream
-        .write_all(&out)
-        .map_err(|error| format!("video handshake write failed: {error}"))?;
-    stream.flush().map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    dial.write_all(stream, &out, deadline)
+        .map_err(|error| describe_dial_error("video handshake write failed", error))?;
 
     let mut recv = RecvBuffer::new();
-    let ack_plain = read_one_plain_record(&mut stream, &mut recv, &mut record)?;
+    let ack_plain = read_one_plain_record(dial, stream, &mut recv, record, deadline)?;
     match video::decode_video_ack(&ack_plain)? {
         VideoAck::Ok => {}
         VideoAck::Rejected => return Err("video stream rejected by server".to_string()),
     }
-    Ok((stream, record, recv))
+    Ok(recv)
+}
+
+fn describe_dial_error(context: &str, error: DialError) -> String {
+    match error {
+        DialError::Io(error) => format!("{context}: {error}"),
+        DialError::Stopped => "video connection stopped".to_string(),
+    }
 }
 
 /// Minimum spare receive capacity ensured before each video socket read.
@@ -163,19 +196,22 @@ const VIDEO_READ_CHUNK_BYTES: usize = 64 * 1024;
 /// it in place and returning the plaintext. Bytes past the record stay
 /// buffered for the caller.
 fn read_one_plain_record(
-    stream: &mut TcpStream,
+    dial: &mut Dial,
+    stream: &mio::net::TcpStream,
     recv: &mut RecvBuffer,
     record_protection: &mut RecordProtection,
+    deadline: Instant,
 ) -> Result<Vec<u8>, String> {
     loop {
         let total = match video::parse_record(recv.pending()) {
             Ok(Some((_, total))) => total,
             Ok(None) => {
-                let read = recv
-                    .fill(stream, VIDEO_READ_CHUNK_BYTES)
-                    .map_err(|error| format!("video read failed: {error}"))?;
-                if read == 0 {
-                    return Err("video connection closed".to_string());
+                match recv.fill(stream, VIDEO_READ_CHUNK_BYTES) {
+                    Ok(0) => return Err("video connection closed".to_string()),
+                    Ok(_) => {}
+                    Err(error) => dial
+                        .retry_after(error, deadline)
+                        .map_err(|error| describe_dial_error("video read failed", error))?,
                 }
                 continue;
             }

@@ -26,6 +26,7 @@ mod clipboard_windows;
 mod config;
 mod config_diagnostics;
 mod device_link;
+mod dial;
 mod e2e;
 mod e2e_identity;
 #[cfg(feature = "embedded-client")]

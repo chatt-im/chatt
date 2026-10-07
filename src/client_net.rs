@@ -4,12 +4,12 @@ use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpStream as StdTcpStream},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SendError, Sender, TryRecvError},
     },
     thread::{self, JoinHandle},
@@ -60,6 +60,7 @@ use rpc::evented::ReadPumpOutcome;
 use std::net::IpAddr;
 
 use crate::app::{NetworkEventSender, PairingEventSender};
+use crate::dial::{Dial, DialError, DialPoll};
 use crate::audio::{
     AUDIO_DIAGNOSTICS_LOGS, LiveEncoderProfile, LivePlaybackFeedback, LivePlaybackSink,
     LocalVoiceFrame, RemoteVoicePacket, VoicePayload as AudioVoicePayload,
@@ -1022,6 +1023,9 @@ impl CommandSender {
 
 pub struct NetworkClient {
     tx: CommandSender,
+    /// Raised before the shutdown command so a dial blocked in the worker's
+    /// poll abandons the attempt as soon as the waker fires.
+    stopping: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     voice: Option<voice::VoiceLoopHandle>,
 }
@@ -1050,6 +1054,8 @@ impl NetworkClient {
             voice: Some(voice_input),
             alive: Arc::clone(&alive),
         };
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
         let panic_events = events.clone();
         let worker_alive = Arc::clone(&alive);
         let voice_shutdown = voice_control.clone();
@@ -1061,7 +1067,7 @@ impl NetworkClient {
             .stack_size(1024 * 1024)
             .spawn(move || {
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    run_worker(config, events, rx, poll, waker, voice_control);
+                    run_worker(config, events, rx, poll, waker, &worker_stopping, voice_control);
                 }));
                 let _ = voice_shutdown.submit(voice::VoiceCommand::Shutdown);
                 if result.is_err() {
@@ -1078,6 +1084,7 @@ impl NetworkClient {
             })?;
         Ok(Self {
             tx,
+            stopping,
             worker: Some(worker),
             voice: Some(voice),
         })
@@ -1103,12 +1110,14 @@ impl NetworkClient {
     pub(crate) fn from_parts_for_test(tx: Sender<NetworkCommand>) -> Self {
         Self {
             tx: CommandSender::for_test(tx),
+            stopping: Arc::new(AtomicBool::new(false)),
             worker: None,
             voice: None,
         }
     }
 
     fn stop_inner(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         let _ = self.tx.send(NetworkCommand::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1203,7 +1212,7 @@ fn device_pair_once(
     overwrite_existing: bool,
     cancellation: &AtomicU8,
 ) -> Result<(String, String, String), DevicePairFailure> {
-    let (mut stream, transport, trusted) = connect_and_handshake(config, false)?;
+    let (mut stream, transport, trusted) = connect_and_handshake_standalone(config, false)?;
     let secrets = crate::device_link::derive_pairing_secrets(&ticket.pairing_secret, &trusted)?;
     let redemption_secret = secrets.redemption_secret.as_str();
     let mut control = transport.control_record();
@@ -1416,11 +1425,12 @@ fn open_pair_once(
     password: String,
     existing_token: String,
 ) -> OpenPairOutcome {
-    let (mut stream, transport, trusted) = match connect_and_handshake(config, true) {
+    let (mut stream, transport, trusted) = match connect_and_handshake_standalone(config, true) {
         Ok(value) => value,
         Err(HandshakeFailure::TransportEncryptionRequired) => {
             return OpenPairOutcome::TransportEncryptionRequired;
         }
+        Err(HandshakeFailure::Stopped) => unreachable!("a standalone dial has no stop request"),
         Err(HandshakeFailure::Other(error)) => return OpenPairOutcome::Failed(error),
     };
     let mut control = transport.control_record();
@@ -1525,6 +1535,7 @@ fn run_worker(
     commands: Receiver<NetworkCommand>,
     mut poll: Poll,
     waker: Arc<Waker>,
+    stopping: &AtomicBool,
     voice: voice::VoiceControl,
 ) {
     kvlog::info!(
@@ -1535,7 +1546,11 @@ fn run_worker(
     );
     let mut reconnect = ReconnectSchedule::new();
     let mut pending_authenticated_commands = VecDeque::new();
-    let mls_runtime = match mls_actor::Runtime::spawn(config.clone(), events.clone(), waker) {
+    let mls_runtime = match mls_actor::Runtime::spawn(
+        config.clone(),
+        events.clone(),
+        Arc::clone(&waker),
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = events.send(NetworkEvent::WorkerStopped { reason: error });
@@ -1562,7 +1577,7 @@ fn run_worker(
             &events,
             &commands,
             &mut pending_authenticated_commands,
-            &mut poll,
+            &mut Dial::new(&mut poll, &waker, Some(stopping)),
             &mls_runtime,
             mls_generation,
             &voice,
@@ -1629,17 +1644,18 @@ fn run_worker_inner(
     events: &NetworkEventSender,
     commands: &Receiver<NetworkCommand>,
     pending_authenticated_commands: &mut VecDeque<NetworkCommand>,
-    poll: &mut Poll,
+    dial: &mut Dial,
     mls_runtime: &mls_actor::Runtime,
     mls_generation: u64,
     voice_control: &voice::VoiceControl,
 ) -> SessionEnd {
-    let (std_tcp, transport, _trusted) = match connect_and_handshake(config, false) {
+    let (std_tcp, transport, _trusted) = match connect_and_handshake(config, false, dial) {
         Ok(value) => value,
         Err(HandshakeFailure::TransportEncryptionRequired) => {
             let _ = events.send(NetworkEvent::TransportEncryptionRequired);
             return SessionEnd::Shutdown;
         }
+        Err(HandshakeFailure::Stopped) => return SessionEnd::Shutdown,
         Err(HandshakeFailure::Other(error)) => return SessionEnd::ConnectFailed(error),
     };
     let video_addr = match std_tcp.peer_addr() {
@@ -1669,20 +1685,22 @@ fn run_worker_inner(
     let udp_media = if force_tcp_media {
         None
     } else {
-        let server_addr = match resolve_endpoint(&config.udp_addr) {
-            Ok(addr) => addr,
-            Err(error) => {
+        let server_addr = match dial.resolve(&config.udp_addr) {
+            Ok(addresses) => addresses[0],
+            Err(DialError::Io(error)) => {
                 return SessionEnd::ConnectFailed(format!("invalid UDP endpoint: {error}"));
             }
+            Err(DialError::Stopped) => return SessionEnd::Shutdown,
         };
         let server_probe_addr = match config.udp_probe_addr.as_deref() {
-            Some(addr) => match resolve_endpoint(addr) {
-                Ok(addr) => Some(addr),
-                Err(error) => {
+            Some(addr) => match dial.resolve(addr) {
+                Ok(addresses) => Some(addresses[0]),
+                Err(DialError::Io(error)) => {
                     return SessionEnd::ConnectFailed(format!(
                         "invalid UDP probe endpoint: {error}"
                     ));
                 }
+                Err(DialError::Stopped) => return SessionEnd::Shutdown,
             },
             None => None,
         };
@@ -1791,6 +1809,7 @@ fn run_worker_inner(
     };
     worker.loop_work.queue_tcp_read();
 
+    let poll = &mut *dial.poll;
     // The poll outlives each session so its waker survives reconnects. A prior
     // session's sockets were dropped on return, closing their fds and clearing
     // them from the poll, so re-registering the same tokens here is sound.
@@ -2134,6 +2153,8 @@ enum HandshakeFailure {
     /// entry still requires encryption. Only public handshake material reached
     /// the wire, so the caller may prompt for consent and retry.
     TransportEncryptionRequired,
+    /// The owner asked the worker to stop while the dial was still waiting.
+    Stopped,
     Other(String),
 }
 
@@ -2141,6 +2162,33 @@ impl From<String> for HandshakeFailure {
     fn from(error: String) -> Self {
         Self::Other(error)
     }
+}
+
+/// Upper bound on one TCP connect attempt, and on the whole dial across every
+/// resolved address.
+const DIAL_ADDRESS_TIMEOUT: Duration = Duration::from_secs(10);
+const DIAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on the server hello exchange.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl DialError {
+    fn into_failure(self, describe: impl FnOnce(&io::Error) -> String) -> HandshakeFailure {
+        match self {
+            Self::Io(error) => HandshakeFailure::Other(describe(&error)),
+            Self::Stopped => HandshakeFailure::Stopped,
+        }
+    }
+}
+
+/// [`connect_and_handshake`] for the short-lived pairing threads, which own
+/// their thread outright and have no stop request to observe.
+fn connect_and_handshake_standalone(
+    config: &ClientConfig,
+    allow_tofu: bool,
+) -> Result<(StdTcpStream, SessionTransport, [u8; 32]), HandshakeFailure> {
+    let mut dial_poll =
+        DialPoll::new().map_err(|error| format!("failed to create dial poll: {error}"))?;
+    connect_and_handshake(config, allow_tofu, &mut dial_poll.dial(None))
 }
 
 /// Dials the server, completes the signed handshake, and refuses the session
@@ -2153,45 +2201,46 @@ impl From<String> for HandshakeFailure {
 fn connect_and_handshake(
     config: &ClientConfig,
     allow_tofu: bool,
+    dial: &mut Dial,
 ) -> Result<(StdTcpStream, SessionTransport, [u8; 32]), HandshakeFailure> {
-    let (stream, transport, trusted) = dial_and_handshake(config, allow_tofu)?;
+    let (stream, transport, trusted) = dial_and_handshake(config, allow_tofu, dial)?;
     if transport.mode == TransportMode::Plaintext && config.require_transport_encryption {
         return Err(HandshakeFailure::TransportEncryptionRequired);
     }
     Ok((stream, transport, trusted))
 }
 
+/// Returns a blocking stream with 10 s read and write timeouts, which the
+/// pairing exchanges rely on and the session worker switches back to
+/// nonblocking.
 fn dial_and_handshake(
     config: &ClientConfig,
     allow_tofu: bool,
-) -> Result<(StdTcpStream, SessionTransport, [u8; 32]), String> {
+    dial: &mut Dial,
+) -> Result<(StdTcpStream, SessionTransport, [u8; 32]), HandshakeFailure> {
     kvlog::info!(
         "tcp connecting",
         tcp_addr = %config.tcp_addr,
         username = config.username.as_str()
     );
-    let addresses = config
-        .tcp_addr
-        .to_socket_addrs()
-        .map_err(|error| format!("failed to resolve server address: {error}"))?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err("server address resolved to no endpoints".to_string());
-    }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let addresses = dial.resolve(&config.tcp_addr).map_err(|error| {
+        error.into_failure(|error| format!("failed to resolve server address: {error}"))
+    })?;
+    let deadline = Instant::now() + DIAL_TOTAL_TIMEOUT;
     let mut last_error = None;
     let mut connected = None;
     for address in addresses {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        let now = Instant::now();
+        if now >= deadline {
             break;
         }
-        match StdTcpStream::connect_timeout(&address, remaining.min(Duration::from_secs(10))) {
+        match dial.connect(address, deadline.min(now + DIAL_ADDRESS_TIMEOUT)) {
             Ok(stream) => {
                 connected = Some(stream);
                 break;
             }
-            Err(error) => last_error = Some(error),
+            Err(DialError::Stopped) => return Err(HandshakeFailure::Stopped),
+            Err(DialError::Io(error)) => last_error = Some(error),
         }
     }
     let mut stream = connected.ok_or_else(|| {
@@ -2202,12 +2251,33 @@ fn dial_and_handshake(
                 .unwrap_or_else(|| "connection deadline exceeded".to_string())
         )
     })?;
+    let exchanged = exchange_hellos(config, allow_tofu, dial, &mut stream);
+    let _ = dial.poll.registry().deregister(&mut stream);
+    let (transport, trusted_key) = exchanged?;
+    let stream = StdTcpStream::from(stream);
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("failed to make TCP blocking: {error}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| format!("failed to set TCP read timeout: {error}"))?;
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| format!("failed to set TCP write timeout: {error}"))?;
+    kvlog::info!(
+        "tcp handshake completed",
+        transport_mode = transport.mode.as_str(),
+        media_route_id = transport.route_id
+    );
+    Ok((stream, transport, trusted_key))
+}
+
+fn exchange_hellos(
+    config: &ClientConfig,
+    allow_tofu: bool,
+    dial: &mut Dial,
+    stream: &mut TcpStream,
+) -> Result<(SessionTransport, [u8; 32]), HandshakeFailure> {
     stream
         .set_nodelay(true)
         .map_err(|error| format!("failed to set TCP_NODELAY: {error}"))?;
@@ -2226,24 +2296,23 @@ fn dial_and_handshake(
         hello_size = hello.len(),
         frame_size = framed.len()
     );
-    stream
-        .write_all(&framed)
-        .map_err(|error| format!("failed to write client hello: {error}"))?;
-    let response = read_blocking_frame(&mut stream)
-        .map_err(|error| server_hello_read_error(&error, pinned_server_public_key.as_ref()))?;
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    dial.write_all(stream, &framed, deadline).map_err(|error| {
+        error.into_failure(|error| format!("failed to write client hello: {error}"))
+    })?;
+    let response = read_dial_frame(dial, stream, deadline).map_err(|error| {
+        error.into_failure(|error| {
+            server_hello_read_error(error, pinned_server_public_key.as_ref())
+        })
+    })?;
     let server_hello = decode_server_hello(&response)?;
-    let (transport, trusted_key) = complete_client_transport_handshake(
+    let handshake = complete_client_transport_handshake(
         client,
         &server_hello,
         pinned_server_public_key.as_ref(),
     )
     .map_err(|error| error.to_string())?;
-    kvlog::info!(
-        "tcp handshake completed",
-        transport_mode = transport.mode.as_str(),
-        media_route_id = transport.route_id
-    );
-    Ok((stream, transport, trusted_key))
+    Ok(handshake)
 }
 
 /// Why an invite pairing attempt failed. `UsernameTaken` is separated so the app
@@ -2263,6 +2332,7 @@ impl From<HandshakeFailure> for PairFailure {
     fn from(failure: HandshakeFailure) -> Self {
         match failure {
             HandshakeFailure::TransportEncryptionRequired => Self::TransportEncryptionRequired,
+            HandshakeFailure::Stopped => unreachable!("a standalone dial has no stop request"),
             HandshakeFailure::Other(error) => Self::Other(error),
         }
     }
@@ -2284,13 +2354,14 @@ impl From<HandshakeFailure> for DevicePairFailure {
     fn from(failure: HandshakeFailure) -> Self {
         match failure {
             HandshakeFailure::TransportEncryptionRequired => Self::TransportEncryptionRequired,
+            HandshakeFailure::Stopped => unreachable!("a standalone dial has no stop request"),
             HandshakeFailure::Other(error) => Self::Other(error),
         }
     }
 }
 
 fn pair_once(config: &ClientConfig, pairing_code: String) -> Result<(), PairFailure> {
-    let (mut stream, transport, trusted) = connect_and_handshake(config, false)?;
+    let (mut stream, transport, trusted) = connect_and_handshake_standalone(config, false)?;
     let mut control = transport.control_record();
     write_blocking_control(
         &mut stream,
@@ -2345,14 +2416,6 @@ fn write_blocking_control(
         .map_err(|error| format!("failed to write pairing request: {error}"))
 }
 
-fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
-    endpoint
-        .to_socket_addrs()
-        .map_err(|error| format!("{endpoint}: {error}"))?
-        .next()
-        .ok_or_else(|| format!("{endpoint}: no socket addresses resolved"))
-}
-
 /// Resolves the Ed25519 key to pin for a connection.
 ///
 /// A configured key is always pinned. With no configured key, `allow_tofu`
@@ -2402,6 +2465,27 @@ fn server_hello_read_error(
             "server accepted the connection but sent no hello ({error}); it may require an invite rather than open pairing"
         ),
     }
+}
+
+/// Reads one length-prefixed frame from a socket under dial.
+fn read_dial_frame(
+    dial: &mut Dial,
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, DialError> {
+    let mut len = [0u8; 4];
+    dial.read_exact(stream, &mut len, deadline)?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > frame::MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server frame exceeds maximum length",
+        )
+        .into());
+    }
+    let mut payload = vec![0u8; len];
+    dial.read_exact(stream, &mut payload, deadline)?;
+    Ok(payload)
 }
 
 fn read_blocking_frame(stream: &mut StdTcpStream) -> io::Result<Vec<u8>> {
@@ -7149,6 +7233,83 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::net::UnixStream;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unreachable_server_config(tcp_addr: String) -> ClientConfig {
+        ClientConfig {
+            udp_addr: tcp_addr.clone(),
+            tcp_addr,
+            udp_probe_addr: None,
+            username: "test".to_string(),
+            token: "test".to_string(),
+            server_public_key: None,
+            data_dir: None,
+            e2e_peer_pins: Vec::new(),
+            require_transport_encryption: true,
+            file_policy: FilePolicy::default(),
+            download_store: crate::receive_store::DownloadStore::new(1024 * 1024),
+            max_upload_bytes: 1024 * 1024,
+            upload_rate_bytes: 0,
+            media_transport: crate::config::MediaTransportSetting::Auto,
+            p2p_enabled: false,
+            candidate_privacy: CandidatePrivacy::Disabled,
+            prefer_ipv6: false,
+        }
+    }
+
+    #[test]
+    fn stop_interrupts_handshake_with_silent_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let client = NetworkClient::spawn(
+            unreachable_server_config(addr.to_string()),
+            NetworkEventSender::for_test(tx),
+        )
+        .unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        client.stop();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop blocked for {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Linux drops an inbound SYN while the listener's accept queue is full, so
+    /// a dial to this listener stays in `connect` the way it does against a
+    /// powered-off host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_interrupts_connect_to_blackholed_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_eq!(unsafe { libc::listen(listener.as_raw_sock(), 0) }, 0);
+        let addr = listener.local_addr().unwrap();
+        let _queued = std::net::TcpStream::connect(addr).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let client = NetworkClient::spawn(
+            unreachable_server_config(addr.to_string()),
+            NetworkEventSender::for_test(tx),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            rx.try_recv().is_err(),
+            "the dial should still be waiting on connect"
+        );
+
+        let started = Instant::now();
+        client.stop();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop blocked for {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn voice_udp_bind_applies_ef_qos() {

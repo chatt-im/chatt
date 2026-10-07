@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use mio::Waker;
+
 use rpc::{
     crypto::{CHANNEL_VIDEO, RecordProtection},
     ids::{SessionId, StreamId},
@@ -21,6 +23,7 @@ use rpc::{
 
 use super::{VideoFrameFanout, VideoTransport};
 use crate::app::{AppEvent, EventSender, ShareViewState};
+use crate::dial::{Dial, DialPoll};
 
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
@@ -143,6 +146,7 @@ impl ReconnectNotice {
 /// Handle to an active viewer connection. Dropping it tears the connection down.
 pub struct SubscriberHandle {
     stop: Arc<AtomicBool>,
+    waker: Arc<Waker>,
     state: Arc<AtomicU8>,
     join: Option<JoinHandle<()>>,
 }
@@ -154,6 +158,7 @@ impl SubscriberHandle {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        let _ = self.waker.wake();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -181,6 +186,9 @@ pub fn start(
     // cached-GOP boundary.
     fanout.begin_upstream_bootstrap(stream_id);
     let stop = Arc::new(AtomicBool::new(false));
+    let mut dial_poll = DialPoll::new()
+        .map_err(|error| format!("could not start video subscriber: {error}"))?;
+    let waker = Arc::clone(&dial_poll.waker);
     let state = Arc::new(AtomicU8::new(ShareViewState::WaitingForKeyframe.as_u8()));
     let thread_stop = stop.clone();
     let thread_state = state.clone();
@@ -196,12 +204,14 @@ pub fn start(
                 events,
                 generation,
                 thread_state,
+                &mut dial_poll.dial(Some(&thread_stop)),
                 &thread_stop,
             )
         })
         .map_err(|error| format!("could not start video subscriber: {error}"))?;
     Ok(SubscriberHandle {
         stop,
+        waker,
         state,
         join: Some(join),
     })
@@ -216,6 +226,7 @@ fn run(
     events: EventSender,
     generation: u64,
     state: Arc<AtomicU8>,
+    dial: &mut Dial,
     stop: &AtomicBool,
 ) {
     let mut notice = ReconnectNotice::new(stream_id, generation, events, state);
@@ -226,6 +237,7 @@ fn run(
             secret,
             video_transport,
             fanout,
+            dial,
             stop,
             &mut notice,
         ) {
@@ -237,7 +249,9 @@ fn run(
                     error = error.as_str()
                 );
                 notice.failed();
-                thread::sleep(RECONNECT_BACKOFF);
+                if dial.sleep_until(Instant::now() + RECONNECT_BACKOFF).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -252,10 +266,12 @@ fn run_once(
     secret: &[u8],
     video_transport: VideoTransport,
     fanout: &VideoFrameFanout,
+    dial: &mut Dial,
     stop: &AtomicBool,
     notice: &mut ReconnectNotice,
 ) -> Result<(), String> {
     let (stream, mut record_protection, mut recv) = super::open_video_connection(
+        dial,
         session_id,
         stream_id,
         VideoRole::Subscriber,
@@ -385,6 +401,38 @@ mod tests {
         KEY_LEN, TAG_LEN, TRANSPORT_HEADER_LEN, TransportCipher, VideoKeyRole, derive_video_keys,
     };
     use rpc::video;
+
+    #[test]
+    fn stop_interrupts_handshake_with_silent_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = VideoTransport::new(
+            listener.local_addr().unwrap(),
+            rpc::crypto::TransportMode::Encrypted,
+            [0u8; KEY_LEN],
+        );
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let mut handle = start(
+            SessionId(1),
+            StreamId(1),
+            1,
+            vec![0u8; KEY_LEN],
+            transport,
+            VideoFrameFanout::new(None),
+            EventSender(events),
+        )
+        .unwrap();
+        let (_accepted, _) = listener.accept().unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        handle.stop();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop blocked for {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn multi_record_residual_forwards_exact_backed_frames() {
