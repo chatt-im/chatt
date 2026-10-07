@@ -8549,4 +8549,126 @@ mod tests {
         );
         assert!(!room.local_voice_stream_ready(Some(UserId(1))));
     }
+
+    // ---- review repros -------------------------------------------------
+
+    /// While this client is not in any call, the lobby roster is the viewed
+    /// room's (`voice_room.or(viewed_room)`) and `participant_snapshot` returns
+    /// the cached `participants` for it. A remote user joining that room's
+    /// call must show up there, exactly as a fresh rebuild would show it.
+    #[test]
+    #[ignore = "BUG: remote VoiceStarted in the viewed room is not reflected in the lobby roster while the local user is not in a call — see review"]
+    fn review_viewed_room_roster_tracks_remote_voice_join_when_not_in_call() {
+        let mut room = test_room();
+        enter(
+            &mut room,
+            vec![user(UserId(1), "alice"), user(UserId(2), "bob")],
+            Vec::new(),
+            Some(UserId(1)),
+        );
+        assert_eq!(room.voice_room, None);
+        assert_eq!(room.viewed_room, Some(RoomId(1)));
+
+        // Exactly what App::handle_network_event_inner passes for a remote
+        // VoiceStarted: `voice_room` is the session's (None).
+        let voice_room = room.voice_room;
+        room.voice_started_transition(
+            RoomId(1),
+            SessionId(2),
+            UserId(2),
+            StreamId(10),
+            Some(SessionId(1)),
+            voice_room,
+            true,
+        );
+
+        let cached = room.participant_snapshot(Some(RoomId(1)));
+        let rebuilt = room.roster_seeds(RoomId(1));
+        assert_eq!(rebuilt.len(), 1, "canonical occupancy has bob in call");
+        assert_eq!(
+            cached.entries.len(),
+            1,
+            "lobby snapshot for the viewed room should list bob in the call"
+        );
+        assert!(cached.entries[0].voice_active);
+    }
+
+    /// A room the authenticated snapshot omitted is archived; if the server
+    /// later upserts it again, the archived copy must not linger beside the
+    /// live one.
+    #[test]
+    #[ignore = "BUG: RoomUpserted for an archived room leaves it in both metas and archived_metas (duplicate catalog rows; disconnect restores the stale meta) — see review"]
+    fn review_upsert_of_archived_room_does_not_duplicate_it() {
+        let mut room = test_room();
+        room.authenticated(
+            &[room_info(1), room_info(2)],
+            vec![user(UserId(1), "alice")],
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+        // Re-auth without room 2: archived.
+        room.authenticated(
+            &[room_info(1)],
+            vec![user(UserId(1), "alice")],
+            RoomId(1),
+            None,
+            Some(UserId(1)),
+        );
+        let mut renamed = room_info(2);
+        renamed.name = "room-2-renamed".to_string();
+        renamed.head = Some(MessageId(50));
+        room.upsert_room(&renamed, Some(UserId(1)));
+        room.chat_received(
+            message_in(RoomId(2), 50, UserId(1), "mine"),
+            Some(UserId(1)),
+        );
+        assert!(room.set_viewed_room(RoomId(2)));
+        assert_eq!(
+            room.room_meta(RoomId(2)).unwrap().last_read,
+            Some(MessageId(50))
+        );
+
+        let catalog = room.catalog(None);
+        let rows = catalog
+            .rooms
+            .iter()
+            .filter(|row| row.room_id == RoomId(2))
+            .count();
+        assert_eq!(rows, 1, "catalog lists room 2 once: {:?}", catalog.rooms);
+
+        // A disconnect restores archived rooms; the live meta must survive.
+        room.reset_for_disconnect();
+        let meta = room.room_meta(RoomId(2)).unwrap();
+        assert_eq!(meta.name, "room-2-renamed");
+        assert_eq!(meta.last_read, Some(MessageId(50)));
+    }
+
+    /// `App::promote_worker` calls `load_offline_catalog(.., self.user_id)`
+    /// right after `disconnect_network` cleared `user_id`, so the local user
+    /// is always unknown there. Any catalog save before authentication (view
+    /// switch, or `reset_room_for_disconnect` on a failed connect) must still
+    /// write the DM peer back unchanged.
+    #[test]
+    #[ignore = "BUG: offline-loaded DM rooms resolve their peer as UserId(0) and a pre-auth catalog save persists dm-peer = 0 — see review"]
+    fn review_offline_dm_catalog_round_trips_peer_without_local_user() {
+        let catalog = RoomCatalog {
+            last_viewed_room: Some(RoomId(0x8000_0001)),
+            last_voice_room: None,
+            rooms: vec![CatalogRoom {
+                room_id: RoomId(0x8000_0001),
+                name: "@bob".to_string(),
+                kind: CatalogRoomKind::Dm {
+                    peer: UserId(2),
+                    peer_name: "bob".to_string(),
+                },
+                last_read: None,
+            }],
+        };
+        let mut room = test_room();
+        room.load_offline_catalog(&catalog, None);
+
+        assert_eq!(room.dm_peer_of(RoomId(0x8000_0001)), Some(UserId(2)));
+        assert_eq!(room.catalog(None), catalog);
+    }
 }

@@ -3578,4 +3578,177 @@ mod tests {
         );
         assert!(!requested.contains(&local_device));
     }
+
+    // ---- review repros -------------------------------------------------
+
+    /// Alice (creator) builds a DM with Bob (the actor under test) and returns
+    /// Bob's installation plus the server-shaped Welcome for his device.
+    fn review_welcome_for_bob(
+        temp: &Path,
+    ) -> (LocalInstallation, rpc::mls::MlsWelcome, UserId, UserId) {
+        let server_id = [77; 32];
+        let (alice, _) =
+            LocalInstallation::open_or_create(&temp.join("alice"), server_id, UserId(1), "Alice")
+                .unwrap();
+        let (bob, _) =
+            LocalInstallation::open_or_create(&temp.join("bob"), server_id, UserId(2), "Bob")
+                .unwrap();
+        alice.install_roster(&bob.bootstrap.own_roster).unwrap();
+        bob.install_roster(&alice.bootstrap.own_roster).unwrap();
+        let descriptor = rpc::mls::EncryptedRoomDescriptor::new(
+            RoomId(9),
+            alice.bootstrap.account_id,
+            vec![alice.bootstrap.account_id, bob.bootstrap.account_id],
+            1,
+        )
+        .unwrap();
+        let package = bob
+            .client
+            .generate_key_packages(bob.bootstrap.device_id, 1)
+            .unwrap()
+            .remove(0);
+        let bundle = alice
+            .client
+            .create_room(&descriptor, &[(bob.bootstrap.device_id, package.package)])
+            .unwrap();
+        let shared = bundle.welcome.unwrap();
+        let welcome = rpc::mls::MlsWelcome {
+            delivery_id: 1,
+            sequence: 1,
+            device_id: bob.bootstrap.device_id,
+            descriptor: shared.descriptor,
+            welcome: shared.welcome,
+        };
+        (bob, welcome, UserId(1), UserId(2))
+    }
+
+    fn review_bound_actor(
+        bob: LocalInstallation,
+        bob_id: UserId,
+    ) -> (Actor, Arc<OutputQueue>, Poll) {
+        let (mut actor, outputs, poll) = test_actor(test_config(None));
+        actor.generation = 1;
+        actor.session_id = Some(SessionId(1));
+        actor.user_id = Some(bob_id);
+        actor.mls_bound = true;
+        actor.installation = Some(bob);
+        (actor, outputs, poll)
+    }
+
+    /// A Welcome queued in the device inbox for a room this account can no
+    /// longer access (removed from a private room / room deleted while the
+    /// device was offline) is delivered on every bind. It must not be a
+    /// session-fatal error: the actor's Fatal output disconnects the whole
+    /// network session, the welcome cursor is not advanced, and the next
+    /// reconnect fetches the same Welcome again — a permanent reconnect loop.
+    #[test]
+    #[ignore = "BUG: Welcome for a room absent from room_kinds is session-fatal and never acknowledged → permanent reconnect loop — see review"]
+    fn review_welcome_for_inaccessible_room_is_not_session_fatal() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bob, welcome, _alice_id, bob_id) = review_welcome_for_bob(temp.path());
+        let (mut actor, _outputs, _poll) = review_bound_actor(bob, bob_id);
+        // Room 9 is not in the authenticated snapshot: room_kinds is empty.
+        let result = actor.handle_server_control(ServerControl::MlsWelcomes {
+            welcomes: vec![welcome],
+            head_sequence: 1,
+        });
+        let cursor = actor
+            .installation
+            .as_ref()
+            .unwrap()
+            .client
+            .welcome_cursor()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "welcome for an inaccessible room failed the session: {result:?} (welcome cursor {cursor})"
+        );
+    }
+
+    /// An installation that is not linked for encrypted rooms ("Public rooms
+    /// remain available") still has DM/private rooms in its list, and the
+    /// worker routes `SendChat`/`EditChat`/`DeleteChat` for any non-public
+    /// room to the actor without checking `mls_available` (only files are
+    /// gated). The actor then fails the whole network session — dropping the
+    /// voice call — and the message is lost.
+    #[test]
+    #[ignore = "BUG: chat send to a DM/private room without an MLS installation is session-fatal (disconnects voice, drops the message) — see review"]
+    fn review_send_without_installation_is_not_session_fatal() {
+        let (mut actor, outputs, _poll) = test_actor(test_config(None));
+        actor.generation = 1;
+        actor.session_id = Some(SessionId(1));
+        actor.user_id = Some(UserId(1));
+        actor.room_kinds.insert(
+            RoomId(9),
+            RoomKind::Dm {
+                user_a: UserId(1),
+                user_b: UserId(2),
+            },
+        );
+        assert!(actor.installation.is_none());
+        let observed = run_inputs(
+            actor,
+            vec![
+                Input::Command(Command::SendContent {
+                    room_id: RoomId(9),
+                    content: rpc::mls::ChattEventContent::Text {
+                        body: "hello".to_string(),
+                    },
+                }),
+                Input::Shutdown,
+            ],
+            &outputs,
+        );
+        let fatal = observed.iter().find_map(|output| match output {
+            Output::Fatal { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            fatal, None,
+            "sending without an MLS identity killed the session"
+        );
+    }
+
+    /// The Welcome body is opaque to the delivery service (it only checks the
+    /// wire format and target device ids), so any room member's client can
+    /// put an undecryptable Welcome in a peer's inbox. One bad Welcome must
+    /// not fail every future session of the recipient.
+    #[test]
+    #[ignore = "BUG: an undecryptable peer-authored Welcome is session-fatal and never acknowledged → recipient stuck in a reconnect loop — see review"]
+    fn review_undecryptable_welcome_is_not_session_fatal() {
+        let temp = tempfile::tempdir().unwrap();
+        let (bob, mut welcome, alice_id, bob_id) = review_welcome_for_bob(temp.path());
+        // Flip one byte of the AEAD-protected tail; the envelope still parses
+        // as an MLS Welcome, which is all the server validates.
+        let last = welcome.welcome.len() - 1;
+        welcome.welcome[last] ^= 0x01;
+        chatt_mls::PublicGroupValidator::new(chatt_mls::ChattIdentityProvider::new(vec![77; 32]))
+            .validate_welcome(&welcome.welcome)
+            .expect("the delivery service accepts the corrupted Welcome");
+        let (mut actor, _outputs, _poll) = review_bound_actor(bob, bob_id);
+        actor.room_kinds.insert(
+            RoomId(9),
+            RoomKind::Dm {
+                user_a: alice_id,
+                user_b: bob_id,
+            },
+        );
+        actor.mls_installed_rosters.insert(alice_id);
+
+        let first = actor.handle_server_control(ServerControl::MlsWelcomes {
+            welcomes: vec![welcome.clone()],
+            head_sequence: 1,
+        });
+        let cursor = actor
+            .installation
+            .as_ref()
+            .unwrap()
+            .client
+            .welcome_cursor()
+            .unwrap();
+        assert!(
+            first.is_ok(),
+            "undecryptable welcome failed the session: {first:?} (welcome cursor stays {cursor}, so every reconnect re-fails)"
+        );
+    }
 }

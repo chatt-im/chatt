@@ -251,3 +251,59 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    /// MLS message ids carry the high bit (`1 << 63 | sequence`) and dynamic
+    /// open-pair user ids do too; both exceed `i64::MAX`, the TOML integer
+    /// range.
+    #[test]
+    fn catalog_round_trips_high_bit_mls_ids() {
+        let dir = room_history::server_dir("catalog-review-high-bit");
+        let catalog = RoomCatalog {
+            last_viewed_room: Some(RoomId(7)),
+            last_voice_room: None,
+            rooms: vec![CatalogRoom {
+                room_id: RoomId(7),
+                name: "dm".to_string(),
+                kind: CatalogRoomKind::Dm {
+                    peer: UserId((1 << 63) | 99),
+                    peer_name: "bob".to_string(),
+                },
+                last_read: Some(MessageId((1 << 63) | 5)),
+            }],
+        };
+        save(dir.as_deref(), &catalog);
+        assert_eq!(load(dir.as_deref()), catalog);
+    }
+
+    /// Room names are server-supplied. A single control character other than
+    /// \n \r \t must not make the whole catalog unloadable.
+    #[test]
+    #[ignore = "BUG: control char in a room name makes rooms.toml unparseable, wiping the whole catalog (read watermarks, last viewed/voice) — see review"]
+    fn catalog_round_trips_control_characters_in_names() {
+        let dir = room_history::server_dir("catalog-review-control-char");
+        let catalog = RoomCatalog {
+            last_viewed_room: Some(RoomId(1)),
+            last_voice_room: Some(RoomId(1)),
+            rooms: vec![
+                CatalogRoom {
+                    room_id: RoomId(1),
+                    name: "lobby".to_string(),
+                    kind: CatalogRoomKind::Public,
+                    last_read: Some(MessageId(42)),
+                },
+                CatalogRoom {
+                    room_id: RoomId(2),
+                    name: "bell\u{7}\u{1b}[31m\u{7f}".to_string(),
+                    kind: CatalogRoomKind::Public,
+                    last_read: Some(MessageId(9)),
+                },
+            ],
+        };
+        save(dir.as_deref(), &catalog);
+        assert_eq!(load(dir.as_deref()), catalog);
+    }
+}
