@@ -92,7 +92,6 @@ fn app_mut(app: &mut TestApp) -> &mut App {
 /// call. On real hardware that stream stays open, with its sink installed,
 /// until the user joins and leaves voice.
 #[test]
-#[ignore = "BUG: settings apply opens call playback while not in a call — see review"]
 fn settings_apply_does_not_open_call_playback_outside_a_call() {
     let (mut app, _network_rx) = connected_app();
     let app = app_mut(&mut app);
@@ -116,7 +115,6 @@ fn settings_apply_does_not_open_call_playback_outside_a_call() {
 /// change that touches the output restarts it, so a deafened user gets a live
 /// call playback stream (with the network sink attached) again.
 #[test]
-#[ignore = "BUG: settings apply re-opens call playback while deafened — see review"]
 fn settings_apply_does_not_open_call_playback_while_deafened() {
     let (mut app, _network_rx) = connected_app();
     let app = app_mut(&mut app);
@@ -143,7 +141,6 @@ fn settings_apply_does_not_open_call_playback_while_deafened() {
 /// that comes due on the first tick after the deafen reopens call playback
 /// for a deafened user (and nothing tears it down afterwards).
 #[test]
-#[ignore = "BUG: pending playback rebuild reopens playback after deafen — see review"]
 fn pending_playback_rebuild_does_not_reopen_playback_after_deafen() {
     let (mut app, _network_rx) = connected_app();
     let app = app_mut(&mut app);

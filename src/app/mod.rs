@@ -6981,7 +6981,7 @@ impl App {
             self.supervisor.playback.reset();
             if self.loopback_uses_dedicated_playback() {
                 self.restart_loopback_output();
-            } else {
+            } else if self.call_playback_should_run() || self.playback.is_some() {
                 self.restart_playback_stream();
             }
             applied.push("playback");
@@ -7023,13 +7023,16 @@ impl App {
         self.mic_error = None;
         self.playback_error = None;
         self.restart_capture_stream();
-        let playback_should_run = self.voice_tx_enabled.load(Ordering::Relaxed)
-            && !self.local_voice_state().is_deafened();
-        if playback_should_run || self.playback.is_some() {
+        if self.call_playback_should_run() || self.playback.is_some() {
             self.restart_playback_stream();
         }
         self.refresh_audio_devices();
         self.set_status("audio reset: rebuilding streams");
+    }
+
+    /// Whether call playback belongs open: in voice and not deafened.
+    fn call_playback_should_run(&self) -> bool {
+        self.voice_tx_enabled.load(Ordering::Relaxed) && !self.local_voice_state().is_deafened()
     }
 
     fn supervise(&mut self, now: Instant) -> bool {
@@ -7262,6 +7265,15 @@ impl App {
     }
 
     fn supervise_capture(&mut self, now: Instant) -> bool {
+        let should_run =
+            self.voice_tx_enabled.load(Ordering::Relaxed) || self.settings_preview_capture;
+        // Checked before any due rebuild, so one armed before the stream was
+        // dropped on purpose cannot reopen it.
+        if self.capture.is_none() && !should_run {
+            self.supervisor.capture_watch = CaptureWatch::default();
+            self.supervisor.capture.reset();
+            return false;
+        }
         let mut dirty = false;
         let apply_owns_restart = self
             .pending_audio_apply
@@ -7274,11 +7286,6 @@ impl App {
         }
         let Some(capture) = &self.capture else {
             self.supervisor.capture_watch = CaptureWatch::default();
-            let should_run =
-                self.voice_tx_enabled.load(Ordering::Relaxed) || self.settings_preview_capture;
-            if !should_run {
-                self.supervisor.capture.reset();
-            }
             return dirty;
         };
         let snapshot = capture.stats().snapshot();
@@ -7335,6 +7342,13 @@ impl App {
     }
 
     fn supervise_playback(&mut self, now: Instant) -> bool {
+        // Checked before any due rebuild, so one armed before a deafen or
+        // leave cannot reopen call playback.
+        if self.playback.is_none() && !self.call_playback_should_run() {
+            self.supervisor.playback_watch = PlaybackWatch::default();
+            self.supervisor.playback.reset();
+            return false;
+        }
         let mut dirty = false;
         let apply_owns_restart = self
             .pending_audio_apply
@@ -7347,11 +7361,6 @@ impl App {
         }
         let Some(playback) = &self.playback else {
             self.supervisor.playback_watch = PlaybackWatch::default();
-            let should_run = self.voice_tx_enabled.load(Ordering::Relaxed)
-                && !self.local_voice_state().is_deafened();
-            if !should_run {
-                self.supervisor.playback.reset();
-            }
             return dirty;
         };
         let snapshot = playback.stats();
@@ -7729,6 +7738,14 @@ impl App {
         }
         self.set_network_playback_sink(None);
         self.playback.take();
+        // Backstop: deafen is implemented by dropping call playback, so no
+        // restart path may bring it back.
+        if self.local_voice_state().is_deafened() {
+            if restore_loopback {
+                self.restart_loopback_output();
+            }
+            return;
+        }
         self.start_playback_stream(true);
         if restore_loopback {
             if self.playback.is_some() {
@@ -8670,6 +8687,8 @@ impl App {
             }
             self.set_network_playback_sink(None);
             self.playback.take();
+            self.supervisor.playback.reset();
+            self.supervisor.playback_watch = PlaybackWatch::default();
             self.drop_notification_playback();
         } else {
             self.pending_voice_teardown_at = None;
