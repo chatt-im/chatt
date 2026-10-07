@@ -487,10 +487,15 @@ impl LiveEncoderPipeline {
     pub(crate) fn note_capture_timestamp(&mut self, capture_ns: u64) -> Result<(), String> {
         // `effective` is the media index of the first sample of the incoming
         // chunk: accumulator `pending` holds the previous chunk's leftover, which
-        // the new samples are appended after.
+        // the new samples are appended after, and on a non-48 kHz device the
+        // resampler's partial block precedes them as well.
+        let resampler_backlog = self
+            .resampler
+            .as_ref()
+            .map_or(0, CaptureResampler::pending_len_48k);
         let effective = self
             .next_capture_sample
-            .wrapping_add(self.accumulator.pending.len() as u32);
+            .wrapping_add((self.accumulator.pending.len() + resampler_backlog) as u32);
         let gap_samples = self.capture_clock.observe(capture_ns, effective);
         self.capture_hole_suspected = self.capture_clock.hole_suspected();
         if gap_samples == 0 {
@@ -2754,7 +2759,6 @@ mod review_tests {
     /// callbacks, the clock "confirms" holes that never happened: the media
     /// clock jumps ahead and the Opus stream is reset, repeatedly.
     #[test]
-    #[ignore = "BUG: resampler backlog not counted by CaptureClock -> false holes on non-48k devices — see review"]
     fn perfect_timestamps_never_gap_on_resampled_devices() {
         let mut failures = Vec::new();
         for device_rate in [44_100u32, 96_000, 88_200, 32_000, 24_000, 16_000] {
@@ -2774,7 +2778,6 @@ mod review_tests {
     /// Irregular chunk sizes (as delivered by e.g. PulseAudio's ALSA plugin or
     /// WASAPI shared mode) at 44.1 kHz with perfect timestamps.
     #[test]
-    #[ignore = "BUG: resampler backlog not counted by CaptureClock -> false holes on non-48k devices — see review"]
     fn perfect_timestamps_never_gap_with_irregular_44k1_chunks() {
         let mut failures = Vec::new();
         for (seed, (lo, hi)) in [(1u64, (400u64, 500u64)), (2, (64, 1024)), (3, (300, 600))] {

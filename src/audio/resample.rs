@@ -58,6 +58,12 @@ impl CaptureResampler {
         }
         self.pending.drain(..start);
     }
+
+    /// Device-rate samples buffered in a partial block, expressed in 48 kHz
+    /// samples (rounded). They precede the next pushed chunk on the timeline.
+    pub(crate) fn pending_len_48k(&self) -> usize {
+        (self.pending.len() * FRAME_SAMPLES + self.src_block / 2) / self.src_block
+    }
 }
 
 /// Resamples the 48 kHz mixer output down or up to a non-48 kHz device rate,
