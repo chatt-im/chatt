@@ -1,6 +1,7 @@
 use chatt_mls::LocalInstallation;
 use hashbrown::{HashMap, HashSet};
 use std::{
+    cell::Cell,
     collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -1558,6 +1559,9 @@ fn run_worker(
     );
     let mut reconnect = ReconnectSchedule::new();
     let mut pending_authenticated_commands = VecDeque::new();
+    // The user's P2P preference outlives each session: a runtime
+    // `SetP2pEnabled` must still hold for every later `StartSession`.
+    let p2p_preference = Cell::new(config.p2p_enabled);
     let mls_runtime = match mls_actor::Runtime::spawn(
         config.clone(),
         events.clone(),
@@ -1590,6 +1594,7 @@ fn run_worker(
             &events,
             &commands,
             &mut pending_authenticated_commands,
+            &p2p_preference,
             &mut Dial::new(&mut poll, &waker, Some(stopping)),
             &mls_runtime,
             mls_generation,
@@ -1609,8 +1614,14 @@ fn run_worker(
                     "network connection attempt failed",
                     reason = reason.as_str()
                 );
-                match schedule_reconnect(&events, &commands, &mut reconnect, &mls_runtime, &reason)
-                {
+                match schedule_reconnect(
+                    &events,
+                    &commands,
+                    &mut reconnect,
+                    &mls_runtime,
+                    &p2p_preference,
+                    &reason,
+                ) {
                     RetryWait::Retry => {}
                     RetryWait::Shutdown => break,
                     RetryWait::Fatal(reason) => {
@@ -1646,6 +1657,7 @@ fn run_worker(
                         &commands,
                         &mut reconnect,
                         &mls_runtime,
+                        &p2p_preference,
                         &reason,
                     ) {
                         RetryWait::Retry => {}
@@ -1685,6 +1697,7 @@ fn run_worker_inner(
     events: &NetworkEventSender,
     commands: &Receiver<NetworkCommand>,
     pending_authenticated_commands: &mut VecDeque<NetworkCommand>,
+    p2p_preference: &Cell<bool>,
     dial: &mut Dial,
     mls_runtime: &mls_actor::Runtime,
     mls_generation: u64,
@@ -1719,7 +1732,7 @@ fn run_worker_inner(
     let media = media::MediaProtection::from_transport(&transport);
     // P2P is available only with transport encryption, regardless of the
     // client's P2P config.
-    let p2p_enabled = config.p2p_enabled && transport_mode == TransportMode::Encrypted;
+    let p2p_enabled = p2p_preference.get() && transport_mode == TransportMode::Encrypted;
     // Force-TCP sessions never touch UDP: no endpoint resolution, no socket,
     // and the shared media counter starts at zero for the lane's own Bind
     // instead of being consumed by an initial UDP bind.
@@ -1807,6 +1820,7 @@ fn run_worker_inner(
         mls_session_ready: false,
         mls_outputs: Vec::new(),
         config: config.clone(),
+        p2p_preference,
         events: events.clone(),
         voice: voice_control,
         voice_generation: mls_generation,
@@ -2135,11 +2149,12 @@ fn schedule_reconnect(
     commands: &Receiver<NetworkCommand>,
     reconnect: &mut ReconnectSchedule,
     mls_runtime: &mls_actor::Runtime,
+    p2p_preference: &Cell<bool>,
     reason: &str,
 ) -> RetryWait {
     let delay = reconnect.next_delay();
     report_reconnect_scheduled(events, delay, reason);
-    wait_for_reconnect(commands, delay, |room_id, sequence| {
+    wait_for_reconnect(commands, delay, p2p_preference, |room_id, sequence| {
         mls_runtime.queue_ui_dispatch_ack(room_id, sequence)
     })
 }
@@ -2159,6 +2174,7 @@ fn report_reconnect_scheduled(events: &NetworkEventSender, delay: Duration, reas
 fn wait_for_reconnect(
     commands: &Receiver<NetworkCommand>,
     delay: Duration,
+    p2p_preference: &Cell<bool>,
     mut acknowledge_mls_ui_dispatch: impl FnMut(RoomId, u64) -> Result<(), String>,
 ) -> RetryWait {
     let deadline = Instant::now() + delay;
@@ -2185,6 +2201,11 @@ fn wait_for_reconnect(
                     room_id = room_id.0,
                     sequence
                 );
+            }
+            Ok(NetworkCommand::SetP2pEnabled(enabled)) => {
+                // There is no session to apply it to, but the next one must
+                // start with it.
+                p2p_preference.set(enabled);
             }
             Ok(command) => {
                 if !matches!(
@@ -2571,6 +2592,8 @@ struct WorkerState<'a> {
     mls_session_ready: bool,
     mls_outputs: Vec<mls_actor::Output>,
     config: ClientConfig,
+    /// Survives sessions; see `run_worker`.
+    p2p_preference: &'a Cell<bool>,
     events: NetworkEventSender,
     voice: &'a voice::VoiceControl,
     voice_generation: u64,
@@ -4179,6 +4202,9 @@ impl WorkerState<'_> {
                 // this lifecycle wake raced with a successful reconnect.
             }
             NetworkCommand::SetP2pEnabled(enabled) => {
+                // Recorded for later sessions first, since one with
+                // transport encryption may still honor it.
+                self.p2p_preference.set(enabled);
                 // P2P stays off without transport encryption regardless of a
                 // runtime toggle.
                 if enabled && self.transport_mode != TransportMode::Encrypted {
@@ -8191,9 +8217,10 @@ mod tests {
     fn embedded_server_lifecycle_wakes_reconnect_backoff() {
         let (tx, rx) = mpsc::channel();
         tx.send(NetworkCommand::RetryConnection).unwrap();
+        let p2p = Cell::new(false);
 
         assert!(matches!(
-            wait_for_reconnect(&rx, Duration::from_secs(60), |_, _| Ok(())),
+            wait_for_reconnect(&rx, Duration::from_secs(60), &p2p, |_, _| Ok(())),
             RetryWait::Retry
         ));
     }
@@ -8208,9 +8235,10 @@ mod tests {
         .unwrap();
         tx.send(NetworkCommand::Shutdown).unwrap();
         let mut acknowledged = Vec::new();
+        let p2p = Cell::new(false);
 
         assert!(matches!(
-            wait_for_reconnect(&rx, Duration::from_secs(60), |room_id, sequence| {
+            wait_for_reconnect(&rx, Duration::from_secs(60), &p2p, |room_id, sequence| {
                 acknowledged.push((room_id, sequence));
                 Ok(())
             }),

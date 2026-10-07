@@ -2953,7 +2953,6 @@ mod client_net_review_p2p {
     /// user's host/reflexive addresses to peers they opted out of exposing
     /// them to. (The app does not re-send the toggle after `Authenticated`.)
     #[test]
-    #[ignore = "BUG: runtime P2P opt-out is silently re-enabled after a reconnect — see review"]
     fn review_runtime_p2p_opt_out_survives_reconnect() {
         let _guard = live_mls_e2e_guard();
         let root = temp_dir("review-p2p-optout");
