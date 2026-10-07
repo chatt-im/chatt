@@ -56,8 +56,10 @@ capture-silence-ramp-ms = 10
 room-height = 4
 max-composer-height = 6
 composer-padding = true
-# Copy clicked or drag-selected message rows: "off", "clipboard", or "primary".
+# Copy a clicked line or drag-selected text: "off", "clipboard", or "primary".
 copy-on-select = "off"
+# Clicking a URL: "open" runs `url-open`, "copy" copies it to the clipboard.
+link-click = "open"
 max-messages = 50000
 # Timeline rows kept above and below the selected row. A value larger than the
 # available space keeps the selection centered.
@@ -182,6 +184,18 @@ viewer = "panel"
 "LEFT" = "AdjustLeft"
 "RIGHT" = "AdjustRight"
 "v" = "ToggleVisual"
+"V" = "ToggleVisualLine"
+"0" = "LineStart"
+"^" = "FirstNonBlank"
+"$" = "LineEnd"
+"w" = "WordForward"
+"b" = "WordBack"
+"e" = "WordEnd"
+"W" = "BigWordForward"
+"B" = "BigWordBack"
+"E" = "BigWordEnd"
+"g j" = "RowDown"
+"g k" = "RowUp"
 "{" = "ParagraphBack"
 "}" = "ParagraphForward"
 "y" = "CopyLine"
@@ -189,7 +203,7 @@ viewer = "panel"
 "Y" = "CopyMessageRef"
 "r" = "InsertMessageRef"
 "o" = "OpenMessageRef"
-"e" = "EditMessage"
+"c" = "EditMessage"
 "d" = "DeleteMessage"
 "p" = "PasteClipboard"
 "C-v" = "PasteClipboard"
@@ -207,8 +221,9 @@ viewer = "panel"
 "F4" = "OpenRoomSettings"
 "." = "ToggleKeyPreview"
 
-# Active while the chat log has a visual-line selection (mouse drag or `v`).
-# `y` yanks the selection instead of the cursor line.
+# Active while the chat log has a visual selection: character-wise (`v` or a
+# mouse drag) or line-wise (`V`). `y` yanks the selection instead of the
+# cursor's line.
 [bindings.chat-visual]
 inherit = ["workspace"]
 "y" = "CopySelection"

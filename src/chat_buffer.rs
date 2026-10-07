@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use extui::{Style, vt::Modifier};
 use rpc::ids::{FileTransferId, MessageId, RoomId};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -159,10 +160,10 @@ mod viewport_tests {
         let mut viewport = ChatViewport::new(SyntaxTheme::default());
         viewport.reconcile(&history.history());
         viewport.ensure_cursor(&history.history(), 6);
-        viewport.toggle_visual_anchor(&history.history(), 6);
+        viewport.toggle_visual(&history.history(), VisualKind::Line, 6);
         assert_eq!(
             viewport.visual_text(&history.history(), 6).as_deref(),
-            Some("gamma")
+            Some("alpha beta gamma")
         );
     }
 
@@ -278,19 +279,18 @@ mod viewport_tests {
         viewport.reconcile(&history.history());
         viewport.ensure_cursor(&history.history(), 40);
         assert!(viewport.toggle_expand(&history.history(), 0, 40));
-        viewport.move_cursor_line(&history.history(), 20, 40);
+        viewport.move_cursor(&history.history(), ChatMotion::Down(20), 40);
 
         viewport
             .keep_cursor_visible(&history.history(), 40, 9, 3)
             .unwrap();
         let visible = viewport.visible_lines(&history.history(), 40, 9, 1);
         let cursor = viewport.cursor().unwrap();
+        let row = viewport.cursor_row(&history.history(), 40).unwrap();
         let selected = visible
             .iter()
             .position(|line| {
-                line.kind == LineKind::Body
-                    && line.entry == cursor.entry
-                    && line.line == cursor.line
+                line.kind == LineKind::Body && line.entry == cursor.entry && line.line == row
             })
             .expect("cursor row is visible");
         assert!(selected >= 3, "only {selected} rows above cursor");
@@ -299,18 +299,17 @@ mod viewport_tests {
         // The prior render installed a scroll anchor. Centering must discard
         // it instead of allowing the next visible-lines pass to restore the
         // old viewport.
-        viewport.move_cursor_line(&history.history(), 1, 40);
+        viewport.move_cursor(&history.history(), ChatMotion::Down(1), 40);
         viewport
             .keep_cursor_visible(&history.history(), 40, 9, 1_000)
             .unwrap();
         let visible = viewport.visible_lines(&history.history(), 40, 9, 1);
         let cursor = viewport.cursor().unwrap();
+        let row = viewport.cursor_row(&history.history(), 40).unwrap();
         let selected = visible
             .iter()
             .position(|line| {
-                line.kind == LineKind::Body
-                    && line.entry == cursor.entry
-                    && line.line == cursor.line
+                line.kind == LineKind::Body && line.entry == cursor.entry && line.line == row
             })
             .expect("centered cursor row is visible");
         assert_eq!(selected, 4);
@@ -331,12 +330,11 @@ mod viewport_tests {
             .unwrap();
         let visible = viewport.visible_lines(&history.history(), 40, 9, 1);
         let cursor = viewport.cursor().unwrap();
+        let row = viewport.cursor_row(&history.history(), 40).unwrap();
         let selected = visible
             .iter()
             .position(|line| {
-                line.kind == LineKind::Body
-                    && line.entry == cursor.entry
-                    && line.line == cursor.line
+                line.kind == LineKind::Body && line.entry == cursor.entry && line.line == row
             })
             .expect("scrolled cursor row is visible");
         assert!(selected >= 3);
@@ -651,6 +649,284 @@ mod viewport_tests {
         viewport.reconcile(&history.history());
         assert_eq!(viewport.scroll_offset(), 0);
     }
+
+    fn viewport_with(bodies: &[&str]) -> (TestHistory, ChatViewport) {
+        let mut history = TestHistory::new();
+        for (index, body) in bodies.iter().enumerate() {
+            history.push(index as u64 + 1, "alice", body);
+        }
+        let mut viewport = ChatViewport::new(SyntaxTheme::default());
+        viewport.reconcile(&history.history());
+        viewport.cursor_to_first();
+        (history, viewport)
+    }
+
+    fn step(
+        viewport: &mut ChatViewport,
+        history: &TestHistory,
+        motion: ChatMotion,
+        width: u16,
+    ) -> u32 {
+        viewport
+            .move_cursor(&history.history(), motion, width)
+            .unwrap()
+            .offset
+    }
+
+    #[test]
+    fn j_moves_by_logical_line_across_wrapped_rows() {
+        let (history, mut viewport) = viewport_with(&["alpha beta gamma\nsecond"]);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Down(1), 6), 17);
+        assert_eq!(viewport.cursor_row(&history.history(), 6), Some(3));
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Up(1), 6), 0);
+    }
+
+    #[test]
+    fn gj_moves_by_display_row() {
+        let (history, mut viewport) = viewport_with(&["alpha beta gamma\nsecond"]);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::RowDown(1), 6), 6);
+        assert_eq!(viewport.cursor_row(&history.history(), 6), Some(1));
+        assert_eq!(step(&mut viewport, &history, ChatMotion::RowUp(1), 6), 0);
+    }
+
+    #[test]
+    fn vertical_motion_keeps_virtual_column() {
+        let (history, mut viewport) = viewport_with(&["abcdef\nab\nabcdef"]);
+        for _ in 0..4 {
+            step(&mut viewport, &history, ChatMotion::Right, 40);
+        }
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Down(1), 40), 8);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Down(1), 40), 14);
+    }
+
+    #[test]
+    fn dollar_sticks_to_line_end_across_j() {
+        let (history, mut viewport) = viewport_with(&["ab\nabcdef"]);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::LineEnd, 40), 1);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Down(1), 40), 8);
+    }
+
+    #[test]
+    fn h_and_l_do_not_cross_logical_lines() {
+        let (history, mut viewport) = viewport_with(&["ab\ncd"]);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Left, 40), 0);
+        for _ in 0..3 {
+            step(&mut viewport, &history, ChatMotion::Right, 40);
+        }
+        assert_eq!(viewport.cursor().unwrap().offset, 1);
+    }
+
+    #[test]
+    fn line_start_and_first_non_blank_differ_on_indented_lines() {
+        let (history, mut viewport) = viewport_with(&["```\n    code\n```"]);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::FirstNonBlank, 40), 8);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::LineStart, 40), 4);
+    }
+
+    #[test]
+    fn word_motions_cross_lines_and_messages() {
+        let (history, mut viewport) = viewport_with(&["foo.bar baz", "  qux"]);
+        let forward = ChatMotion::WordForward(WordKind::Small);
+        assert_eq!(step(&mut viewport, &history, forward, 40), 3);
+        assert_eq!(step(&mut viewport, &history, forward, 40), 4);
+        assert_eq!(step(&mut viewport, &history, forward, 40), 8);
+        assert_eq!(step(&mut viewport, &history, forward, 40), 2);
+        assert_eq!(
+            viewport.cursor().unwrap().entry,
+            HistoryEntryId::Message(MessageId(2))
+        );
+        let back = ChatMotion::WordBack(WordKind::Small);
+        assert_eq!(step(&mut viewport, &history, back, 40), 8);
+        assert_eq!(
+            viewport.cursor().unwrap().entry,
+            HistoryEntryId::Message(MessageId(1))
+        );
+
+        viewport.cursor_to_first();
+        let end = ChatMotion::WordEnd(WordKind::Small);
+        assert_eq!(step(&mut viewport, &history, end, 40), 2);
+        assert_eq!(step(&mut viewport, &history, end, 40), 3);
+        assert_eq!(step(&mut viewport, &history, end, 40), 6);
+    }
+
+    #[test]
+    fn w_stops_on_empty_lines() {
+        let (history, mut viewport) = viewport_with(&["a\n\nb"]);
+        let forward = ChatMotion::WordForward(WordKind::Small);
+        step(&mut viewport, &history, forward, 40);
+        assert_eq!(viewport.cursor_row(&history.history(), 40), Some(1));
+        assert_eq!(step(&mut viewport, &history, forward, 40), 3);
+    }
+
+    #[test]
+    fn big_word_treats_punctuation_as_word() {
+        let (history, mut viewport) = viewport_with(&["foo.bar baz"]);
+        assert_eq!(
+            step(&mut viewport, &history, ChatMotion::WordForward(WordKind::Big), 40),
+            8
+        );
+        assert_eq!(
+            step(&mut viewport, &history, ChatMotion::WordBack(WordKind::Big), 40),
+            0
+        );
+        assert_eq!(
+            step(&mut viewport, &history, ChatMotion::WordEnd(WordKind::Big), 40),
+            6
+        );
+    }
+
+    #[test]
+    fn pill_is_a_single_cursor_stop() {
+        let code = rpc::msgref::MessageRef {
+            room_id: RoomId(1),
+            message_id: MessageId(1),
+        }
+        .encode();
+        let reference = format!("@@{code}");
+        let body = format!("see {reference} ok");
+        let (history, mut viewport) = viewport_with(&["target", &body]);
+        viewport.set_cursor(HistoryEntryId::Message(MessageId(2)));
+        let forward = ChatMotion::WordForward(WordKind::Small);
+        assert_eq!(step(&mut viewport, &history, forward, 80), 4);
+        let after = 4 + reference.len() as u32;
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Right, 80), after);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Left, 80), 4);
+
+        viewport.toggle_visual(&history.history(), VisualKind::Char, 80);
+        assert_eq!(
+            viewport.visual_text(&history.history(), 80).as_deref(),
+            Some(reference.as_str())
+        );
+    }
+
+    #[test]
+    fn linewise_yank_keeps_list_marker_and_code_indent() {
+        let (history, mut viewport) = viewport_with(&["- item one\n\n```\n  indented\n```"]);
+        assert_eq!(
+            viewport.cursor_line_text(&history.history(), 40).as_deref(),
+            Some("- item one")
+        );
+        step(&mut viewport, &history, ChatMotion::Down(2), 40);
+        assert_eq!(
+            viewport.cursor_line_text(&history.history(), 40).as_deref(),
+            Some("  indented")
+        );
+    }
+
+    #[test]
+    fn charwise_yank_slices_source_offsets() {
+        let (history, mut viewport) = viewport_with(&["hello **bold** world"]);
+        viewport.toggle_visual(&history.history(), VisualKind::Char, 40);
+        assert_eq!(
+            step(&mut viewport, &history, ChatMotion::WordForward(WordKind::Small), 40),
+            8
+        );
+        assert_eq!(
+            viewport.visual_text(&history.history(), 40).as_deref(),
+            Some("hello **b")
+        );
+    }
+
+    #[test]
+    fn selection_survives_reflow() {
+        let (history, mut viewport) = viewport_with(&["alpha beta gamma"]);
+        viewport.toggle_visual(&history.history(), VisualKind::Char, 6);
+        step(&mut viewport, &history, ChatMotion::Right, 6);
+        step(&mut viewport, &history, ChatMotion::Right, 6);
+        viewport.on_reflow(&history.history(), 40);
+        assert!(viewport.has_visual());
+        assert_eq!(
+            viewport.visual_text(&history.history(), 40).as_deref(),
+            Some("alp")
+        );
+    }
+
+    #[test]
+    fn collapse_clamps_cursor_into_preview() {
+        let body = (0..30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (history, mut viewport) = viewport_with(&[&body]);
+        assert!(viewport.toggle_expand(&history.history(), 0, 40));
+        step(&mut viewport, &history, ChatMotion::Down(25), 40);
+        assert_eq!(viewport.cursor_row(&history.history(), 40), Some(25));
+        assert!(viewport.toggle_expand(&history.history(), 0, 40));
+        assert_eq!(
+            viewport.cursor_row(&history.history(), 40),
+            Some(COLLAPSE_SHOW - 1)
+        );
+    }
+
+    #[test]
+    fn yank_omits_text_hidden_by_collapse() {
+        let body = (0..30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (history, mut viewport) = viewport_with(&[&body, "after"]);
+        viewport.toggle_visual(&history.history(), VisualKind::Line, 40);
+        step(&mut viewport, &history, ChatMotion::Down(COLLAPSE_SHOW), 40);
+        let text = viewport.visual_text(&history.history(), 40).unwrap();
+        let shown = (0..COLLAPSE_SHOW)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text, format!("{shown}\nafter"));
+    }
+
+    #[test]
+    fn generation_change_forgets_desired_column() {
+        let (mut history, mut viewport) = viewport_with(&["abcdef\nab"]);
+        step(&mut viewport, &history, ChatMotion::LineEnd, 40);
+        history.advance_generation();
+        viewport.reconcile(&history.history());
+        viewport.ensure_cursor(&history.history(), 40);
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Up(1), 40), 0);
+    }
+
+    #[test]
+    fn empty_line_has_a_cursor_stop() {
+        let (history, mut viewport) = viewport_with(&["a\n\nb"]);
+        step(&mut viewport, &history, ChatMotion::Down(1), 40);
+        assert_eq!(viewport.cursor_row(&history.history(), 40), Some(1));
+        assert_eq!(
+            viewport.cursor_line_text(&history.history(), 40).as_deref(),
+            Some("")
+        );
+        assert_eq!(step(&mut viewport, &history, ChatMotion::Down(1), 40), 3);
+    }
+
+    #[test]
+    fn cursor_line_marks_every_wrapped_row_and_one_cursor_cell() {
+        let (history, mut viewport) = viewport_with(&["alpha beta gamma\nsecond"]);
+        viewport.visible_lines(&history.history(), 6, 10, 1);
+        step(&mut viewport, &history, ChatMotion::Right, 6);
+        let marks = viewport.marks(&history.history(), 6);
+        for row in 0..3 {
+            let row_marks = viewport.row_marks(&history.history(), &marks, 0, row);
+            assert!(row_marks.cursor_line, "row {row} is in the logical line");
+            assert_eq!(row_marks.cursor_cell, (row == 0).then_some((1, 1)));
+        }
+        let other = viewport.row_marks(&history.history(), &marks, 0, 3);
+        assert!(!other.cursor_line);
+    }
+
+    #[test]
+    fn charwise_marks_cover_partial_rows() {
+        let (history, mut viewport) = viewport_with(&["alpha beta gamma"]);
+        viewport.visible_lines(&history.history(), 6, 10, 1);
+        step(&mut viewport, &history, ChatMotion::Right, 6);
+        viewport.toggle_visual(&history.history(), VisualKind::Char, 6);
+        step(&mut viewport, &history, ChatMotion::RowDown(1), 6);
+        let marks = viewport.marks(&history.history(), 6);
+        let first = viewport.row_marks(&history.history(), &marks, 0, 0);
+        let second = viewport.row_marks(&history.history(), &marks, 0, 1);
+        let third = viewport.row_marks(&history.history(), &marks, 0, 2);
+        assert_eq!(first.selected_cols, Some(1..5));
+        assert_eq!(second.selected_cols, Some(0..2));
+        assert_eq!(third.selected_cols, None);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -952,10 +1228,180 @@ struct LayoutCursor {
     line: usize,
 }
 
+/// A chat-log cursor position: a body byte offset within a stable history
+/// entry. Offsets are independent of wrap width, so a position survives
+/// reflow; [`ChatViewport`] snaps them onto the nearest visible cursor stop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewCursor {
     pub entry: HistoryEntryId,
-    pub line: usize,
+    /// Body byte offset. `u32::MAX` means the first non-blank stop of the
+    /// entry's last visible line.
+    pub offset: u32,
+}
+
+/// Shape of the chat log's visual selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VisualKind {
+    /// `v`: from the anchor's stop through the cursor's stop.
+    #[default]
+    Char,
+    /// `V`: every logical line between the anchor and the cursor.
+    Line,
+}
+
+/// Whether a word motion splits punctuation from keyword runs (`w`) or treats
+/// any non-blank run as one word (`W`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordKind {
+    Small,
+    Big,
+}
+
+/// A vim cursor motion in the chat log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatMotion {
+    /// `h`: previous stop on the logical line.
+    Left,
+    /// `l`: next stop on the logical line.
+    Right,
+    /// `0`
+    LineStart,
+    /// `^`
+    FirstNonBlank,
+    /// `$`
+    LineEnd,
+    /// `j`: logical lines down.
+    Down(usize),
+    /// `k`: logical lines up.
+    Up(usize),
+    /// `gj`: wrapped display rows down.
+    RowDown(usize),
+    /// `gk`: wrapped display rows up.
+    RowUp(usize),
+    /// `w` / `W`
+    WordForward(WordKind),
+    /// `b` / `B`
+    WordBack(WordKind),
+    /// `e` / `E`
+    WordEnd(WordKind),
+}
+
+/// Vim's `curswant`: the column vertical motions aim for, kept across lines
+/// that are too short to hold it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesiredColumn {
+    /// Cells from the start of the logical line, for `j`/`k`.
+    Logical(usize),
+    /// Screen column within the row, for `gj`/`gk`.
+    Screen(u16),
+    /// The line end, set by `$`.
+    End,
+}
+
+/// The cursor resolved against the current layout.
+#[derive(Clone, Copy, Debug)]
+struct CursorSpot {
+    message: usize,
+    /// Logical line within `message`.
+    line: usize,
+    /// Index of `stop` among the logical line's stops.
+    index: usize,
+    stop: Stop,
+}
+
+impl CursorSpot {
+    fn layout(self) -> LayoutCursor {
+        LayoutCursor {
+            message: self.message,
+            line: self.stop.row,
+        }
+    }
+
+    fn position(self) -> (usize, u32) {
+        (self.message, self.stop.offset)
+    }
+}
+
+/// A cursor walking stops in reading order across logical lines and messages,
+/// for word motions.
+struct StopWalk {
+    message: usize,
+    line: usize,
+    index: usize,
+    stops: Vec<Stop>,
+}
+
+impl StopWalk {
+    fn current(&self) -> Stop {
+        self.stops[self.index]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    SameLine,
+    NewLine,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Down,
+    Up,
+}
+
+/// Index of the first non-blank stop, or the last stop of an all-blank line.
+fn first_non_blank(stops: &[Stop]) -> usize {
+    stops
+        .iter()
+        .position(|stop| stop.class != CharClass::Whitespace)
+        .unwrap_or(stops.len().saturating_sub(1))
+}
+
+/// Cells before stop `index` on its logical line: vim's virtual column.
+fn logical_col(stops: &[Stop], index: usize) -> usize {
+    stops[..index]
+        .iter()
+        .map(|stop| stop.width as usize)
+        .sum()
+}
+
+/// The last stop whose logical column does not pass `want`.
+fn index_at_logical_col(stops: &[Stop], want: usize) -> usize {
+    let mut col = 0usize;
+    let mut found = 0;
+    for (index, stop) in stops.iter().enumerate() {
+        if col > want {
+            break;
+        }
+        found = index;
+        col = col.saturating_add(stop.width as usize);
+    }
+    found
+}
+
+/// The cursor and visual selection resolved once per frame, so each rendered
+/// row can be classified without re-resolving them.
+pub struct ChatMarks {
+    cursor: Option<(CursorSpot, Range<usize>)>,
+    selection: Option<(VisualKind, CursorSpot, CursorSpot)>,
+    /// For a line selection, the first row of the oldest line and the last
+    /// row of the newest, as `(message, row)` pairs.
+    line_rows: Option<((usize, usize), (usize, usize))>,
+}
+
+/// How one body row draws against the chat cursor and visual selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RowMarks {
+    /// The row belongs to the cursor's logical line.
+    pub cursor_line: bool,
+    /// The row holds the cursor cell.
+    pub cursor_row: bool,
+    /// The whole row is inside a line-wise selection.
+    pub line_selected: bool,
+    /// Columns covered by a character-wise selection on this row.
+    pub selected_cols: Option<Range<u16>>,
+    /// Column and width of the cursor cell, when on this row.
+    pub cursor_cell: Option<(u16, u16)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1036,13 +1482,19 @@ pub struct ChatViewport {
     observed_revision: Revision,
     scroll_offset: usize,
     scroll_anchor: Option<ViewScrollAnchor>,
-    /// Navigation cursor; `None` only while the buffer is empty. A stale
-    /// `line` (after reflow or collapse) is clamped lazily by
-    /// [`Self::ensure_cursor`].
+    /// Navigation cursor; `None` only while the buffer is empty. An offset
+    /// that no longer names a visible stop (after an edit or collapse) is
+    /// snapped lazily by [`Self::ensure_cursor`].
     cursor: Option<ViewCursor>,
-    /// `Some` means a line-wise visual selection spans `anchor..=cursor`,
-    /// order-normalized. Keyboard visual mode and mouse drags share this.
+    /// `Some` means a visual selection of kind [`Self::visual`] spans
+    /// `anchor..=cursor`, order-normalized. Keyboard visual mode and mouse
+    /// drags share this.
     anchor: Option<ViewCursor>,
+    visual: VisualKind,
+    /// Column vertical motions aim for. Belongs to the current cursor
+    /// position: anything that places the cursor other than a vertical
+    /// motion or a viewport scroll resets it.
+    desired: Option<DesiredColumn>,
     /// A mouse drag is in progress; releasing with `anchor == cursor` (a
     /// click) clears the anchor, leaving a plain cursor move.
     dragging: bool,
@@ -1074,6 +1526,8 @@ impl ChatViewport {
             scroll_anchor: None,
             cursor: None,
             anchor: None,
+            visual: VisualKind::Char,
+            desired: None,
             dragging: false,
             syntax,
             room_id: None,
@@ -1171,15 +1625,17 @@ impl ChatViewport {
         if self.cursor.is_none() && !self.entries.is_empty() {
             self.cursor = self.entries.last().map(|entry| ViewCursor {
                 entry: entry.id,
-                line: 0,
+                offset: 0,
             });
             self.anchor = None;
+            self.desired = None;
         }
         if follow.following && follow.cursor_at_tail && self.anchor.is_none() {
             self.cursor = self.entries.last().map(|entry| ViewCursor {
                 entry: entry.id,
-                line: usize::MAX,
+                offset: u32::MAX,
             });
+            self.desired = None;
         }
     }
 
@@ -1201,6 +1657,7 @@ impl ChatViewport {
             self.scroll_offset = 0;
             self.cursor = None;
             self.anchor = None;
+            self.desired = None;
             self.scroll_anchor = None;
             self.dragging = false;
         }
@@ -1398,13 +1855,13 @@ impl ChatViewport {
         self.cursor = self.cursor.and_then(|cursor| {
             Some(ViewCursor {
                 entry: successor(cursor.entry, cursor_position)?,
-                line: cursor.line,
+                offset: cursor.offset,
             })
         });
         self.anchor = self.anchor.and_then(|anchor| {
             Some(ViewCursor {
                 entry: successor(anchor.entry, anchor_position)?,
-                line: anchor.line,
+                offset: anchor.offset,
             })
         });
         self.scroll_anchor = self.scroll_anchor.and_then(|anchor| {
@@ -1663,9 +2120,12 @@ impl ChatViewport {
             .get(index)
             .or_else(|| index.checked_sub(1).and_then(|prev| self.entries.get(prev)))
             .map(|entry| entry.id);
+        if self.cursor.is_some_and(|current| current.entry == id) {
+            self.desired = None;
+        }
         for cursor in [&mut self.cursor, &mut self.anchor] {
             if cursor.is_some_and(|current| current.entry == id) {
-                *cursor = replacement.map(|entry| ViewCursor { entry, line: 0 });
+                *cursor = replacement.map(|entry| ViewCursor { entry, offset: 0 });
             }
         }
         if self.scroll_anchor.is_some_and(|anchor| anchor.entry == id) {
@@ -1702,11 +2162,16 @@ impl ChatViewport {
         }
         self.entries.truncate(kept);
         let front = self.entries.first().map(|entry| entry.id);
+        if let Some(current) = self.cursor
+            && !self.entries.iter().any(|entry| entry.id == current.entry)
+        {
+            self.desired = None;
+        }
         for cursor in [&mut self.cursor, &mut self.anchor] {
             if let Some(current) = cursor
                 && !self.entries.iter().any(|entry| entry.id == current.entry)
             {
-                *cursor = front.map(|entry| ViewCursor { entry, line: 0 });
+                *cursor = front.map(|entry| ViewCursor { entry, offset: 0 });
             }
         }
         if let Some(anchor) = self.scroll_anchor
@@ -1863,6 +2328,7 @@ impl ChatViewport {
         self.scroll_anchor = None;
         self.cursor = None;
         self.anchor = None;
+        self.desired = None;
         self.dragging = false;
         self.layout_index.clear();
         self.bump_layout_epoch();
@@ -2109,32 +2575,181 @@ impl ChatViewport {
             .saturating_sub(height as usize)
     }
 
-    fn layout_cursor(&self, cursor: ViewCursor) -> Option<LayoutCursor> {
-        Some(LayoutCursor {
-            message: self
-                .entries
+    /// Fills `out` with the stops of logical line `line` of `message`, clipped
+    /// to its collapse-visible rows.
+    fn load_line_stops(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        line: usize,
+        width: u16,
+        out: &mut Vec<Stop>,
+    ) {
+        let visible = self.visible_body_lines(history, message, width);
+        self.ensure_lines(history, message, width);
+        out.clear();
+        let view = &self.entries[message];
+        let body = self
+            .resolve_record(history, view.id)
+            .map_or("", |record| record.body);
+        view.layout().line_stops(line, visible, body, out);
+    }
+
+    /// Number of logical lines of `message` with a collapse-visible row.
+    fn visible_lines_of(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        width: u16,
+    ) -> usize {
+        let visible = self.visible_body_lines(history, message, width);
+        self.ensure_lines(history, message, width);
+        self.entries[message]
+            .layout()
+            .visible_logical_lines(visible)
+    }
+
+    /// Resolves `cursor` onto the stop it names: the last visible stop at or
+    /// before its offset, so offsets inside hidden markup or a collapsed tail
+    /// snap to what is on screen. Leaves the stops of its line in `stops`.
+    fn locate(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        cursor: ViewCursor,
+        width: u16,
+        stops: &mut Vec<Stop>,
+    ) -> Option<CursorSpot> {
+        let message = self.entry_index(cursor.entry)?;
+        let visible = self.visible_body_lines(history, message, width);
+        self.ensure_lines(history, message, width);
+        let layout = self.entries[message].layout();
+        let line = if cursor.offset == u32::MAX {
+            layout.visible_logical_lines(visible) - 1
+        } else {
+            layout.logical_line_of_row(layout.row_at_offset(cursor.offset, visible))
+        };
+        self.load_line_stops(history, message, line, width, stops);
+        let index = if cursor.offset == u32::MAX {
+            first_non_blank(stops)
+        } else {
+            stops
                 .iter()
-                .position(|entry| entry.id == cursor.entry)?,
-            line: cursor.line,
+                .rposition(|stop| stop.offset <= cursor.offset)
+                .unwrap_or(0)
+        };
+        Some(CursorSpot {
+            message,
+            line,
+            index,
+            stop: stops[index],
         })
     }
 
-    /// Places the cursor and anchor at `pos` and starts a mouse drag.
-    pub fn begin_drag(&mut self, pos: ViewCursor) {
-        self.cursor = self
-            .entries
-            .iter()
-            .any(|entry| entry.id == pos.entry)
-            .then_some(pos);
+    fn place(&mut self, message: usize, stop: Stop) -> Option<ViewCursor> {
+        self.cursor = Some(ViewCursor {
+            entry: self.entries[message].id,
+            offset: stop.offset,
+        });
+        self.cursor
+    }
+
+    /// The stop on wrapped `row` of `message` covering screen column `col`,
+    /// or the nearest one on that row.
+    fn stop_on_row(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        row: usize,
+        col: u16,
+        width: u16,
+    ) -> Option<Stop> {
+        self.ensure_lines(history, message, width);
+        let line = self.entries[message].layout().logical_line_of_row(row);
+        let mut stops = Vec::new();
+        self.load_line_stops(history, message, line, width, &mut stops);
+        let mut on_row = stops.iter().filter(|stop| stop.row == row);
+        let first = on_row.clone().next();
+        on_row
+            .rfind(|stop| stop.col <= col)
+            .or(first)
+            .or(stops.first())
+            .copied()
+    }
+
+    /// The visible logical line after `line` of `message`, crossing into the
+    /// next message.
+    fn line_after(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        line: usize,
+        width: u16,
+    ) -> Option<(usize, usize)> {
+        if line + 1 < self.visible_lines_of(history, message, width) {
+            return Some((message, line + 1));
+        }
+        (message + 1 < self.entries.len()).then_some((message + 1, 0))
+    }
+
+    /// The visible logical line before `line` of `message`, crossing into the
+    /// previous message's last visible line.
+    fn line_before(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        line: usize,
+        width: u16,
+    ) -> Option<(usize, usize)> {
+        if line > 0 {
+            return Some((message, line - 1));
+        }
+        let message = message.checked_sub(1)?;
+        Some((message, self.visible_lines_of(history, message, width) - 1))
+    }
+
+    /// Places the cursor and a character-wise anchor at the stop under
+    /// `(row, col)` of `entry` and starts a mouse drag.
+    pub fn begin_drag(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        entry: HistoryEntryId,
+        row: usize,
+        col: u16,
+        width: u16,
+    ) {
+        let Some(message) = self.entry_index(entry) else {
+            return;
+        };
+        let Some(stop) = self.stop_on_row(history, message, row, col, width) else {
+            return;
+        };
+        self.place(message, stop);
+        self.desired = None;
         self.anchor = self.cursor;
+        self.visual = VisualKind::Char;
         self.dragging = true;
     }
 
-    /// Moves the cursor of an in-progress drag to `pos`; the anchor stays.
-    pub fn drag_to(&mut self, pos: ViewCursor) {
-        if self.dragging && self.entries.iter().any(|entry| entry.id == pos.entry) {
-            self.cursor = Some(pos);
+    /// Moves the cursor of an in-progress drag to the stop under `(row, col)`
+    /// of `entry`; the anchor stays.
+    pub fn drag_to(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        entry: HistoryEntryId,
+        row: usize,
+        col: u16,
+        width: u16,
+    ) {
+        if !self.dragging {
+            return;
         }
+        let Some(message) = self.entry_index(entry) else {
+            return;
+        };
+        let Some(stop) = self.stop_on_row(history, message, row, col, width) else {
+            return;
+        };
+        self.place(message, stop);
     }
 
     /// Finishes a drag. A click (no movement since [`Self::begin_drag`])
@@ -2161,8 +2776,15 @@ impl ChatViewport {
         self.cursor
     }
 
-    /// Returns a valid cursor, defaulting to the last body line of the newest
-    /// message and clamping stale coordinates. `None` only when empty.
+    /// The wrapped row within its message that the cursor sits on.
+    #[cfg(test)]
+    pub fn cursor_row(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> Option<usize> {
+        Some(self.ensure_layout_cursor(history, width)?.stop.row)
+    }
+
+    /// Returns a valid cursor, defaulting to the start of the newest message's
+    /// last line and snapping stale offsets onto a visible stop. `None` only
+    /// when empty.
     pub fn ensure_cursor(
         &mut self,
         history: &RoomHistoryRef<'_>,
@@ -2176,7 +2798,7 @@ impl ChatViewport {
         &mut self,
         history: &RoomHistoryRef<'_>,
         width: u16,
-    ) -> Option<LayoutCursor> {
+    ) -> Option<CursorSpot> {
         if self.entries.is_empty() {
             self.cursor = None;
             self.anchor = None;
@@ -2185,51 +2807,290 @@ impl ChatViewport {
         if self.cursor.is_none() {
             self.cursor = Some(ViewCursor {
                 entry: self.entries.last()?.id,
-                line: usize::MAX,
+                offset: u32::MAX,
             });
+            self.desired = None;
         }
-        self.clamp_positions(history, width);
-        self.layout_cursor(self.cursor?)
+        self.clamp_positions(history, width)
     }
 
-    /// Moves the cursor to a stable history entry, clearing any visual anchor.
+    /// Moves the cursor to the start of a stable history entry, clearing any
+    /// visual anchor.
     pub fn set_cursor(&mut self, entry: HistoryEntryId) -> Option<ViewCursor> {
         if !self.entries.iter().any(|candidate| candidate.id == entry) {
             return None;
         }
-        self.cursor = Some(ViewCursor { entry, line: 0 });
+        self.cursor = Some(ViewCursor { entry, offset: 0 });
         self.anchor = None;
+        self.desired = None;
         self.cursor()
     }
 
-    /// Moves the cursor `delta` visible body lines, walking across messages,
-    /// clamping at the buffer edges. Lines hidden by collapse are never
-    /// visited.
-    pub fn move_cursor_line(
+    /// Applies a vim motion. Vertical motions skip lines hidden by collapse
+    /// and clamp at the buffer edges; `h`/`l` never leave the logical line.
+    pub fn move_cursor(
         &mut self,
         history: &RoomHistoryRef<'_>,
-        delta: isize,
+        motion: ChatMotion,
         width: u16,
     ) -> Option<ViewCursor> {
-        let mut cursor = self.ensure_layout_cursor(history, width)?;
-        for _ in 0..delta.unsigned_abs() {
-            let next = if delta > 0 {
-                self.next_body_pos(history, cursor, width)
-            } else {
-                self.prev_body_pos(history, cursor, width)
-            };
-            let Some(next) = next else { break };
-            cursor = next;
+        let spot = self.ensure_layout_cursor(history, width)?;
+        let mut stops = Vec::new();
+        self.load_line_stops(history, spot.message, spot.line, width, &mut stops);
+        match motion {
+            ChatMotion::Left => {
+                self.desired = None;
+                self.place(spot.message, stops[spot.index.saturating_sub(1)])
+            }
+            ChatMotion::Right => {
+                self.desired = None;
+                let index = (spot.index + 1).min(stops.len() - 1);
+                self.place(spot.message, stops[index])
+            }
+            ChatMotion::LineStart => {
+                self.desired = None;
+                self.place(spot.message, stops[0])
+            }
+            ChatMotion::FirstNonBlank => {
+                self.desired = None;
+                self.place(spot.message, stops[first_non_blank(&stops)])
+            }
+            ChatMotion::LineEnd => {
+                self.desired = Some(DesiredColumn::End);
+                self.place(spot.message, stops[stops.len() - 1])
+            }
+            ChatMotion::Down(count) => {
+                self.move_lines(history, spot, &stops, count, Direction::Down, width)
+            }
+            ChatMotion::Up(count) => {
+                self.move_lines(history, spot, &stops, count, Direction::Up, width)
+            }
+            ChatMotion::RowDown(count) => {
+                self.move_rows(history, spot, count, Direction::Down, width)
+            }
+            ChatMotion::RowUp(count) => self.move_rows(history, spot, count, Direction::Up, width),
+            ChatMotion::WordForward(kind) => {
+                let mut walk = self.walk_from(spot, stops);
+                self.word_forward(history, &mut walk, kind, width);
+                self.desired = None;
+                self.place(walk.message, walk.current())
+            }
+            ChatMotion::WordBack(kind) => {
+                let mut walk = self.walk_from(spot, stops);
+                self.word_back(history, &mut walk, kind, width);
+                self.desired = None;
+                self.place(walk.message, walk.current())
+            }
+            ChatMotion::WordEnd(kind) => {
+                let mut walk = self.walk_from(spot, stops);
+                self.word_end(history, &mut walk, kind, width);
+                self.desired = None;
+                self.place(walk.message, walk.current())
+            }
         }
-        self.cursor = Some(ViewCursor {
-            entry: self.entries[cursor.message].id,
-            line: cursor.line,
-        });
-        self.cursor()
     }
 
-    /// Moves the cursor to the first body line of the block `delta` blocks
-    /// away (a sender-group heading boundary), clamping at the ends.
+    /// `j`/`k`: steps `count` logical lines, landing on the stop nearest the
+    /// desired logical column.
+    fn move_lines(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        spot: CursorSpot,
+        stops: &[Stop],
+        count: usize,
+        direction: Direction,
+        width: u16,
+    ) -> Option<ViewCursor> {
+        let want = match self.desired {
+            Some(DesiredColumn::Logical(col)) => col,
+            Some(DesiredColumn::End) => usize::MAX,
+            Some(DesiredColumn::Screen(_)) | None => logical_col(stops, spot.index),
+        };
+        let (mut message, mut line) = (spot.message, spot.line);
+        for _ in 0..count {
+            let next = match direction {
+                Direction::Down => self.line_after(history, message, line, width),
+                Direction::Up => self.line_before(history, message, line, width),
+            };
+            let Some(next) = next else { break };
+            (message, line) = next;
+        }
+        let mut stops = Vec::new();
+        self.load_line_stops(history, message, line, width, &mut stops);
+        self.desired = Some(match want {
+            usize::MAX => DesiredColumn::End,
+            col => DesiredColumn::Logical(col),
+        });
+        self.place(message, stops[index_at_logical_col(&stops, want)])
+    }
+
+    /// `gj`/`gk`: steps `count` wrapped rows, landing on the stop nearest the
+    /// desired screen column.
+    fn move_rows(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        spot: CursorSpot,
+        count: usize,
+        direction: Direction,
+        width: u16,
+    ) -> Option<ViewCursor> {
+        let col = self.desired_screen_col(spot);
+        let mut pos = spot.layout();
+        for _ in 0..count {
+            let next = match direction {
+                Direction::Down => self.next_body_pos(history, pos, width),
+                Direction::Up => self.prev_body_pos(history, pos, width),
+            };
+            let Some(next) = next else { break };
+            pos = next;
+        }
+        let stop = self.stop_on_row(history, pos.message, pos.line, col, width)?;
+        if col != u16::MAX {
+            self.desired = Some(DesiredColumn::Screen(col));
+        }
+        self.place(pos.message, stop)
+    }
+
+    /// The screen column a row-wise move from `spot` aims for: `u16::MAX`
+    /// for a `$` cursor, otherwise any remembered `gj`/`gk` column or the
+    /// cursor's own.
+    fn desired_screen_col(&self, spot: CursorSpot) -> u16 {
+        match self.desired {
+            Some(DesiredColumn::Screen(col)) => col,
+            Some(DesiredColumn::End) => u16::MAX,
+            Some(DesiredColumn::Logical(_)) | None => spot.stop.col,
+        }
+    }
+
+    fn walk_from(&self, spot: CursorSpot, stops: Vec<Stop>) -> StopWalk {
+        StopWalk {
+            message: spot.message,
+            line: spot.line,
+            index: spot.index,
+            stops,
+        }
+    }
+
+    fn walk_next(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        walk: &mut StopWalk,
+        width: u16,
+    ) -> Option<Step> {
+        if walk.index + 1 < walk.stops.len() {
+            walk.index += 1;
+            return Some(Step::SameLine);
+        }
+        let (message, line) = self.line_after(history, walk.message, walk.line, width)?;
+        self.load_line_stops(history, message, line, width, &mut walk.stops);
+        walk.message = message;
+        walk.line = line;
+        walk.index = 0;
+        Some(Step::NewLine)
+    }
+
+    fn walk_prev(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        walk: &mut StopWalk,
+        width: u16,
+    ) -> Option<Step> {
+        if walk.index > 0 {
+            walk.index -= 1;
+            return Some(Step::SameLine);
+        }
+        let (message, line) = self.line_before(history, walk.message, walk.line, width)?;
+        self.load_line_stops(history, message, line, width, &mut walk.stops);
+        walk.message = message;
+        walk.line = line;
+        walk.index = walk.stops.len() - 1;
+        Some(Step::NewLine)
+    }
+
+    /// `w`: past the current word, then past blanks and line breaks to the
+    /// next word or empty line.
+    fn word_forward(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        walk: &mut StopWalk,
+        kind: WordKind,
+        width: u16,
+    ) {
+        let start = walk.current().class.widen(kind);
+        if start.is_word() {
+            loop {
+                let Some(step) = self.walk_next(history, walk, width) else {
+                    return;
+                };
+                if step == Step::NewLine || walk.current().class.widen(kind) != start {
+                    break;
+                }
+            }
+        } else if self.walk_next(history, walk, width).is_none() {
+            return;
+        }
+        while walk.current().class == CharClass::Whitespace {
+            if self.walk_next(history, walk, width).is_none() {
+                return;
+            }
+        }
+    }
+
+    /// `e`: forward at least one stop, past blanks and empty lines, then to
+    /// the last stop of that word.
+    fn word_end(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        walk: &mut StopWalk,
+        kind: WordKind,
+        width: u16,
+    ) {
+        if self.walk_next(history, walk, width).is_none() {
+            return;
+        }
+        while !walk.current().class.is_word() {
+            if self.walk_next(history, walk, width).is_none() {
+                return;
+            }
+        }
+        let class = walk.current().class.widen(kind);
+        while walk
+            .stops
+            .get(walk.index + 1)
+            .is_some_and(|stop| stop.class.widen(kind) == class)
+        {
+            walk.index += 1;
+        }
+    }
+
+    /// `b`: back at least one stop, past blanks and line breaks, then to the
+    /// first stop of that word. An empty line is a word of its own.
+    fn word_back(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        walk: &mut StopWalk,
+        kind: WordKind,
+        width: u16,
+    ) {
+        if self.walk_prev(history, walk, width).is_none() {
+            return;
+        }
+        while walk.current().class == CharClass::Whitespace {
+            if self.walk_prev(history, walk, width).is_none() {
+                return;
+            }
+        }
+        let class = walk.current().class.widen(kind);
+        if !class.is_word() {
+            return;
+        }
+        while walk.index > 0 && walk.stops[walk.index - 1].class.widen(kind) == class {
+            walk.index -= 1;
+        }
+    }
+
+    /// Moves the cursor to the first stop of the block `delta` blocks away (a
+    /// sender-group heading boundary), clamping at the ends.
     pub fn move_cursor_paragraph(
         &mut self,
         history: &RoomHistoryRef<'_>,
@@ -2242,48 +3103,60 @@ impl ChatViewport {
         let block_count = self.layout_index.blocks.len();
         let next = (current as isize + delta).clamp(0, block_count as isize - 1) as usize;
         let message = self.layout_index.blocks[next].first;
+        self.desired = None;
         self.cursor = Some(ViewCursor {
             entry: self.entries[message].id,
-            line: 0,
+            offset: 0,
         });
         self.cursor()
     }
 
+    /// `gg`: the first stop of the oldest entry.
     pub fn cursor_to_first(&mut self) -> Option<ViewCursor> {
-        if self.entries.is_empty() {
-            return None;
-        }
+        let first = self.entries.first()?.id;
+        self.desired = None;
         self.cursor = Some(ViewCursor {
-            entry: self.entries[0].id,
-            line: 0,
+            entry: first,
+            offset: 0,
         });
         self.cursor()
     }
 
+    /// `G`: the first non-blank stop of the newest entry's last visible line.
     pub fn cursor_to_last(
         &mut self,
         history: &RoomHistoryRef<'_>,
         width: u16,
     ) -> Option<ViewCursor> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let last = self.entries.len() - 1;
+        let last = self.entries.last()?.id;
+        self.desired = None;
         self.cursor = Some(ViewCursor {
-            entry: self.entries[last].id,
-            line: self.visible_body_lines(history, last, width) - 1,
+            entry: last,
+            offset: u32::MAX,
         });
-        self.cursor()
+        self.ensure_cursor(history, width)
     }
 
-    /// Toggles visual-line mode: anchors a selection at the cursor, or clears
-    /// an existing one. Returns whether a selection is now active.
-    pub fn toggle_visual_anchor(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> bool {
-        if self.anchor.take().is_some() {
-            return false;
+    /// Vim's `v`/`V`: starts a selection of `kind` at the cursor, switches an
+    /// active selection of the other kind, or ends one of the same kind.
+    /// Returns whether a selection is now active.
+    pub fn toggle_visual(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        kind: VisualKind,
+        width: u16,
+    ) -> bool {
+        if self.anchor.is_some() {
+            if self.visual == kind {
+                self.anchor = None;
+                return false;
+            }
+            self.visual = kind;
+            return true;
         }
         self.ensure_cursor(history, width);
         self.anchor = self.cursor;
+        self.visual = kind;
         self.anchor.is_some()
     }
 
@@ -2296,40 +3169,25 @@ impl ChatViewport {
         self.anchor.is_some()
     }
 
-    pub fn is_cursor_line(&self, message: usize, line: usize) -> bool {
-        self.entries.get(message).is_some_and(|entry| {
-            self.cursor
-                == Some(ViewCursor {
-                    entry: entry.id,
-                    line,
-                })
-        })
-    }
-
-    /// Returns whether the given `(message, line)` falls within the visual
-    /// selection.
-    pub fn is_visual(&self, message: usize, line: usize) -> bool {
-        let Some((lo, hi)) = self.visual_bounds() else {
-            return false;
-        };
-        let pos = LayoutCursor { message, line };
-        lo <= pos && pos <= hi
-    }
-
-    /// The visual range's ordered `(oldest, newest)` endpoints, when active.
-    fn visual_bounds(&self) -> Option<(LayoutCursor, LayoutCursor)> {
-        let anchor = self.layout_cursor(self.anchor?)?;
-        let cursor = self.layout_cursor(self.cursor?)?;
-        if anchor <= cursor {
-            Some((anchor, cursor))
+    /// The selection's kind and ordered `(oldest, newest)` endpoints.
+    fn selection_bounds(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+    ) -> Option<(VisualKind, CursorSpot, CursorSpot)> {
+        let cursor = self.ensure_layout_cursor(history, width)?;
+        let mut stops = Vec::new();
+        let anchor = self.locate(history, self.anchor?, width, &mut stops)?;
+        if anchor.position() <= cursor.position() {
+            Some((self.visual, anchor, cursor))
         } else {
-            Some((cursor, anchor))
+            Some((self.visual, cursor, anchor))
         }
     }
 
     /// Stable entries targeted by an action on the current chat selection.
-    /// A plain cursor targets its whole message; a visual-line range targets
-    /// each message touched by either endpoint or any line between them.
+    /// A plain cursor targets its whole message; a visual range targets each
+    /// message touched by either endpoint or anything between them.
     pub fn selected_entries(
         &mut self,
         history: &RoomHistoryRef<'_>,
@@ -2338,7 +3196,7 @@ impl ChatViewport {
         let Some(cursor) = self.ensure_layout_cursor(history, width) else {
             return Vec::new();
         };
-        let Some((lo, hi)) = self.visual_bounds() else {
+        let Some((_, lo, hi)) = self.selection_bounds(history, width) else {
             return vec![self.entries[cursor.message].id];
         };
         self.entries[lo.message..=hi.message]
@@ -2347,72 +3205,79 @@ impl ChatViewport {
             .collect()
     }
 
-    /// Copies original body text covered by the visually selected rendered
-    /// rows, content only (no sender column). Wrapped rows from the same
-    /// message are sliced as one source range so clipboard text keeps the
-    /// message's whitespace instead of the display wrapper's trimmed fragments.
+    /// Copies the original body text of the visual selection, content only (no
+    /// sender column). A character-wise range slices source offsets through
+    /// the newest endpoint's stop; a line-wise range covers whole source
+    /// lines, so markup the renderer hides is kept. Text a collapse hides is
+    /// never highlighted, so it is not copied either. Messages join with `\n`.
     pub fn visual_text(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> Option<String> {
-        let width = width.max(1);
-        let (lo, hi) = self.visual_bounds()?;
+        let (kind, lo, hi) = self.selection_bounds(history, width)?;
         let mut out = String::new();
-        let mut first = true;
-        for message in lo.message..=hi.message.min(self.entries.len().saturating_sub(1)) {
-            let lines = self.visible_body_lines(history, message, width);
-            self.ensure_lines(history, message, width);
-            let start = if message == lo.message { lo.line } else { 0 };
-            if start >= lines {
-                continue;
-            }
-            let end = if message == hi.message {
-                hi.line
-            } else {
-                lines - 1
+        for message in lo.message..=hi.message {
+            let visible_end = self.visible_source_end(history, message, width);
+            let view = &self.entries[message];
+            let body = self
+                .resolve_record(history, view.id)
+                .map_or("", |record| record.body);
+            let layout = view.layout();
+            let start = match (message == lo.message, kind) {
+                (false, _) => 0,
+                (true, VisualKind::Char) => lo.stop.offset as usize,
+                (true, VisualKind::Line) => layout.logical_source_line(lo.line, body).start,
             };
-            let end = end.min(lines - 1);
-            if !first {
+            let end = match (message == hi.message, kind) {
+                (false, _) => body.len(),
+                (true, VisualKind::Char) => hi.stop.end as usize,
+                (true, VisualKind::Line) => layout.logical_source_line(hi.line, body).end,
+            };
+            if message != lo.message {
                 out.push('\n');
             }
-            first = false;
-            let view = &self.entries[message];
-            let entry = self.resolve_record(history, self.entries.get(message)?.id)?;
-            if start == 0 && end == lines - 1 {
-                if lines == view.layout().lines().max(1) {
-                    out.push_str(entry.body);
-                } else {
-                    let range = view.layout().source_range(start, end, entry.body.len());
-                    out.push_str(&entry.body[range]);
-                }
-            } else {
-                let range = view.layout().source_range(start, end, entry.body.len());
-                out.push_str(&entry.body[range]);
-            }
+            let end = end.min(visible_end);
+            let start = start.min(end);
+            out.push_str(&body[start..end]);
         }
         Some(out)
     }
 
-    /// The original body text the cursor's wrapped row displays.
+    /// The original body text of the cursor's logical line, widened to its
+    /// source line so hidden markup (list markers, `# `, `> `) is kept, and
+    /// clipped where a collapse hides the rest of the line.
     pub fn cursor_line_text(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> Option<String> {
-        let cursor = self.layout_cursor(self.cursor?)?;
-        self.ensure_lines(history, cursor.message, width);
-        let view = self.entries.get(cursor.message)?;
-        let entry = self.resolve_record(history, self.entries.get(cursor.message)?.id)?;
-        let lines = view.layout().lines().max(1);
-        if cursor.line >= lines {
-            return None;
+        let spot = self.ensure_layout_cursor(history, width)?;
+        let visible_end = self.visible_source_end(history, spot.message, width);
+        let view = &self.entries[spot.message];
+        let body = self.resolve_record(history, view.id)?.body;
+        let range = view.layout().logical_source_line(spot.line, body);
+        let end = range.end.min(visible_end);
+        Some(body[range.start.min(end)..end].to_string())
+    }
+
+    /// The body offset where `message`'s collapse-visible rows end: the body
+    /// length when nothing is hidden.
+    fn visible_source_end(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        message: usize,
+        width: u16,
+    ) -> usize {
+        let visible = self.visible_body_lines(history, message, width);
+        self.ensure_lines(history, message, width);
+        let view = &self.entries[message];
+        let len = self
+            .resolve_record(history, view.id)
+            .map_or(0, |record| record.body.len());
+        let layout = view.layout();
+        if visible >= layout.lines() {
+            return len;
         }
-        if lines == 1 {
-            return Some(entry.body.to_string());
-        }
-        let range = view
-            .layout()
-            .source_range(cursor.line, cursor.line, entry.body.len());
-        Some(entry.body[range].to_string())
+        layout.source_range(0, visible.saturating_sub(1), len).end
     }
 
     pub fn cursor_message_body<'a>(&'a self, history: &'a RoomHistoryRef<'a>) -> Option<&'a str> {
-        let cursor = self.layout_cursor(self.cursor?)?;
+        let message = self.entry_index(self.cursor?.entry)?;
         Some(
-            self.resolve_record(history, self.entries.get(cursor.message)?.id)?
+            self.resolve_record(history, self.entries.get(message)?.id)?
                 .body,
         )
     }
@@ -2420,8 +3285,8 @@ impl ChatViewport {
     /// The first decodable reference contained in the cursor's message, for
     /// keyboard-driven "open the reference in this message".
     pub fn cursor_ref(&self, history: &RoomHistoryRef<'_>) -> Option<rpc::msgref::MessageRef> {
-        let cursor = self.layout_cursor(self.cursor?)?;
-        let entry = self.resolve_record(history, self.entries.get(cursor.message)?.id)?;
+        let message = self.entry_index(self.cursor?.entry)?;
+        let entry = self.resolve_record(history, self.entries.get(message)?.id)?;
         let inline = chatt_message_format::inline_ranges(entry.body);
         for span in self.build_ref_spans(history, entry.body, inline.refs) {
             if let Some(target) = span.target {
@@ -2429,6 +3294,100 @@ impl ChatViewport {
             }
         }
         None
+    }
+
+    /// Resolves the cursor and selection for one frame of rendering. Call
+    /// after the visible rows are laid out.
+    pub fn marks(&mut self, history: &RoomHistoryRef<'_>, width: u16) -> ChatMarks {
+        let cursor = self.ensure_layout_cursor(history, width).map(|spot| {
+            let visible = self.visible_body_lines(history, spot.message, width);
+            let rows = self.entries[spot.message]
+                .layout()
+                .logical_rows(spot.line, visible);
+            (spot, rows)
+        });
+        let selection = self.selection_bounds(history, width);
+        let line_rows = match selection {
+            Some((VisualKind::Line, lo, hi)) => {
+                let visible = self.visible_body_lines(history, hi.message, width);
+                let first = self.entries[lo.message]
+                    .layout()
+                    .logical_rows(lo.line, usize::MAX)
+                    .start;
+                let last = self.entries[hi.message]
+                    .layout()
+                    .logical_rows(hi.line, visible)
+                    .end
+                    .saturating_sub(1);
+                Some(((lo.message, first), (hi.message, last)))
+            }
+            _ => None,
+        };
+        ChatMarks {
+            cursor,
+            selection,
+            line_rows,
+        }
+    }
+
+    /// Classifies wrapped `row` of `message` against `marks`.
+    pub fn row_marks(
+        &self,
+        history: &RoomHistoryRef<'_>,
+        marks: &ChatMarks,
+        message: usize,
+        row: usize,
+    ) -> RowMarks {
+        let mut out = RowMarks::default();
+        if let Some((spot, rows)) = &marks.cursor
+            && spot.message == message
+        {
+            out.cursor_line = rows.contains(&row);
+            if spot.stop.row == row {
+                out.cursor_row = true;
+                out.cursor_cell = Some((spot.stop.col, spot.stop.width.max(1)));
+            }
+        }
+        let pos = (message, row);
+        if let Some((lo, hi)) = marks.line_rows {
+            out.line_selected = lo <= pos && pos <= hi;
+            return out;
+        }
+        let Some((VisualKind::Char, lo, hi)) = marks.selection else {
+            return out;
+        };
+        let lo_pos = (lo.message, lo.stop.row);
+        let hi_pos = (hi.message, hi.stop.row);
+        if pos < lo_pos || hi_pos < pos {
+            return out;
+        }
+        let Some(view) = self.entries.get(message) else {
+            return out;
+        };
+        let Some(layout) = view.layout.as_deref() else {
+            return out;
+        };
+        let body = self
+            .resolve_record(history, view.id)
+            .map_or("", |record| record.body);
+        let mut stops = Vec::new();
+        layout.row_stops(row..row + 1, body, &mut stops);
+        if stops.is_empty() {
+            layout.line_stops(layout.logical_line_of_row(row), usize::MAX, body, &mut stops);
+        }
+        let mut on_row = stops.iter().filter(|stop| stop.row == row);
+        let Some(first) = on_row.next() else {
+            return out;
+        };
+        let last = on_row.last().unwrap_or(first);
+        let start = if pos == lo_pos { lo.stop.col } else { first.col };
+        let end = if pos == hi_pos {
+            hi.stop.col.saturating_add(hi.stop.width.max(1))
+        } else {
+            last.col.saturating_add(last.width.max(1))
+        };
+        out.selected_cols = (start < end).then_some(start..end);
+        out
     }
 
     /// Scrolls the minimum amount that brings the cursor's row into the safe
@@ -2446,7 +3405,7 @@ impl ChatViewport {
             return None;
         }
         let cursor = self.ensure_layout_cursor(history, width)?;
-        let (row, total) = self.pos_row_and_total(history, cursor, width)?;
+        let (row, total) = self.pos_row_and_total(history, cursor.layout(), width)?;
         let max_scroll = total.saturating_sub(height);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
         let top = total.saturating_sub(self.scroll_offset.saturating_add(height));
@@ -2500,7 +3459,7 @@ impl ChatViewport {
             return None;
         }
         let cursor = self.ensure_layout_cursor(history, width)?;
-        let (cursor_row, total) = self.pos_row_and_total(history, cursor, width)?;
+        let (cursor_row, total) = self.pos_row_and_total(history, cursor.layout(), width)?;
         let max_top = total.saturating_sub(height);
         let top = total
             .saturating_sub(self.scroll_offset.saturating_add(height))
@@ -2520,11 +3479,23 @@ impl ChatViewport {
         } else {
             None
         };
-        if let Some(replacement) = replacement {
-            self.cursor = Some(ViewCursor {
-                entry: self.entries[replacement.message].id,
-                line: replacement.line,
-            });
+        let col = self.desired_screen_col(cursor);
+        if let Some(replacement) = replacement
+            && let Some(stop) = self.stop_on_row(
+                history,
+                replacement.message,
+                replacement.line,
+                col,
+                width,
+            )
+        {
+            // Dragging the cursor along with the viewport is a row-wise move:
+            // it lands on the remembered column and, like `gj`, remembers the
+            // screen column so successive ticks do not drift on short rows.
+            if self.desired.is_none() {
+                self.desired = Some(DesiredColumn::Screen(col));
+            }
+            self.place(replacement.message, stop);
         }
         self.keep_cursor_visible(history, width, height as u16, scroll_buffer)
     }
@@ -2555,46 +3526,48 @@ impl ChatViewport {
         None
     }
 
-    /// Reflow at a new width invalidates wrapped-line coordinates: the anchor
-    /// is dropped (a line-wise range is ambiguous across rewrap) and the
-    /// cursor's line is clamped, never lost.
+    /// Reflow at a new width invalidates wrapped-row coordinates only. Cursor
+    /// and anchor are body offsets, so both survive and merely re-snap.
     pub fn on_reflow(&mut self, history: &RoomHistoryRef<'_>, width: u16) {
-        self.anchor = None;
         self.dragging = false;
+        if matches!(self.desired, Some(DesiredColumn::Screen(_))) {
+            self.desired = None;
+        }
         self.scroll_anchor = None;
         self.layout_index.invalidate();
         self.bump_layout_epoch();
         self.clamp_positions(history, width);
     }
 
-    /// Clamps the cursor and anchor into the collapse-aware visible line range
-    /// at `width`.
-    fn clamp_positions(&mut self, history: &RoomHistoryRef<'_>, width: u16) {
+    /// Snaps the cursor and anchor onto visible stops at `width`, pulling
+    /// positions under a collapse into its preview. Returns the resolved
+    /// cursor.
+    fn clamp_positions(
+        &mut self,
+        history: &RoomHistoryRef<'_>,
+        width: u16,
+    ) -> Option<CursorSpot> {
         if self.entries.is_empty() {
             self.cursor = None;
             self.anchor = None;
-            return;
+            return None;
         }
-        if let Some(cursor) = self.cursor.and_then(|cursor| self.layout_cursor(cursor)) {
-            let message = cursor.message;
-            let line = cursor
-                .line
-                .min(self.visible_body_lines(history, message, width) - 1);
-            self.cursor = Some(ViewCursor {
-                entry: self.entries[message].id,
-                line,
-            });
-        }
-        if let Some(anchor) = self.anchor.and_then(|anchor| self.layout_cursor(anchor)) {
-            let message = anchor.message;
-            let line = anchor
-                .line
-                .min(self.visible_body_lines(history, message, width) - 1);
+        let mut stops = Vec::new();
+        if let Some(anchor) = self.anchor
+            && let Some(spot) = self.locate(history, anchor, width, &mut stops)
+        {
             self.anchor = Some(ViewCursor {
-                entry: self.entries[message].id,
-                line,
+                entry: anchor.entry,
+                offset: spot.stop.offset,
             });
         }
+        let cursor = self.cursor?;
+        let spot = self.locate(history, cursor, width, &mut stops)?;
+        self.cursor = Some(ViewCursor {
+            entry: cursor.entry,
+            offset: spot.stop.offset,
+        });
+        Some(spot)
     }
 
     pub fn clamp_scroll(&mut self, history: &RoomHistoryRef<'_>, width: u16, height: u16) {
@@ -3331,6 +4304,12 @@ struct MessageLayout {
     tokens: Vec<Token>,
     line_starts: Vec<u32>,
     line_sources: Vec<(u32, u32)>,
+    /// First row of each logical line: a row the layout started fresh, as
+    /// opposed to a wrap continuation. Ascending, and `[0]` is always row 0.
+    logical_starts: Vec<u32>,
+    /// Hidden `@@code` body range of each reference, indexed like the
+    /// `ref_index` of [`Self::pill_spans`], so a pill maps back to its source.
+    ref_ranges: Vec<Range<u32>>,
     segments: Vec<Segment>,
     /// Display-only text with no body counterpart: resolved reference pill
     /// labels. Synthetic segments index into this buffer.
@@ -3440,6 +4419,8 @@ impl MessageLayout {
             tokens: Vec::new(),
             line_starts: Vec::new(),
             line_sources: Vec::new(),
+            logical_starts: Vec::new(),
+            ref_ranges: Vec::new(),
             segments: Vec::new(),
             synthetic: String::new(),
             pill_spans: Vec::new(),
@@ -3461,12 +4442,15 @@ impl MessageLayout {
         self.syntax = syntax;
         if self.wrap_width != width {
             self.reset_layout(width, text);
+            self.ref_ranges.clear();
+            self.ref_ranges
+                .extend(refs.iter().map(|span| span.range.clone()));
         }
         while !self.complete {
             self.layout_next_block(text, refs);
         }
         if self.line_starts.is_empty() {
-            self.push_line();
+            self.push_logical_line();
             self.complete = true;
         }
     }
@@ -3519,6 +4503,7 @@ impl MessageLayout {
         chatt_message_format::tokenize(text, &mut self.tokens);
         self.line_starts.clear();
         self.line_sources.clear();
+        self.logical_starts.clear();
         self.segments.clear();
         self.synthetic.clear();
         self.pill_spans.clear();
@@ -3587,7 +4572,7 @@ impl MessageLayout {
             }
             TokenKind::BlankLine => {
                 let range = token_range(&self.tokens[self.cursor]);
-                self.push_line();
+                self.push_logical_line();
                 self.emit_quote_marker();
                 self.note_source_range(range.start, range.end);
                 self.cursor += 1;
@@ -3872,7 +4857,7 @@ impl MessageLayout {
         cols: (u16, u16),
     ) {
         if display.is_empty() {
-            self.push_line();
+            self.push_logical_line();
             for source in invisible {
                 self.note_source_range(source.source.start, source.source.end);
             }
@@ -3881,9 +4866,13 @@ impl MessageLayout {
 
         let mut wrapped_any = false;
         for wrapped in bwrap::wrap_ranges_preserve_leading(display, widths.0, widths.1) {
+            if wrapped_any {
+                self.push_line();
+            } else {
+                self.push_logical_line();
+            }
             let base_col = if wrapped_any { cols.1 } else { cols.0 };
             wrapped_any = true;
-            self.push_line();
             for source in invisible {
                 if wrapped.start <= source.display_pos && source.display_pos <= wrapped.end {
                     self.note_source_range(source.source.start, source.source.end);
@@ -3917,7 +4906,7 @@ impl MessageLayout {
         }
 
         if !wrapped_any {
-            self.push_line();
+            self.push_logical_line();
             for source in invisible {
                 self.note_source_range(source.source.start, source.source.end);
             }
@@ -3953,7 +4942,7 @@ impl MessageLayout {
                     .get(cursor)
                     .is_some_and(|token| matches!(token.kind, TokenKind::CodeBlockEnd))
             );
-            self.push_line();
+            self.push_logical_line();
             self.emit_quote_marker();
             self.note_source_range(source_pos, source_pos);
             return cursor.saturating_add(1);
@@ -4039,6 +5028,11 @@ impl MessageLayout {
         self.line_sources.push((u32::MAX, 0));
     }
 
+    fn push_logical_line(&mut self) {
+        self.logical_starts.push(self.line_starts.len() as u32);
+        self.push_line();
+    }
+
     fn emit_plain_verbatim(
         &mut self,
         text: &str,
@@ -4047,7 +5041,7 @@ impl MessageLayout {
         avail: usize,
         style: Style,
     ) {
-        self.push_line();
+        self.push_logical_line();
         let lead = self.emit_quote_marker();
         if start == end {
             self.note_source_range(start, end);
@@ -4080,7 +5074,7 @@ impl MessageLayout {
         runs: &[(u32, u32, HlClass)],
         run_index: &mut usize,
     ) {
-        self.push_line();
+        self.push_logical_line();
         let lead = self.emit_quote_marker();
         if line.source_start == line.source_end {
             self.note_source_range(line.source_start, line.source_end);
@@ -4287,6 +5281,196 @@ impl MessageLayout {
     fn source_end(range: (u32, u32)) -> Option<usize> {
         (range.0 != u32::MAX).then_some(range.1 as usize)
     }
+
+    fn logical_lines(&self) -> usize {
+        self.logical_starts.len()
+    }
+
+    /// The logical line `row` belongs to.
+    fn logical_line_of_row(&self, row: usize) -> usize {
+        self.logical_starts
+            .partition_point(|&start| start as usize <= row)
+            .saturating_sub(1)
+    }
+
+    /// The rows logical line `line` spans, clipped to the first `visible` rows.
+    fn logical_rows(&self, line: usize, visible: usize) -> Range<usize> {
+        let start = self.logical_starts[line] as usize;
+        let end = self
+            .logical_starts
+            .get(line + 1)
+            .map_or(self.lines(), |&end| end as usize)
+            .min(visible);
+        start..end.max(start)
+    }
+
+    /// Number of logical lines with at least one row among the first `visible`.
+    fn visible_logical_lines(&self, visible: usize) -> usize {
+        self.logical_starts
+            .partition_point(|&start| (start as usize) < visible)
+            .max(1)
+            .min(self.logical_lines())
+    }
+
+    /// The last visible row whose source starts at or before `offset`, or row 0.
+    fn row_at_offset(&self, offset: u32, visible: usize) -> usize {
+        let mut found = 0;
+        for (row, &(start, _)) in self.line_sources.iter().take(visible).enumerate() {
+            if start == u32::MAX {
+                continue;
+            }
+            if start > offset {
+                break;
+            }
+            found = row;
+        }
+        found
+    }
+
+    /// Appends the cursor stops of logical line `line` in display order,
+    /// clipped to the first `visible` rows. A line with no navigable cell
+    /// still yields one empty stop at its lead column, so every visible
+    /// logical line can hold the cursor.
+    fn line_stops(&self, line: usize, visible: usize, body: &str, out: &mut Vec<Stop>) {
+        let rows = self.logical_rows(line, visible);
+        let first = out.len();
+        let lead = self.row_stops(rows.clone(), body, out);
+        if out.len() == first {
+            let offset = self
+                .source_range(rows.start, rows.end.saturating_sub(1), body.len())
+                .start as u32;
+            out.push(Stop {
+                offset,
+                end: offset,
+                row: rows.start,
+                col: lead.unwrap_or(0),
+                width: 0,
+                class: CharClass::Empty,
+            });
+        }
+    }
+
+    /// Appends the stops drawn on `rows`, returning the column right of any
+    /// synthetic lead (a quote marker) on the first row.
+    fn row_stops(&self, rows: Range<usize>, body: &str, out: &mut Vec<Stop>) -> Option<u16> {
+        let first = out.len();
+        let mut lead = None;
+        for row in rows.clone() {
+            for seg in self.line(row) {
+                if seg.synth {
+                    let text = &self.synthetic[seg.start as usize..seg.end as usize];
+                    let width = UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16;
+                    let Some(index) = self.pill_ref_at(seg) else {
+                        if row == rows.start {
+                            lead = Some(seg.col.saturating_add(width));
+                        }
+                        continue;
+                    };
+                    let Some(source) = self.ref_ranges.get(index) else {
+                        continue;
+                    };
+                    // A pill wrapped across rows renders twice but is one stop.
+                    if out[first..]
+                        .last()
+                        .is_some_and(|stop: &Stop| stop.offset == source.start)
+                    {
+                        continue;
+                    }
+                    out.push(Stop {
+                        offset: source.start,
+                        end: source.end,
+                        row,
+                        col: seg.col,
+                        width,
+                        class: CharClass::Keyword,
+                    });
+                    continue;
+                }
+                let text = &body[seg.start as usize..seg.end as usize];
+                let mut col = seg.col;
+                for (index, grapheme) in text.grapheme_indices(true) {
+                    let width = UnicodeWidthStr::width(grapheme).min(u16::MAX as usize) as u16;
+                    let offset = seg.start + index as u32;
+                    out.push(Stop {
+                        offset,
+                        end: offset + grapheme.len() as u32,
+                        row,
+                        col,
+                        width,
+                        class: CharClass::of(grapheme),
+                    });
+                    col = col.saturating_add(width);
+                }
+            }
+        }
+        lead
+    }
+
+    /// The body range logical line `line` displays, widened to the enclosing
+    /// source line breaks so markup the renderer hides (list markers, `# `,
+    /// `> `, code indentation) is part of the yank.
+    fn logical_source_line(&self, line: usize, body: &str) -> Range<usize> {
+        let rows = self.logical_rows(line, usize::MAX);
+        let range = self.source_range(rows.start, rows.end.saturating_sub(1), body.len());
+        let start = body[..range.start].rfind('\n').map_or(0, |index| index + 1);
+        let end = body[range.end..]
+            .find('\n')
+            .map_or(body.len(), |index| range.end + index);
+        start..end.max(start)
+    }
+}
+
+/// Word-motion class of one cursor stop, following vim's default
+/// `iskeyword`. `Empty` marks the single stop of a line with no cells, which
+/// vim's word motions treat as a word of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CharClass {
+    Keyword,
+    Whitespace,
+    Other,
+    Empty,
+}
+
+impl CharClass {
+    fn of(grapheme: &str) -> Self {
+        let Some(ch) = grapheme.chars().next() else {
+            return Self::Whitespace;
+        };
+        if ch.is_whitespace() {
+            Self::Whitespace
+        } else if ch.is_alphanumeric() || ch == '_' {
+            Self::Keyword
+        } else {
+            Self::Other
+        }
+    }
+
+    /// The class under `W`/`B`/`E`, where any non-blank run is one word.
+    fn widen(self, word: WordKind) -> Self {
+        match (word, self) {
+            (WordKind::Big, Self::Other) => Self::Keyword,
+            _ => self,
+        }
+    }
+
+    fn is_word(self) -> bool {
+        matches!(self, Self::Keyword | Self::Other)
+    }
+}
+
+/// One navigable cell group of a message: a grapheme, a whole reference pill,
+/// or the placeholder of an empty line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stop {
+    /// Body byte offset the stop starts at; what [`ViewCursor::offset`] holds.
+    offset: u32,
+    /// Body byte offset the stop's text ends at, for inclusive yanks.
+    end: u32,
+    /// Wrapped row within the message.
+    row: usize,
+    col: u16,
+    width: u16,
+    class: CharClass,
 }
 
 fn append_piece(

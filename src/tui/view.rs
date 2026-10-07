@@ -515,7 +515,7 @@ impl ClientView {
             .then_some(DeleteDenied::TooOld)
     }
 
-    /// Collects deletable messages under the cursor or visual-line selection.
+    /// Collects deletable messages under the cursor or visual selection.
     /// Ineligible entries are skipped so a contiguous visual range can cross
     /// other users' messages and notices. The server remains authoritative if
     /// concurrent traffic changes the window after this preflight.
@@ -601,7 +601,7 @@ impl ClientView {
         Some(text)
     }
 
-    /// Copies the original body text of the cursor's wrapped row.
+    /// Copies the original body text of the cursor's logical line.
     pub(crate) fn copy_cursor_line(&mut self, session: &RoomSession, width: u16) -> Option<String> {
         let history = session.history_ref(self.viewed_room?)?;
         self.active.chat.ensure_cursor(&history, width)?;
@@ -699,7 +699,7 @@ impl ClientView {
     pub(crate) fn move_chat_cursor(
         &mut self,
         session: &RoomSession,
-        delta: isize,
+        motion: crate::chat_buffer::ChatMotion,
         width: u16,
     ) -> bool {
         let Some(history) = self.viewed_room.and_then(|id| session.history_ref(id)) else {
@@ -707,7 +707,7 @@ impl ClientView {
         };
         self.active
             .chat
-            .move_cursor_line(&history, delta, width)
+            .move_cursor(&history, motion, width)
             .is_some()
     }
 

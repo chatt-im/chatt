@@ -13861,8 +13861,12 @@ mod tests {
             .set_cursor(crate::chat_buffer::HistoryEntryId::Message(MessageId(1)));
         let (core, view) = app.parts_mut();
         let history = core.room.history_ref(RoomId(1)).unwrap();
-        assert!(view.active.chat.toggle_visual_anchor(&history, 80));
-        view.active.chat.move_cursor_line(&history, 2, 80);
+        assert!(view.active.chat.toggle_visual(
+            &history,
+            crate::chat_buffer::VisualKind::Line,
+            80
+        ));
+        view.active.chat.move_cursor(&history, crate::chat_buffer::ChatMotion::Down(2), 80);
         let stack = crate::tui::mode_stack::ModeStack::new(Box::new(mode), &mut app);
         let mut h = Harness { app, stack };
 

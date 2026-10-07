@@ -7,7 +7,7 @@ use crate::{
         NETEQ_START_DELAY_MS_RANGE, StreamPreview,
     },
     config::{
-        AudioConfig, AudioLatencyConfig, BufferSize, CandidatePrivacy, CopyOnSelect,
+        AudioConfig, AudioLatencyConfig, BufferSize, CandidatePrivacy, CopyOnSelect, LinkClick,
         DEFAULT_DENOISE_RELEASE, DEFAULT_DENOISE_SUPPRESSION, DEFAULT_DENOISE_TYPING_VAD_ENTER,
         DEFAULT_DENOISE_TYPING_VAD_RELEASE, DEFAULT_INPUT_TARGET_LATENCY,
         DEFAULT_MAX_AMPLIFICATION, DEFAULT_OUTPUT_TARGET_LATENCY, DownloadMode, FileConfig,
@@ -102,6 +102,7 @@ pub struct SettingsDraft {
     pub(crate) ui_max_composer_height: String,
     pub(crate) ui_composer_padding: bool,
     pub(crate) ui_copy_on_select: CopyOnSelect,
+    pub(crate) ui_link_click: LinkClick,
     pub(crate) ui_max_messages: String,
     pub(crate) ui_scroll_buffer: String,
     pub(crate) ui_overscan: String,
@@ -278,6 +279,7 @@ impl SettingsDraft {
             ui_max_composer_height: UiConfig::default().max_composer_height.to_string(),
             ui_composer_padding: UiConfig::default().composer_padding,
             ui_copy_on_select: UiConfig::default().copy_on_select,
+            ui_link_click: UiConfig::default().link_click,
             ui_max_messages: UiConfig::default().max_messages.to_string(),
             ui_scroll_buffer: UiConfig::default().scroll_buffer.to_string(),
             ui_overscan: UiConfig::default().overscan.to_string(),
@@ -347,6 +349,7 @@ impl SettingsDraft {
         self.ui_max_composer_height = ui.max_composer_height.to_string();
         self.ui_composer_padding = ui.composer_padding;
         self.ui_copy_on_select = ui.copy_on_select;
+        self.ui_link_click = ui.link_click;
         self.ui_max_messages = ui.max_messages.to_string();
         self.ui_scroll_buffer = ui.scroll_buffer.to_string();
         self.ui_overscan = ui.overscan.to_string();
@@ -458,6 +461,7 @@ impl SettingsDraft {
         }
         ui.composer_padding = self.ui_composer_padding;
         ui.copy_on_select = self.ui_copy_on_select;
+        ui.link_click = self.ui_link_click;
         if let Ok(value) = self.ui_max_messages.trim().parse::<u32>() {
             ui.max_messages = value;
         }

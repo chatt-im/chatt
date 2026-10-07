@@ -1,4 +1,4 @@
-use extui::{AnsiColor, Style};
+use extui::{AnsiColor, Style, vt::Modifier};
 use extui_editor::{EditorTheme, SelectionTheme};
 use tinyhl::RenderSpan;
 
@@ -51,10 +51,14 @@ pub struct Theme {
     // Chat lines.
     pub local_line: Style,
     pub selected_line: Style,
-    /// Rows inside the chat visual-line selection (mouse drag or `v` range).
+    /// Chat visual selection: whole rows of a `V` range, or the cells of a `v`
+    /// range or mouse drag.
     pub chat_visual_line: Style,
-    /// The chat cursor's row, dimmer than [`Theme::chat_visual_line`].
+    /// Every wrapped row of the chat cursor's logical line, dimmer than
+    /// [`Theme::chat_visual_line`].
     pub chat_cursor_line: Style,
+    /// The chat cursor's cell, merged over the glyph drawn there.
+    pub chat_cursor: Style,
     pub room_selected: Style,
     // Status bar.
     pub status_fill: Style,
@@ -143,6 +147,7 @@ impl Theme {
             selected_line: d.with_bg_rgb(0x3a, 0x3a, 0x3a),
             chat_visual_line: d.with_bg_rgb(0x2c, 0x44, 0x58),
             chat_cursor_line: d.with_bg_rgb(0x2c, 0x2c, 0x2c),
+            chat_cursor: d.with_modifier(Modifier::REVERSED),
             room_selected: d
                 .with_bg_rgb(0x29, 0x29, 0x29)
                 .with_fg_rgb(0xf0, 0xf2, 0xe8),
@@ -259,6 +264,7 @@ impl Theme {
             selected_line: d.with_bg_ansi(AnsiColor::Grey[4]),
             chat_visual_line: d.with_bg_ansi(AnsiColor(4)),
             chat_cursor_line: d.with_bg_ansi(AnsiColor::Grey[3]),
+            chat_cursor: d.with_modifier(Modifier::REVERSED),
             room_selected: d
                 .with_bg_ansi(AnsiColor::Grey[5])
                 .with_fg_ansi(bright_white),
@@ -341,6 +347,7 @@ impl Theme {
             selected_line: d.with_bg_ansi(AnsiColor::Grey[27]),
             chat_visual_line: d.with_bg_ansi(AnsiColor::Grey[21]),
             chat_cursor_line: d.with_bg_ansi(AnsiColor::Grey[26]),
+            chat_cursor: d.with_modifier(Modifier::REVERSED),
             room_selected: d.with_bg_ansi(AnsiColor::Grey[25]).with_fg_ansi(black),
             status_fill: d.with_bg_ansi(AnsiColor::Grey[27]).with_fg_ansi(black),
             status_section: d.with_bg_ansi(AnsiColor::Grey[23]).with_fg_ansi(black),
@@ -401,6 +408,7 @@ impl Theme {
             ThemeSlot::SelectedLine => &mut self.selected_line,
             ThemeSlot::ChatVisualLine => &mut self.chat_visual_line,
             ThemeSlot::ChatCursorLine => &mut self.chat_cursor_line,
+            ThemeSlot::ChatCursor => &mut self.chat_cursor,
             ThemeSlot::RoomSelected => &mut self.room_selected,
             ThemeSlot::StatusFill => &mut self.status_fill,
             ThemeSlot::StatusSection => &mut self.status_section,
@@ -599,6 +607,7 @@ mod tests {
                 (ThemeSlot::RoomSelected, pair(13)),
                 (ThemeSlot::ChatVisualLine, pair(37)),
                 (ThemeSlot::ChatCursorLine, pair(38)),
+                (ThemeSlot::ChatCursor, pair(42)),
                 (ThemeSlot::StatusFill, pair(14)),
                 (ThemeSlot::StatusSection, pair(15)),
                 (ThemeSlot::StatusSectionInactive, pair(39)),
@@ -671,6 +680,7 @@ mod tests {
         assert_eq!(theme.vu_peak, style(36));
         assert_eq!(theme.chat_visual_line, style(37));
         assert_eq!(theme.chat_cursor_line, style(38));
+        assert_eq!(theme.chat_cursor, style(42));
     }
 
     #[test]

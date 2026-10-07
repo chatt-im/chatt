@@ -1075,7 +1075,7 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
         .is_focus()
     {
         form.set_help(
-            "Copies clicked or drag-selected message rows to the chosen selection on mouse release.",
+            "On mouse release, copies a clicked line or drag-selected text to the chosen selection.",
         );
         form.set_default(crate::config::CopyOnSelect::default().label());
     }
@@ -1092,6 +1092,18 @@ fn interface_tab(form: &mut SettingsForm, draft: &mut SettingsDraft) {
     }
 
     form.section("Links");
+    if form
+        .choice_value(
+            "Link Click",
+            &mut draft.ui_link_click,
+            &crate::config::LinkClick::ALL,
+            |value| value.label().to_string(),
+        )
+        .is_focus()
+    {
+        form.set_help("Clicking a URL opens it with the command below, or copies it to the clipboard.");
+        form.set_default(crate::config::LinkClick::default().label());
+    }
     if form
         .string_list(
             "Open Arg",

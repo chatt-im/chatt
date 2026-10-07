@@ -438,10 +438,13 @@ pub struct UiConfig {
     pub max_composer_height: u16,
     #[toml(default = true, ToToml skip_if = |value: &bool| *value)]
     pub composer_padding: bool,
-    /// Where clicked or mouse-selected message-log rows are copied when the
-    /// mouse button is released.
+    /// Where a clicked logical line or a drag-selected character range of the
+    /// message log is copied when the mouse button is released.
     #[toml(default)]
     pub copy_on_select: CopyOnSelect,
+    /// What clicking a URL in the message log does.
+    #[toml(default)]
+    pub link_click: LinkClick,
     #[toml(default = 50_000)]
     pub max_messages: u32,
     /// Rendered timeline rows kept above and below the selected row while
@@ -506,6 +509,28 @@ impl ToToml for CopyOnSelect {
     }
 }
 
+/// What clicking a URL in the message log does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Toml)]
+#[toml(FromToml, ToToml, rename_all = "kebab-case")]
+pub enum LinkClick {
+    /// Hands the URL to the `url-open` command.
+    #[default]
+    Open,
+    /// Copies the URL to the system clipboard.
+    Copy,
+}
+
+impl LinkClick {
+    pub const ALL: [Self; 2] = [Self::Open, Self::Copy];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Copy => "copy",
+        }
+    }
+}
+
 /// The platform default URL opener: `open` on macOS, `xdg-open` on Linux, and
 /// nothing elsewhere (clicks are then inert until `url-open` is configured).
 pub(crate) fn default_url_open() -> Vec<String> {
@@ -535,6 +560,7 @@ impl Default for UiConfig {
             max_composer_height: 6,
             composer_padding: true,
             copy_on_select: CopyOnSelect::Off,
+            link_click: LinkClick::Open,
             max_messages: 50_000,
             scroll_buffer: 3,
             overscan: 24,
@@ -1291,6 +1317,7 @@ pub enum ThemeSlot {
     SelectedLine,
     ChatVisualLine,
     ChatCursorLine,
+    ChatCursor,
     RoomSelected,
     StatusFill,
     StatusSection,
@@ -1341,6 +1368,7 @@ impl ThemeSlot {
             "selected-line" => Self::SelectedLine,
             "chat-visual-line" => Self::ChatVisualLine,
             "chat-cursor-line" => Self::ChatCursorLine,
+            "chat-cursor" => Self::ChatCursor,
             "room-selected" => Self::RoomSelected,
             "status-fill" => Self::StatusFill,
             "status-section" => Self::StatusSection,

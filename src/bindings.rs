@@ -20,8 +20,8 @@ pub const COMPOSE_NORMAL_LAYER: LayerId = LayerId::new(7);
 pub const PASSWORD_LAYER: LayerId = LayerId::new(8);
 pub const PASTE_LAYER: LayerId = LayerId::new(9);
 pub const USER_LIST_LAYER: LayerId = LayerId::new(10);
-/// The chat log's visual-line mode: active while a visual anchor is set, so
-/// `y` yanks the selection instead of the cursor line.
+/// The chat log's visual mode, character- or line-wise: active while a visual
+/// anchor is set, so `y` yanks the selection instead of the cursor's line.
 pub const CHAT_VISUAL_LAYER: LayerId = LayerId::new(11);
 
 const LAYER_TABLES: [(&str, LayerId); 11] = [
@@ -60,6 +60,18 @@ pub enum BindCommand {
     ParagraphBack,
     ParagraphForward,
     ToggleVisual,
+    ToggleVisualLine,
+    LineStart,
+    FirstNonBlank,
+    LineEnd,
+    WordForward,
+    WordBack,
+    WordEnd,
+    BigWordForward,
+    BigWordBack,
+    BigWordEnd,
+    RowDown,
+    RowUp,
     ClearSelection,
     CopySelection,
     CopyLine,
@@ -136,6 +148,18 @@ impl std::fmt::Display for BindCommand {
             ParagraphBack => "ParagraphBack",
             ParagraphForward => "ParagraphForward",
             ToggleVisual => "ToggleVisual",
+            ToggleVisualLine => "ToggleVisualLine",
+            LineStart => "LineStart",
+            FirstNonBlank => "FirstNonBlank",
+            LineEnd => "LineEnd",
+            WordForward => "WordForward",
+            WordBack => "WordBack",
+            WordEnd => "WordEnd",
+            BigWordForward => "BigWordForward",
+            BigWordBack => "BigWordBack",
+            BigWordEnd => "BigWordEnd",
+            RowDown => "RowDown",
+            RowUp => "RowUp",
             ClearSelection => "ClearSelection",
             CopySelection => "CopySelection",
             CopyLine => "CopyLine",
@@ -224,6 +248,18 @@ impl BindCommand {
             ParagraphBack => spec("Prev Block", NAV),
             ParagraphForward => spec("Next Block", NAV),
             ToggleVisual => spec("Visual", NAV),
+            ToggleVisualLine => spec("Visual Line", NAV),
+            LineStart => spec("Line Start", NAV),
+            FirstNonBlank => spec("First Char", NAV),
+            LineEnd => spec("Line End", NAV),
+            WordForward => spec("Word", NAV),
+            WordBack => spec("Word Back", NAV),
+            WordEnd => spec("Word End", NAV),
+            BigWordForward => spec("WORD", NAV),
+            BigWordBack => spec("WORD Back", NAV),
+            BigWordEnd => spec("WORD End", NAV),
+            RowDown => spec("Row Down", NAV),
+            RowUp => spec("Row Up", NAV),
             ClearSelection => spec("Clear Sel", NAV),
             CopySelection => spec("Copy", ACTION),
             CopyLine => spec("Yank Line", ACTION),
@@ -736,7 +772,10 @@ mod tests {
                 command(&runtime, layer, "TAB"),
                 Some(BindCommand::ToggleExpand)
             ));
-            assert!(command(&runtime, layer, "c").is_none());
+            assert!(matches!(
+                command(&runtime, layer, "c"),
+                Some(BindCommand::EditMessage)
+            ));
         }
     }
 
@@ -779,6 +818,37 @@ mod tests {
             command(&runtime, WORKSPACE_LAYER, "M-y"),
             Some(BindCommand::CopyMessage)
         ));
+    }
+
+    #[test]
+    fn default_workspace_binds_vim_column_motions() {
+        let runtime = BindingRuntime::default();
+        for layer in [WORKSPACE_LAYER, CHAT_VISUAL_LAYER] {
+            for (key, expected) in [
+                ("0", "LineStart"),
+                ("^", "FirstNonBlank"),
+                ("$", "LineEnd"),
+                ("w", "WordForward"),
+                ("b", "WordBack"),
+                ("e", "WordEnd"),
+                ("W", "BigWordForward"),
+                ("B", "BigWordBack"),
+                ("E", "BigWordEnd"),
+                ("V", "ToggleVisualLine"),
+                ("c", "EditMessage"),
+            ] {
+                let found = command(&runtime, layer, key).map(|command| command.to_string());
+                assert_eq!(found.as_deref(), Some(expected), "key {key}");
+            }
+            assert!(matches!(
+                sequence_command(&runtime, layer, "g j"),
+                Some(BindCommand::RowDown)
+            ));
+            assert!(matches!(
+                sequence_command(&runtime, layer, "g k"),
+                Some(BindCommand::RowUp)
+            ));
+        }
     }
 
     #[test]

@@ -1886,6 +1886,7 @@ fn draw_chat(
         &mut layout.visible_chat_lines,
     );
     let chat_focused = focus == ChatPanelFocus::ChatLog;
+    let marks = chat_focused.then(|| app.view.active.chat.marks(&history, content_width));
     let search_highlight = history_search
         .and_then(HistorySearch::selected_match)
         .and_then(|found| {
@@ -1914,13 +1915,19 @@ fn draw_chat(
                 // one that ended without landing draws a terminal label. `transfer`
                 // clones the status, so no borrow of `app.room` outlives this read.
                 let status = msg.file_transfer_id.and_then(|id| app.room.transfer(id));
-                let visual_here =
-                    chat_focused && app.view.active.chat.is_visual(line.message, line.line);
-                let cursor_here =
-                    chat_focused && app.view.active.chat.is_cursor_line(line.message, line.line);
-                let base = if visual_here {
+                let row_marks = marks
+                    .as_ref()
+                    .map(|marks| {
+                        app.view
+                            .active
+                            .chat
+                            .row_marks(&history, marks, line.message, line.line)
+                    })
+                    .unwrap_or_default();
+                let cursor_here = row_marks.cursor_row;
+                let base = if row_marks.line_selected {
                     app.view.theme.chat_visual_line
-                } else if cursor_here {
+                } else if row_marks.cursor_line {
                     app.view.theme.chat_cursor_line
                 } else if msg.local {
                     app.view.theme.local_line
@@ -1992,6 +1999,15 @@ fn draw_chat(
                         );
                     }
                 }
+                if let Some(cols) = row_marks.selected_cols {
+                    buf.set_style(row_cells(row, cols.start, cols.end), app.view.theme.chat_visual_line);
+                }
+                if let Some((col, width)) = row_marks.cursor_cell {
+                    buf.set_style(
+                        row_cells(row, col, col.saturating_add(width)),
+                        app.view.theme.chat_cursor,
+                    );
+                }
             }
             LineKind::Ellipsis => {
                 let base = app.view.theme.background;
@@ -2002,6 +2018,18 @@ fn draw_chat(
                     .text(buf, "...");
             }
         }
+    }
+}
+
+/// The cells `start..end` of one-row `row`, clipped to it.
+fn row_cells(row: Rect, start: u16, end: u16) -> Rect {
+    let start = start.min(row.w);
+    let end = end.clamp(start, row.w);
+    Rect {
+        x: row.x + start,
+        y: row.y,
+        w: end - start,
+        h: 1,
     }
 }
 

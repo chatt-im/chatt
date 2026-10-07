@@ -4816,16 +4816,24 @@ mod tests {
             self.view.scroll_up(&self.history, rows, width, height);
         }
 
-        fn toggle_visual_anchor(&mut self, width: u16) -> bool {
-            self.view.toggle_visual_anchor(&self.history, width)
+        fn toggle_visual_line(&mut self, width: u16) -> bool {
+            self.view.toggle_visual(
+                &self.history,
+                crate::chat_buffer::VisualKind::Line,
+                width,
+            )
         }
 
-        fn move_cursor_line(
+        fn move_cursor_down(
             &mut self,
-            delta: isize,
+            lines: usize,
             width: u16,
         ) -> Option<crate::chat_buffer::ViewCursor> {
-            self.view.move_cursor_line(&self.history, delta, width)
+            self.view.move_cursor(
+                &self.history,
+                crate::chat_buffer::ChatMotion::Down(lines),
+                width,
+            )
         }
 
         fn select_visible(&mut self, index: usize) {
@@ -5915,7 +5923,7 @@ mod tests {
         );
         room.chat().scroll_up(5, 80, 5);
         room.chat().select_visible(0);
-        assert!(room.chat().toggle_visual_anchor(80));
+        assert!(room.chat().toggle_visual_line(80));
         let history_offset = room.chat().scroll_offset();
 
         room.view.composer.set_lines("/help");
@@ -8061,8 +8069,8 @@ mod tests {
             Some(UserId(1)),
         );
         room.chat().select_visible(0);
-        assert!(room.chat().toggle_visual_anchor(80));
-        room.chat().move_cursor_line(3, 80);
+        assert!(room.chat().toggle_visual_line(80));
+        room.chat().move_cursor_down(3, 80);
 
         assert_eq!(
             room.view.delete_selection(&room.session, 80),
@@ -8147,8 +8155,8 @@ mod tests {
         );
 
         room.chat().select_visible(0);
-        assert!(room.chat().toggle_visual_anchor(80));
-        room.chat().move_cursor_line(1, 80);
+        assert!(room.chat().toggle_visual_line(80));
+        room.chat().move_cursor_down(1, 80);
         assert_eq!(
             room.view.delete_selection(&room.session, 80),
             Err(DeleteDenied::NoEligible)
