@@ -325,6 +325,7 @@ impl SupervisedStreams {
                     cause: RebuildCause::StreamError,
                     kind: Some(kind),
                     action: RecoveryAction::FullRebuild,
+                    retry: false,
                 })
             })
         };

@@ -171,6 +171,8 @@ pub(crate) struct RebuildTrigger {
     pub(crate) cause: RebuildCause,
     pub(crate) kind: Option<AudioErrorKind>,
     pub(crate) action: RecoveryAction,
+    /// A timed retry after a failed rebuild in the same episode.
+    pub(crate) retry: bool,
 }
 
 /// Whether rebuilding one direction should also restart the other.
@@ -184,8 +186,13 @@ pub(crate) struct RebuildTrigger {
 /// glitch it: a mic restart cuts the user's outgoing voice, and a playback
 /// restart drops every peer's jitter buffer. If a transition does show up
 /// only as a stall, the other direction's own progress watch still catches
-/// it.
+/// it. Only the first rebuild of an episode restarts the other direction: a
+/// retry, failed or not, follows a transition the first rebuild already
+/// restarted it for.
 pub(crate) fn rebuild_restarts_paired_stream(trigger: RebuildTrigger) -> bool {
+    if trigger.retry {
+        return false;
+    }
     match trigger.cause {
         RebuildCause::DefaultChanged => true,
         RebuildCause::DeviceReturned => false,
@@ -475,6 +482,7 @@ impl AudioStreamSupervisor {
             cause,
             kind: self.armed_kind,
             action: RecoveryAction::FullRebuild,
+            retry,
         };
         if self.swap_allowed
             && !self.escalated
@@ -929,6 +937,7 @@ mod tests {
                 cause: RebuildCause::StreamError,
                 kind: Some(AudioErrorKind::ConfigInvalid),
                 action: RecoveryAction::FullRebuild,
+                retry: false,
             })
         );
     }
@@ -974,6 +983,7 @@ mod tests {
                 cause: RebuildCause::StreamError,
                 kind: Some(AudioErrorKind::DeviceGone),
                 action: RecoveryAction::FullRebuild,
+                retry: true,
             })
         );
         supervisor.on_rebuild_ok(at(start, 400));
@@ -1024,12 +1034,18 @@ mod tests {
                     cause,
                     kind,
                     action: RecoveryAction::FullRebuild,
+                    retry: false,
                 };
                 assert_eq!(
                     rebuild_restarts_paired_stream(trigger),
                     expected,
                     "{cause:?} {kind:?}"
                 );
+                let retry = RebuildTrigger {
+                    retry: true,
+                    ..trigger
+                };
+                assert!(!rebuild_restarts_paired_stream(retry), "{cause:?} {kind:?}");
             }
         }
     }
@@ -1205,10 +1221,12 @@ mod tests {
         assert_eq!(rebuild.kind, Some(AudioErrorKind::DeviceGone));
         assert!(rebuild_restarts_paired_stream(rebuild));
 
-        // Sticky until recovery, so a backoff retry still reports it.
+        // Sticky until recovery, so a backoff retry still reports it, but
+        // the retry does not restart the paired stream again.
         fail_transient(&mut supervisor, at(start, 300));
         let retry = supervisor.take_due_rebuild(at(start, 300)).unwrap();
         assert_eq!(retry.kind, Some(AudioErrorKind::DeviceGone));
+        assert!(!rebuild_restarts_paired_stream(retry));
     }
 
     #[test]

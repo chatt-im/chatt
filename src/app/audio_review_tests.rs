@@ -176,7 +176,6 @@ fn pending_playback_rebuild_does_not_reopen_playback_after_deafen() {
 /// speaker side (every peer's NetEQ) is torn down and rebuilt every 30 s for
 /// as long as the mic stays missing.
 #[test]
-#[ignore = "BUG: each capture retry while its device is gone restarts healthy playback — see review"]
 fn capture_waiting_for_device_does_not_restart_playback_on_every_probe() {
     let (mut app, _network_rx) = connected_app();
     let app = app_mut(&mut app);
