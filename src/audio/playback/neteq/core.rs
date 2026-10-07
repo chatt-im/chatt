@@ -2084,6 +2084,82 @@ mod tests {
         );
     }
 
+    /// Review helper: `old_packets` packets on a timeline starting at
+    /// `base_ts`, then a sender capture restart (timeline back to zero,
+    /// OPUS_RESET, sequence continuing) for 150 packets. Returns (new-timeline
+    /// packets reported late, silent-or-muted 10 ms blocks among the last
+    /// 200 blocks, packets buffered at the end).
+    fn capture_restart_outcome(base_ts: u32, old_packets: u32) -> (usize, usize, usize) {
+        let mut core = NetEqCore::new(LiveAudioTuning::default()).unwrap();
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut output = vec![0.0; OUTPUT_SIZE_SAMPLES];
+        let mut clock = WallClock::new();
+        let mut seq = 0u32;
+        for offset in 0..old_packets {
+            let payload = encode_tone(&mut encoder, (seq as usize) * LIVE_OPUS_FRAME_SAMPLES);
+            let ts = base_ts.wrapping_add(offset * LIVE_OPUS_FRAME_SAMPLES as u32);
+            core.insert_packet(clock.now(), ts, seq, 0, &payload);
+            for _ in 0..2 {
+                core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
+            }
+            seq += 1;
+        }
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut late = 0usize;
+        let mut silent = 0usize;
+        let total = 150u32;
+        for offset in 0..total {
+            let flags = if offset == 0 {
+                LIVE_PACKET_FLAG_OPUS_RESET
+            } else {
+                0
+            };
+            let payload = encode_tone(&mut encoder, (offset as usize) * LIVE_OPUS_FRAME_SAMPLES);
+            let ts = offset * LIVE_OPUS_FRAME_SAMPLES as u32;
+            if core.insert_packet(clock.now(), ts, seq, flags, &payload) {
+                late += 1;
+            }
+            for _ in 0..2 {
+                let result = core.get_audio(clock.now(), &mut output);
+                clock.advance_block();
+                if offset >= total - 100
+                    && (result.muted || !output.iter().any(|sample| sample.abs() > 1e-3))
+                {
+                    silent += 1;
+                }
+            }
+            seq += 1;
+        }
+        (late, silent, core.packets_buffered())
+    }
+
+    /// Review (capture/send): the sender restarts its media clock at zero on
+    /// every capture rebuild (device switch, undeafen, recovery) while the
+    /// stream id and sequence persist. The receiver rebases only when zero
+    /// reads as more than 1 s *behind* its playout point. When the previous
+    /// capture lived less than ~1 s, the restarted capture's first packets
+    /// all read as late and are dropped until the new timeline passes the
+    /// old playout point (here 40 packets = 800 ms of speech). The 5-minute
+    /// and past-2^31 (12.4 h) positions recover correctly.
+    #[test]
+    #[ignore = "BUG: capture restart within ~1 s of the previous capture start drops up to ~1 s of audio as late (sender timeline resets to 0) — see review"]
+    fn capture_restart_recovers_for_any_old_timeline_position() {
+        let mut failures = Vec::new();
+        for (label, base_ts, old) in [
+            ("five minutes", 5 * 60 * SAMPLE_RATE, 100u32),
+            ("young", 0, 40),
+            ("past 2^31", 0x9000_0000, 100),
+        ] {
+            let (late, silent, buffered) = capture_restart_outcome(base_ts, old);
+            println!("{label}: late {late}, silent blocks {silent}, buffered {buffered}");
+            if !(late <= 2 && silent <= 4 && buffered < 20) {
+                failures.push(label);
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
     /// A network straggler carries an old sequence along with its old timestamp,
     /// so it must be reported late without flushing the healthy stream.
     #[test]

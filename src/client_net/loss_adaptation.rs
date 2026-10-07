@@ -732,4 +732,56 @@ mod tests {
             Some(LiveEncoderProfile::PROTECTED)
         );
     }
+
+    /// Review: seeded random loss/jitter/late/oversized reports from several
+    /// listeners, then a long calm loss-free stretch. Whatever happened before,
+    /// the controller must return to CLEAN within MAX_CLEAN_AFTER plus one
+    /// hold, never report a level outside LEVELS, and never report a change
+    /// that is not a change.
+    #[test]
+    fn randomized_feedback_always_recovers_to_clean() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n.max(1)
+        };
+        for _ in 0..200 {
+            let start = Instant::now();
+            let mut c = EncoderFeedbackController::new();
+            let mut t = 0u64;
+            let reporters = 1 + rand(4);
+            for _ in 0..rand(400) {
+                let reporter = 1 + rand(reporters);
+                let expected = rand(60) as u16;
+                let feedback = LivePlaybackFeedback {
+                    stream_id: 1,
+                    expected_packets: expected,
+                    // Deliberately allowed to exceed `expected`.
+                    lost_packets: rand(u64::from(expected) + 5) as u16,
+                    late_packets: if rand(4) == 0 { rand(70) as u16 } else { 0 },
+                    window_ms: 500,
+                    max_neteq_target_ms: rand(400) as u16,
+                    max_neteq_playout_delay_ms: rand(400) as u16,
+                    max_interarrival_jitter_ms: rand(120) as u16,
+                    ..LivePlaybackFeedback::default()
+                };
+                let before = c.current();
+                if let Some(next) = c.observe(reporter, feedback, ms(start, t)) {
+                    assert_ne!(next, before);
+                    assert!(LiveEncoderProfile::LEVELS.contains(&next));
+                }
+                t += rand(1_500);
+            }
+            let deadline = t + (MAX_CLEAN_AFTER + PROFILE_HOLD + REPORTER_STALE).as_millis() as u64;
+            while t <= deadline {
+                for reporter in 1..=reporters {
+                    c.observe(reporter, window(25, 0), ms(start, t));
+                }
+                t += 500;
+            }
+            assert_eq!(c.current(), LiveEncoderProfile::CLEAN);
+        }
+    }
 }

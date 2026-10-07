@@ -2660,3 +2660,504 @@ mod tests {
         assert!(packets <= 1);
     }
 }
+
+/// Pre-ship review repros for the capture/send pipeline. Tests that reproduce
+/// a real bug are `#[ignore]`d with a `BUG:` reason so the suite stays green.
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::audio::shared::{DEFAULT_LIVE_MAX_AMPLIFICATION, SAMPLE_RATE};
+    #[allow(unused_imports)]
+    use crate::audio::test_support::*;
+    use std::time::Duration;
+
+    fn pipeline_at(device_rate: u32, tuning: LiveAudioTuning) -> LiveEncoderPipeline {
+        let encoder = OpusVoiceEncoder::new(48_000).unwrap();
+        LiveEncoderPipeline::new(
+            encoder,
+            DenoiseConfig::None,
+            tuning,
+            DEFAULT_LIVE_MAX_AMPLIFICATION,
+            true,
+            DenoiseSuppression::IDENTITY,
+            DenoiseTypingSuppression::DISABLED,
+            None,
+            device_rate,
+            false,
+            AudioReportHub::new(),
+        )
+    }
+
+    /// Drives `callbacks` device periods of `period` frames at `device_rate`
+    /// through a pipeline with *perfect* capture timestamps (no lost audio,
+    /// no lateness) and returns (opus resets after the first packet, total
+    /// clock advance beyond the samples actually produced).
+    pub(super) fn drive_perfect_clock(
+        device_rate: u32,
+        period: usize,
+        callbacks: u64,
+    ) -> (usize, i64) {
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = false;
+        let mut pipeline = pipeline_at(device_rate, tuning);
+        let stats = AudioStats::new();
+        let mut packets = Vec::new();
+        let mut phase = 0u64;
+        let base_ns = 1_000_000_000u64;
+        for k in 0..callbacks {
+            let first_frame = k * period as u64;
+            let capture_ns = base_ns + first_frame * 1_000_000_000 / u64::from(device_rate);
+            let chunk: Vec<f32> = (0..period)
+                .map(|_| {
+                    phase += 1;
+                    ((phase as f32) * 2.0 * std::f32::consts::PI * 300.0 / device_rate as f32).sin()
+                        * 8_000.0
+                })
+                .collect();
+            pipeline.note_capture_timestamp(capture_ns).unwrap();
+            pipeline
+                .push_chunk(
+                    &chunk,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+        }
+        let resets = packets
+            .iter()
+            .skip(1)
+            .filter(|packet| packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0)
+            .count();
+        let produced_48k =
+            (callbacks * period as u64 * u64::from(SAMPLE_RATE) / u64::from(device_rate)) as i64;
+        let extra = i64::from(pipeline.next_capture_sample) - produced_48k;
+        (resets, extra)
+    }
+
+    /// 48 kHz devices with any period size: the accumulator's partial frame is
+    /// accounted, so perfect timestamps never read as a hole.
+    #[test]
+    fn perfect_timestamps_never_gap_at_48k_for_odd_periods() {
+        for period in [64usize, 128, 256, 441, 480, 512, 1000, 1024, 2048] {
+            let (resets, extra) = drive_perfect_clock(48_000, period, 1_500);
+            assert_eq!(resets, 0, "period {period}: spurious opus resets");
+            assert!(extra.abs() <= 480, "period {period}: clock off by {extra}");
+        }
+    }
+
+    /// Non-48 kHz devices: the resampler holds back up to one 10 ms block of
+    /// device samples that `note_capture_timestamp` does not count, so the
+    /// capture clock sees a sawtooth offset of up to ~10 ms. Where the period
+    /// makes that sawtooth rise slowly past the 7.5 ms hole threshold for three
+    /// callbacks, the clock "confirms" holes that never happened: the media
+    /// clock jumps ahead and the Opus stream is reset, repeatedly.
+    #[test]
+    #[ignore = "BUG: resampler backlog not counted by CaptureClock -> false holes on non-48k devices — see review"]
+    fn perfect_timestamps_never_gap_on_resampled_devices() {
+        let mut failures = Vec::new();
+        for device_rate in [44_100u32, 96_000, 88_200, 32_000, 24_000, 16_000] {
+            for period in [64usize, 128, 256, 441, 448, 512, 940, 1000, 1024, 2048] {
+                let (resets, extra) = drive_perfect_clock(device_rate, period, 1_500);
+                if resets > 0 || extra > 960 {
+                    failures.push((device_rate, period, resets, extra));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "(rate, period, resets, extra 48k samples): {failures:?}"
+        );
+    }
+
+    /// Irregular chunk sizes (as delivered by e.g. PulseAudio's ALSA plugin or
+    /// WASAPI shared mode) at 44.1 kHz with perfect timestamps.
+    #[test]
+    #[ignore = "BUG: resampler backlog not counted by CaptureClock -> false holes on non-48k devices — see review"]
+    fn perfect_timestamps_never_gap_with_irregular_44k1_chunks() {
+        let mut failures = Vec::new();
+        for (seed, (lo, hi)) in [(1u64, (400u64, 500u64)), (2, (64, 1024)), (3, (300, 600))] {
+            let mut rng = Lcg(seed);
+            let mut tuning = test_tuning();
+            tuning.capture_silence_gate = false;
+            let mut pipeline = pipeline_at(44_100, tuning);
+            let stats = AudioStats::new();
+            let mut packets = Vec::new();
+            let mut produced = 0u64;
+            for _ in 0..3_000 {
+                let len = (lo + rng.below(hi - lo)) as usize;
+                let capture_ns = 1_000_000_000 + produced * 1_000_000_000 / 44_100;
+                let chunk: Vec<f32> = (0..len)
+                    .map(|n| ((produced as f32 + n as f32) * 0.05).sin() * 8_000.0)
+                    .collect();
+                pipeline.note_capture_timestamp(capture_ns).unwrap();
+                pipeline
+                    .push_chunk(
+                        &chunk,
+                        DEFAULT_LIVE_MAX_AMPLIFICATION,
+                        false,
+                        &stats,
+                        &mut |p| packets.push(p),
+                    )
+                    .unwrap();
+                produced += len as u64;
+            }
+            let resets = packets
+                .iter()
+                .skip(1)
+                .filter(|p| p.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0)
+                .count();
+            let extra =
+                i64::from(pipeline.next_capture_sample) - (produced * 48_000 / 44_100) as i64;
+            if resets > 0 || extra > 960 {
+                failures.push((lo, hi, resets, extra));
+            }
+        }
+        assert!(failures.is_empty(), "(lo, hi, resets, extra): {failures:?}");
+    }
+
+    /// Returns the peak (normalized to the tone) of the last 5 ms of the
+    /// final encoded mute fade-out packet's *input*, when the mute starts
+    /// `lead_frames` 10 ms frames into the stream.
+    fn mute_tail_input_peak(lead_frames: usize) -> f32 {
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = false;
+        let mut pipeline = pipeline_at(SAMPLE_RATE, tuning);
+        let stats = AudioStats::new();
+        let tone: Vec<f32> = (0..FRAME_SAMPLES).map(|_| 10_000.0).collect();
+        let mut packets = Vec::new();
+        for _ in 0..lead_frames {
+            pipeline
+                .push_chunk(
+                    &tone,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    false,
+                    &stats,
+                    &mut |p| packets.push(p),
+                )
+                .unwrap();
+        }
+        // A frame that completes a packet leaves `mute_gain` at the gain of
+        // that packet's last sample; remember it for the last such packet.
+        let mut last_tail_peak = None;
+        for _ in 0..20 {
+            let mut emitted = Vec::new();
+            pipeline
+                .push_chunk(
+                    &tone,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    true,
+                    &stats,
+                    &mut |p| emitted.push(p),
+                )
+                .unwrap();
+            if emitted
+                .iter()
+                .any(|p| matches!(p.payload, VoicePayload::Opus(_)))
+            {
+                last_tail_peak = Some(pipeline.mute_gain);
+            }
+        }
+        // Gain at the end of the last *encoded* frame, smoothstep-shaped.
+        let g = last_tail_peak.unwrap_or(1.0);
+        g * g * (3.0 - 2.0 * g)
+    }
+
+    /// Review guard: whichever packet phase the mute starts on, the last
+    /// encoded fade packet ends at (near) zero gain. (Hypothesis that a
+    /// misaligned fade loses its final 10 ms was disproved: the f32 ramp
+    /// leaves a residue that carries the fade into the frame completing the
+    /// packet. Note this relies on that residue.)
+    #[test]
+    fn mute_fade_reaches_silence_regardless_of_packet_phase() {
+        let aligned = mute_tail_input_peak(10);
+        let misaligned = mute_tail_input_peak(11);
+        assert!(aligned < 0.01, "aligned tail gain {aligned}");
+        assert!(misaligned < 0.01, "misaligned tail gain {misaligned}");
+    }
+
+    /// Non-finite / out-of-range denoise and gain settings straight from
+    /// chatt.toml (TOML accepts `nan` and `inf`; these fields are not
+    /// range-validated at load) must not turn the capture into NaN or
+    /// silence a talker.
+    #[test]
+    fn non_finite_denoise_and_gain_settings_keep_audio_finite() {
+        let frames = sample_speech_frames();
+        for (strength, release, gain_db) in [
+            (f32::NAN, f32::NAN, f32::NAN),
+            (f32::INFINITY, 0.0, f32::INFINITY),
+            (-5.0, -1.0, -20.0),
+            (1.0, f32::NAN, 1_000.0),
+        ] {
+            let mut processor = CaptureProcessor::new(
+                DenoiseConfig::RnnNoise,
+                gain_db,
+                false,
+                DenoiseSuppression { strength, release },
+            );
+            let mut energy = 0.0f64;
+            for frame in frames.iter().take(300) {
+                let mut frame = crate::audio::shared::normalized_to_i16_scale(frame);
+                let vad = processor.process(&mut frame, None);
+                assert!(
+                    vad.is_none_or(f32::is_finite),
+                    "({strength}, {release}, {gain_db}): vad {vad:?}"
+                );
+                assert!(
+                    frame.iter().all(|s| s.is_finite()),
+                    "({strength}, {release}, {gain_db}): non-finite sample"
+                );
+                energy += frame.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+            }
+            println!("({strength}, {release}, {gain_db}): energy {energy:.3e}");
+        }
+    }
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    #[derive(Default, Debug)]
+    struct Violations {
+        /// Consecutive Opus packets whose timestamps are not 960 apart with
+        /// no OPUS_RESET on the later one.
+        discontinuous_without_reset: Vec<(usize, u32, u32)>,
+        /// Opus packet timestamps going backwards.
+        backwards: Vec<(usize, u32, u32)>,
+        /// First Opus packet after a Silence marker without OPUS_RESET.
+        resume_without_reset: Vec<usize>,
+    }
+
+    /// Seeded random walk over speech/silence content, mute toggles, ragged
+    /// 48 kHz chunk sizes, late callbacks and real capture holes. Returns the
+    /// emitted packets.
+    fn random_session(seed: u64) -> Vec<LocalVoiceFrame> {
+        let mut rng = Lcg(seed);
+        let mut tuning = test_tuning();
+        tuning.capture_silence_gate = rng.below(4) != 0;
+        tuning.capture_long_silence_stop = Duration::from_millis(10 * (1 + rng.below(30)));
+        tuning.capture_silence_preroll = Duration::from_millis(10 * rng.below(40));
+        tuning.capture_silence_ramp = Duration::from_millis(rng.below(15));
+        tuning.silence_vad_max = u8::MAX;
+        let mut pipeline = pipeline_at(SAMPLE_RATE, tuning);
+        let stats = AudioStats::new();
+        let mut packets = Vec::new();
+        let mut produced: u64 = 0; // device samples delivered
+        let mut lost_ns: u64 = 0; // capture time lost to real holes
+        let mut speech = true;
+        let mut muted = false;
+        let mut phase = 0u64;
+        for _ in 0..1_500 {
+            match rng.below(40) {
+                0..=2 => speech = !speech,
+                3 => muted = !muted,
+                4 => lost_ns += 10_000_000 * (1 + rng.below(10)),
+                _ => {}
+            }
+            let len = match rng.below(4) {
+                0 => FRAME_SAMPLES,
+                1 => 1 + rng.below(2_000) as usize,
+                2 => 256,
+                _ => 1_024,
+            };
+            let mut capture_ns = 1_000_000_000 + lost_ns + produced * 1_000_000_000 / 48_000;
+            if rng.below(10) == 0 {
+                capture_ns += rng.below(15_000_000);
+            }
+            if rng.below(200) == 0 {
+                capture_ns = 0;
+            }
+            pipeline.note_capture_timestamp(capture_ns).unwrap();
+            let chunk: Vec<f32> = (0..len)
+                .map(|_| {
+                    phase += 1;
+                    if speech {
+                        ((phase as f32) * 0.07).sin() * 12_000.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            pipeline
+                .push_chunk(
+                    &chunk,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    muted,
+                    &stats,
+                    &mut |packet| packets.push(packet),
+                )
+                .unwrap();
+            produced += len as u64;
+        }
+        packets
+    }
+
+    fn check(packets: &[LocalVoiceFrame]) -> Violations {
+        let mut v = Violations::default();
+        let mut last_opus: Option<u32> = None;
+        let mut silence_since_opus = false;
+        for (index, packet) in packets.iter().enumerate() {
+            match packet.payload {
+                VoicePayload::Silence => silence_since_opus = true,
+                VoicePayload::Opus(_) => {
+                    let reset = packet.flags & LIVE_PACKET_FLAG_OPUS_RESET != 0;
+                    if let Some(last) = last_opus {
+                        let step = packet.timestamp.wrapping_sub(last);
+                        if step == 0 || step >= 1 << 31 {
+                            v.backwards.push((index, last, packet.timestamp));
+                        } else if step != LIVE_OPUS_FRAME_SAMPLES as u32 && !reset {
+                            v.discontinuous_without_reset
+                                .push((index, last, packet.timestamp));
+                        }
+                        if silence_since_opus && !reset {
+                            v.resume_without_reset.push(index);
+                        }
+                    }
+                    silence_since_opus = false;
+                    last_opus = Some(packet.timestamp);
+                }
+            }
+        }
+        v
+    }
+
+    /// Timeline invariants hold for any mix of content, mute, chunking, late
+    /// callbacks and holes: Opus timestamps never go backwards, and every
+    /// discontinuity restarts the stream. (The debug contiguity assertion in
+    /// `queue_processed_capture_frame` is armed too.)
+    #[test]
+    fn randomized_sessions_never_send_backwards_opus_timestamps() {
+        for seed in 0..200u64 {
+            let packets = random_session(seed);
+            let v = check(&packets);
+            assert!(v.backwards.is_empty(), "seed {seed}: {v:?}");
+            // Every discontinuity that is not the mute-during-gate-suppression
+            // path (repro below) restarts the stream.
+            let non_mute: Vec<_> = v
+                .discontinuous_without_reset
+                .iter()
+                .filter(|(index, _, _)| packets[*index].flags & LIVE_PACKET_FLAG_MUTE == 0)
+                .collect();
+            assert!(non_mute.is_empty(), "seed {seed}: {non_mute:?}");
+        }
+    }
+
+    /// Muting while the long-silence gate is suppressing: the mute path
+    /// bypasses the gate and queues the fade-out frames straight into the
+    /// Opus encoder that was last fed before the suppressed span. The first
+    /// packet after the silence marker jumps the timeline without
+    /// OPUS_RESET, so encoder and receiver decoder state (and the packet's
+    /// FEC/DRED) straddle the pause.
+    #[test]
+    #[ignore = "BUG: mute during gate suppression resumes Opus across a timestamp gap without OPUS_RESET — see review"]
+    fn randomized_sessions_restart_the_stream_at_every_discontinuity() {
+        let mut failures = Vec::new();
+        for seed in 0..200u64 {
+            let packets = random_session(seed);
+            let v = check(&packets);
+            if !v.discontinuous_without_reset.is_empty() || !v.resume_without_reset.is_empty() {
+                failures.push((seed, v));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} seeds fail; first: {:?}",
+            failures.len(),
+            failures.first()
+        );
+    }
+
+    /// Deterministic form of the above.
+    #[test]
+    #[ignore = "BUG: mute during gate suppression resumes Opus across a timestamp gap without OPUS_RESET — see review"]
+    fn mute_during_gate_suppression_restarts_the_opus_stream() {
+        let mut tuning = test_tuning();
+        tuning.capture_long_silence_stop = Duration::from_millis(20);
+        tuning.capture_silence_preroll = Duration::from_millis(30);
+        tuning.silence_vad_max = u8::MAX;
+        let mut pipeline = pipeline_at(SAMPLE_RATE, tuning);
+        let stats = AudioStats::new();
+        let speech: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|n| (n as f32 * 0.07).sin() * 12_000.0)
+            .collect();
+        let silence = vec![0.0f32; FRAME_SAMPLES];
+        let mut packets = Vec::new();
+        let mut push = |frame: &[f32], muted: bool, packets: &mut Vec<LocalVoiceFrame>| {
+            pipeline
+                .push_chunk(
+                    frame,
+                    DEFAULT_LIVE_MAX_AMPLIFICATION,
+                    muted,
+                    &stats,
+                    &mut |p| packets.push(p),
+                )
+                .unwrap();
+        };
+        for _ in 0..10 {
+            push(&speech, false, &mut packets);
+        }
+        for _ in 0..30 {
+            push(&silence, false, &mut packets);
+        }
+        let before_mute = packets.len();
+        for _ in 0..10 {
+            push(&silence, true, &mut packets);
+        }
+        let first_after = packets[before_mute..]
+            .iter()
+            .find(|p| matches!(p.payload, VoicePayload::Opus(_)))
+            .expect("mute fade-out packet");
+        assert_ne!(
+            first_after.flags & LIVE_PACKET_FLAG_OPUS_RESET,
+            0,
+            "fade-out after a suppressed pause must restart the Opus stream: {:#04x}",
+            first_after.flags
+        );
+    }
+
+    /// Diagnostic: prints one random session's packet trace (`SEED=n`).
+    #[test]
+    #[ignore = "diagnostic trace printer; run with --ignored --nocapture"]
+    fn print_random_session_trace() {
+        let seed: u64 = std::env::var("SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let packets = random_session(seed);
+        for (i, p) in packets.iter().enumerate() {
+            let kind = match p.payload {
+                VoicePayload::Silence => "S",
+                VoicePayload::Opus(_) => "O",
+            };
+            println!("{i} {kind} ts={} flags={:#04x}", p.timestamp, p.flags);
+        }
+    }
+
+    /// Exploratory: lists every period (32..=2048) per rate that produces a
+    /// false hole with perfect timestamps.
+    #[test]
+    #[ignore = "exploratory sweep (~20 min); run with --ignored --nocapture"]
+    fn sweep_resampled_periods() {
+        for device_rate in [44_100u32, 96_000, 32_000, 16_000] {
+            let mut bad = Vec::new();
+            for period in 32usize..=2048 {
+                let (resets, extra) = drive_perfect_clock(device_rate, period, 300);
+                if resets > 0 || extra > 960 {
+                    bad.push(period);
+                }
+            }
+            println!("rate {device_rate}: {} bad periods: {:?}", bad.len(), bad);
+        }
+    }
+}
