@@ -299,7 +299,6 @@ fn rebuilds_of_a_stream_that_never_calls_back(
 /// ~5 s (each one dropping every peer's NetEQ once escalated). Each open/close
 /// also leaks ~8.5 KiB inside PipeWire per the teardown commit's own numbers.
 #[test]
-#[ignore = "BUG: stall→rebuild loop never backs off because open success resets backoff — see review"]
 fn a_stream_that_never_calls_back_backs_off() {
     let window = Duration::from_secs(120);
     let capture = rebuilds_of_a_stream_that_never_calls_back(

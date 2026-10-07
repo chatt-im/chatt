@@ -42,7 +42,9 @@ pub(crate) const DEFAULT_FOLLOW_DEBOUNCE: Duration = Duration::from_secs(1);
 pub(crate) const REBUILD_DEFER_CAP: Duration = Duration::from_secs(3);
 
 /// A failure this soon after an output swap means the swap did not fix the
-/// problem, so recovery escalates to full rebuilds.
+/// problem, so recovery escalates to full rebuilds. Any rebuild or swap is on
+/// the same probation: a failure within it counts as a failed rebuild for
+/// backoff, and only a stream that runs this long without one resets it.
 pub(crate) const SWAP_PROBATION: Duration = Duration::from_secs(10);
 
 /// After this long without a failure, recovery tries a swap first again.
@@ -294,6 +296,11 @@ pub(crate) struct AudioStreamSupervisor {
     escalated: bool,
     last_swap_at: Option<Instant>,
     last_failure_at: Option<Instant>,
+    /// When the last rebuild or swap opened, while it is still on
+    /// [`SWAP_PROBATION`]. A device that opens but never calls back fails its
+    /// progress watch well inside the window, so `attempt` keeps counting
+    /// until a stream has actually run.
+    last_open_at: Option<Instant>,
 }
 
 impl AudioStreamSupervisor {
@@ -350,21 +357,32 @@ impl AudioStreamSupervisor {
         self.note_failure(now);
         self.last_error = Some((kind, message));
         self.since = self.since.or(Some(now));
+        let on_probation = self.settle_probation(now);
         match self.phase() {
             RecoveryPhase::Healthy => {
+                // A stream that fails before it has proven itself counts as a
+                // failed rebuild, so a device that opens but never runs backs
+                // off instead of looping at its stall timeout.
+                let mut delay = DEVICE_FLAP_SETTLE;
+                if on_probation {
+                    self.last_open_at = None;
+                    self.attempt = self.attempt.saturating_add(1);
+                    delay = delay.max(backoff_delay(self.attempt));
+                }
                 self.phase = Some(RecoveryPhase::RebuildPending {
-                    due: now + DEVICE_FLAP_SETTLE,
+                    due: now + delay,
                     first_trigger: now,
                     cause: RebuildCause::StreamError,
                 });
             }
             RecoveryPhase::RebuildPending {
+                due,
                 first_trigger,
                 cause,
-                ..
             } => {
+                // Follow-up errors never pull a backed-off rebuild forward.
                 self.phase = Some(RecoveryPhase::RebuildPending {
-                    due: rearmed_due(now, DEVICE_FLAP_SETTLE, first_trigger),
+                    due: rearmed_due(now, DEVICE_FLAP_SETTLE, first_trigger).max(due),
                     first_trigger,
                     cause,
                 });
@@ -495,12 +513,14 @@ impl AudioStreamSupervisor {
         Some(trigger)
     }
 
-    pub(crate) fn on_rebuild_ok(&mut self, _now: Instant) {
+    /// The rebuild opened. `attempt` resets only once the stream has run
+    /// through [`SWAP_PROBATION`] without a failure.
+    pub(crate) fn on_rebuild_ok(&mut self, now: Instant) {
         self.phase = Some(RecoveryPhase::Healthy);
         self.since = None;
-        self.attempt = 0;
         self.last_error = None;
         self.armed_kind = None;
+        self.last_open_at = Some(now);
     }
 
     /// A [`RecoveryAction::SwapOutput`] succeeded. A failure within
@@ -542,6 +562,8 @@ impl AudioStreamSupervisor {
         }
         self.last_error = Some((kind, message));
         self.since = self.since.or(Some(now));
+        self.settle_probation(now);
+        self.last_open_at = None;
         self.attempt = self.attempt.saturating_add(1);
         if kind == AudioErrorKind::DeviceGone {
             self.phase = Some(RecoveryPhase::WaitingForDevice {
@@ -558,6 +580,20 @@ impl AudioStreamSupervisor {
         if self.armed_kind != Some(AudioErrorKind::DeviceGone) {
             self.armed_kind = Some(kind);
         }
+    }
+
+    /// Ends a probation the stream has run through, resetting `attempt`.
+    /// Returns whether the stream is still on probation.
+    fn settle_probation(&mut self, now: Instant) -> bool {
+        let Some(opened_at) = self.last_open_at else {
+            return false;
+        };
+        if now.saturating_duration_since(opened_at) < SWAP_PROBATION {
+            return true;
+        }
+        self.last_open_at = None;
+        self.attempt = 0;
+        false
     }
 
     fn note_failure(&mut self, now: Instant) {
@@ -912,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_ok_returns_to_healthy_and_resets_attempts() {
+    fn rebuild_ok_returns_to_healthy() {
         let start = Instant::now();
         let mut supervisor = AudioStreamSupervisor::default();
         fail_transient(&mut supervisor, start);
@@ -924,6 +960,65 @@ mod tests {
         supervisor.on_rebuild_ok(at(start, 20));
         assert!(supervisor.is_healthy());
         assert_eq!(supervisor.health().since, None);
+    }
+
+    #[test]
+    fn failure_on_probation_after_a_rebuild_backs_off() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::default();
+        let mut now = start;
+        let mut delays = Vec::new();
+        for _ in 0..7 {
+            supervisor.on_rebuild_ok(now);
+            // The stream opened but stalled before it ever ran.
+            now += Duration::from_millis(750);
+            stall(&mut supervisor, now);
+            let due = supervisor.due_at().unwrap();
+            delays.push(due.duration_since(now));
+            now = due;
+            supervisor.take_due_rebuild(now).unwrap();
+        }
+        assert_eq!(
+            delays,
+            [
+                DEVICE_FLAP_SETTLE,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                AUDIO_BACKOFF_CAP,
+                AUDIO_BACKOFF_CAP,
+            ]
+        );
+
+        // A stream that runs through probation starts over.
+        supervisor.on_rebuild_ok(now);
+        stall(&mut supervisor, now + SWAP_PROBATION);
+        assert_eq!(
+            supervisor.due_at(),
+            Some(now + SWAP_PROBATION + DEVICE_FLAP_SETTLE)
+        );
+        supervisor.take_due_rebuild(now + SWAP_PROBATION + DEVICE_FLAP_SETTLE);
+        fail_transient(&mut supervisor, now + SWAP_PROBATION + DEVICE_FLAP_SETTLE);
+        assert_eq!(
+            supervisor.health().state,
+            AudioHealthState::Reconnecting { attempt: 1 }
+        );
+    }
+
+    #[test]
+    fn follow_up_errors_never_pull_a_backed_off_rebuild_forward() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::default();
+        fail_transient(&mut supervisor, start);
+        fail_transient(&mut supervisor, start);
+        supervisor.take_due_rebuild(at(start, 1_000)).unwrap();
+        supervisor.on_rebuild_ok(at(start, 1_000));
+        stall(&mut supervisor, at(start, 1_500));
+        let due = supervisor.due_at().unwrap();
+        assert_eq!(due, at(start, 3_500));
+        supervisor.on_error(at(start, 1_600), AudioErrorKind::Transient, "x".to_string());
+        assert_eq!(supervisor.due_at(), Some(due));
     }
 
     #[test]
@@ -992,7 +1087,9 @@ mod tests {
             AudioErrorKind::Transient,
             "stall".to_string(),
         );
-        let trigger = supervisor.take_due_rebuild(at(start, 800)).unwrap();
+        // Still on probation, so the rebuild is backed off, not just settled.
+        let due = supervisor.due_at().unwrap();
+        let trigger = supervisor.take_due_rebuild(due).unwrap();
         assert_eq!(trigger.kind, Some(AudioErrorKind::Transient));
     }
 
