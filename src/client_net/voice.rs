@@ -4840,6 +4840,114 @@ mod tests {
         assert!(session.local_talking_since.is_none());
     }
 
+    fn review_session() -> (VoiceSession, StdUdpSocket, Poll) {
+        let actor_poll = Poll::new().unwrap();
+        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let udp = bind_voice_udp_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let session = VoiceSession::new(
+            &actor_poll,
+            1,
+            Some(UdpMediaSetup {
+                socket: udp,
+                server_addr: server.local_addr().unwrap(),
+                server_probe_addr: None,
+            }),
+            protection(55),
+            false,
+            TransportMode::Encrypted,
+            server.local_addr().unwrap(),
+            MediaTransportSetting::Auto,
+            false,
+            CandidatePrivacy::Disabled,
+            false,
+            NetworkEventSender::for_test(event_tx),
+        )
+        .unwrap();
+        (session, server, actor_poll)
+    }
+
+    /// Relay suppression is decided per *user* (`voice_others` is a
+    /// `HashSet<UserId>`), but the server pairs P2P per *session* and relays to
+    /// every session. When one user has two sessions in the call (linked
+    /// devices) and only one of them has a direct path — the other has P2P off
+    /// or forced-TCP media, so the server never pairs it — the relay is
+    /// suppressed and the second device stops hearing us entirely.
+    #[test]
+    #[ignore = "BUG: relay suppressed while a second session of the same user has no direct path — see review"]
+    fn review_relay_kept_for_second_session_of_same_user_without_direct_path() {
+        let (mut session, server, _poll) = review_session();
+        let relayed = |server: &StdUdpSocket| {
+            let mut buf = [0u8; 2048];
+            std::iter::from_fn(|| server.recv_from(&mut buf).ok()).count()
+        };
+        session.voice_started(RoomId(2), SessionId(1), UserId(1), StreamId(5), true);
+        relayed(&server);
+        // User 2 is in the call from two sessions: 9 (P2P, direct and stable)
+        // and 10 (no P2P peer at all).
+        session.voice_started(RoomId(2), SessionId(9), UserId(2), StreamId(20), false);
+        session.voice_started(RoomId(2), SessionId(10), UserId(2), StreamId(21), false);
+        let now = Instant::now();
+        let mut peer = crate::client_net::tests::test_peer_connection(14, 1, 1);
+        assert_eq!(peer.user_id, UserId(2));
+        peer.direct_stable_since = Some(now - Duration::from_secs(10));
+        peer.last_direct_inbound = Some(now);
+        session.p2p_peers.insert(SessionId(9), peer);
+
+        session.send_local_voice(frame(1), None);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            relayed(&server),
+            1,
+            "session 10 of user 2 has no direct path, so our voice must still reach the relay"
+        );
+    }
+
+    /// `voice_stopped` for one of a user's sessions removes the user from
+    /// `voice_others` even though another of their sessions is still in the
+    /// call, so relay/RTT bookkeeping forgets a live participant.
+    #[test]
+    #[ignore = "BUG: voice_others drops a user when only one of their sessions leaves — see review"]
+    fn review_voice_others_tracks_users_with_remaining_sessions() {
+        let (mut session, _server, _poll) = review_session();
+        session.voice_started(RoomId(2), SessionId(1), UserId(1), StreamId(5), true);
+        session.voice_started(RoomId(2), SessionId(9), UserId(2), StreamId(20), false);
+        session.voice_started(RoomId(2), SessionId(10), UserId(2), StreamId(21), false);
+        session.voice_stopped(RoomId(2), SessionId(9), UserId(2), StreamId(20), false);
+        assert!(session.inbound_streams.contains_key(&StreamId(21)));
+        assert!(
+            session.voice_others.contains(&UserId(2)),
+            "user 2 is still in the call from session 10"
+        );
+    }
+
+    /// Before `JoinVoice` activates the voice session, every control the
+    /// network worker forwards (room-wide `VoiceStarted`/`VoiceStopped`,
+    /// offline `Presence`, `UdpBound`, P2P ...) accumulates behind the
+    /// unrunnable `StartSession`. The 257th is rejected, which the worker turns
+    /// into a session teardown.
+    #[test]
+    #[ignore = "BUG: inactive voice mailbox overflows on ordinary room traffic and kills the session — see review"]
+    fn review_inactive_voice_mailbox_does_not_reject_room_traffic() {
+        let (_poll, submission) = submission();
+        assert!(submission.submit(start_command(1)).is_ok());
+        for index in 0..300u32 {
+            let command = VoiceCommand::VoiceStarted {
+                generation: 1,
+                room_id: RoomId(2),
+                session_id: SessionId(u64::from(index) + 10),
+                user_id: UserId(7),
+                stream_id: StreamId(index + 10),
+                local: false,
+            };
+            assert!(
+                submission.submit(command).is_ok(),
+                "control {index} rejected before the session was ever activated"
+            );
+        }
+    }
+
     #[test]
     fn relay_packet_preceding_voice_started_keeps_dedup_state() {
         let actor_poll = Poll::new().unwrap();

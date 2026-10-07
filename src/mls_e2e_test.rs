@@ -2494,3 +2494,507 @@ fn mls_live_competing_membership_commits_roll_back_loser_and_resume() {
     );
     wait_revoked(&alice_victim, "competing commit victim");
 }
+
+/// Pre-ship review repros for client networking state (`client_net.rs`,
+/// `client_net/voice.rs`). Tests marked `BUG:` reproduce a defect and are
+/// ignored so the suite stays green; run them with `--ignored`.
+mod client_net_review {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Collects every network event `client` emits for `window`, counting
+    /// reconnects, without panicking on error events.
+    fn drain_for(client: &Client, window: Duration) -> Vec<NetworkEvent> {
+        let deadline = Instant::now() + window;
+        let mut seen = Vec::new();
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match client.events.recv_timeout(remaining) {
+                Ok(AppEvent::NetworkFor { event, .. }) => {
+                    client.observe_network_event(&event);
+                    seen.push(event);
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        seen
+    }
+
+    fn reconnect_reasons(events: &[NetworkEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                NetworkEvent::ReconnectScheduled { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A TCP front for the real server that completes the transport handshake
+    /// (one hello each way) and then closes, the way a crash-looping or
+    /// overloaded server behind a healthy listener behaves. Counts sessions.
+    struct HandshakeThenCloseProxy {
+        addr: String,
+        accepted: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl HandshakeThenCloseProxy {
+        fn spawn(server_addr: &str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server_addr = server_addr.to_string();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_accepted = Arc::clone(&accepted);
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let (mut client, _) = match listener.accept() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                    };
+                    worker_accepted.fetch_add(1, Ordering::Relaxed);
+                    client.set_nonblocking(false).unwrap();
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let Ok(mut server) = TcpStream::connect(&server_addr) else {
+                        continue;
+                    };
+                    server
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let relay = |from: &mut TcpStream, to: &mut TcpStream| -> bool {
+                        let mut length = [0u8; 4];
+                        if from.read_exact(&mut length).is_err() {
+                            return false;
+                        }
+                        let mut payload = vec![0u8; u32::from_le_bytes(length) as usize];
+                        from.read_exact(&mut payload).is_ok()
+                            && to.write_all(&length).is_ok()
+                            && to.write_all(&payload).is_ok()
+                    };
+                    let _ = relay(&mut client, &mut server) && relay(&mut server, &mut client);
+                    let _ = client.shutdown(Shutdown::Both);
+                    let _ = server.shutdown(Shutdown::Both);
+                }
+            });
+            Self {
+                addr,
+                accepted,
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for HandshakeThenCloseProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    /// `run_worker` resets the backoff and retries with zero delay after every
+    /// `SessionEnd::Disconnected`. A server that completes the handshake and
+    /// then drops the session (crash on auth, overload shedding, a control
+    /// frame this client version cannot decode) is therefore hammered in a
+    /// tight loop instead of being retried on the 1 s/2 s/5 s schedule.
+    #[test]
+    #[ignore = "BUG: reconnect after an established session drop has no backoff (hot loop) — see review"]
+    fn review_reconnect_after_post_handshake_drop_is_rate_limited() {
+        let _guard = live_mls_e2e_guard();
+        let root = temp_dir("review-hot-reconnect");
+        std::fs::create_dir_all(root.join("server")).unwrap();
+        let addrs = start_server(&root);
+        let proxy = HandshakeThenCloseProxy::spawn(&addrs.tcp);
+        let mut bob_config = config(&addrs, &root, "review-hot-Bob", BOB_TOKEN, false);
+        bob_config.tcp_addr = proxy.addr.clone();
+        let bob = spawn(bob_config);
+
+        let events = drain_for(&bob, Duration::from_secs(3));
+        let sessions = proxy.accepted.load(Ordering::Relaxed);
+        let zero_delay = events
+            .iter()
+            .filter(|event| {
+                matches!(event, NetworkEvent::ReconnectScheduled { retry_in, .. } if retry_in.is_zero())
+            })
+            .count();
+        drop(bob);
+        // A bounded schedule allows at most one immediate retry plus one per
+        // second: well under ten sessions in three seconds.
+        assert!(
+            sessions <= 10,
+            "client opened {sessions} handshaken sessions in 3 s ({zero_delay} zero-delay reconnects)"
+        );
+    }
+
+    /// The voice mailbox only drains once `JoinVoice` activates the session,
+    /// but every room-wide `VoiceStarted`/`VoiceStopped`, offline `Presence`,
+    /// `UdpBound`, ... is queued into it regardless. After 256 of them
+    /// `queue_voice_command` fails and the whole network session is torn down
+    /// with "client voice command mailbox is full or stopped". The app skips
+    /// `JoinVoice` after a reconnect when the user had left voice
+    /// (`voice_left`), so such a user is periodically disconnected by other
+    /// people's call activity.
+    #[test]
+    #[ignore = "BUG: client that has not joined voice is disconnected after 256 voice controls — see review"]
+    fn review_client_outside_voice_survives_room_voice_churn() {
+        let _guard = live_mls_e2e_guard();
+        let root = temp_dir("review-voice-mailbox");
+        std::fs::create_dir_all(root.join("server")).unwrap();
+        let addrs = start_server(&root);
+        let alice = spawn(config(&addrs, &root, "review-mbox-Alice", ALICE_TOKEN, false));
+        let bob = spawn(config(&addrs, &root, "review-mbox-Bob", BOB_TOKEN, false));
+        wait_authenticated(&alice, "mailbox Alice");
+        wait_authenticated(&bob, "mailbox Bob");
+
+        // Bob never joins voice. Alice joins and leaves the lobby call.
+        for _ in 0..140 {
+            join_voice_room(&alice, PUBLIC_ROOM, UserId(1));
+            alice.handle.try_send(NetworkCommand::LeaveVoice).unwrap();
+            wait_event(&alice, "alice left", Duration::from_secs(10), |event| {
+                matches!(event, NetworkEvent::VoiceStopped { user_id, .. } if *user_id == UserId(1))
+            });
+            alice.backlog.borrow_mut().clear();
+        }
+        let events = drain_for(&bob, Duration::from_secs(2));
+        let reasons = reconnect_reasons(&events);
+        assert!(
+            reasons.is_empty() && bob.reconnects.get() == 0,
+            "Bob was disconnected by other users' voice activity: {reasons:?}"
+        );
+    }
+
+    /// The server drops an established connection after 300 s without
+    /// traffic, and relies on the client's 5 s voice-RTT probe to keep a quiet
+    /// session alive. That probe runs in the voice thread, which only starts on
+    /// `JoinVoice`; a client that is not in a call (e.g. `voice_left` after a
+    /// reconnect) sends nothing and is dropped every five minutes.
+    #[test]
+    #[ignore = "BUG: idle client outside voice is dropped by the server idle timeout every 5 min (slow: ~5.5 min) — see review"]
+    fn review_idle_client_outside_voice_is_not_dropped_by_server() {
+        let _guard = live_mls_e2e_guard();
+        let root = temp_dir("review-idle-drop");
+        std::fs::create_dir_all(root.join("server")).unwrap();
+        let addrs = start_server(&root);
+        let bob = spawn(config(&addrs, &root, "review-idle-Bob", BOB_TOKEN, false));
+        wait_authenticated(&bob, "idle Bob");
+        let events = drain_for(&bob, Duration::from_secs(330));
+        let reasons = reconnect_reasons(&events);
+        assert!(reasons.is_empty(), "idle client was disconnected: {reasons:?}");
+    }
+
+    /// TCP relay to the server that can be switched into a blackhole: bytes
+    /// keep being accepted (so the client's kernel sees ACKs) but nothing is
+    /// forwarded in either direction — a wedged server or middlebox.
+    struct BlackholeProxy {
+        addr: String,
+        blackhole: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl BlackholeProxy {
+        fn spawn(server_addr: &str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server_addr = server_addr.to_string();
+            let blackhole = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_blackhole = Arc::clone(&blackhole);
+            let worker_stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let Ok((client, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    client.set_nonblocking(false).unwrap();
+                    let Ok(server) = TcpStream::connect(&server_addr) else {
+                        continue;
+                    };
+                    for (mut from, mut to) in [
+                        (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                        (server.try_clone().unwrap(), client.try_clone().unwrap()),
+                    ] {
+                        let blackhole = Arc::clone(&worker_blackhole);
+                        let stop = Arc::clone(&worker_stop);
+                        from.set_read_timeout(Some(Duration::from_millis(100)))
+                            .unwrap();
+                        thread::spawn(move || {
+                            let mut buf = [0u8; 16 * 1024];
+                            while !stop.load(Ordering::Relaxed) {
+                                match from.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(len) => {
+                                        if !blackhole.load(Ordering::Relaxed)
+                                            && to.write_all(&buf[..len]).is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(error)
+                                        if matches!(
+                                            error.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                        ) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                            let _ = to.shutdown(Shutdown::Both);
+                        });
+                    }
+                }
+            });
+            Self {
+                addr,
+                blackhole,
+                stop,
+            }
+        }
+    }
+
+    impl Drop for BlackholeProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Once authenticated, the control connection has no read deadline,
+    /// keepalive, or application ping: `run_worker_inner` only ends on a socket
+    /// error/EOF. A server that stops answering (hung process, middlebox that
+    /// silently drops the flow) leaves the client "connected" indefinitely —
+    /// chat sends queue forever and no reconnect is ever attempted.
+    #[test]
+    #[ignore = "BUG: authenticated session never detects an unresponsive server (slow: 60 s) — see review"]
+    fn review_unresponsive_server_is_detected() {
+        let _guard = live_mls_e2e_guard();
+        let root = temp_dir("review-blackhole");
+        std::fs::create_dir_all(root.join("server")).unwrap();
+        let addrs = start_server(&root);
+        let proxy = BlackholeProxy::spawn(&addrs.tcp);
+        let mut bob_config = config(&addrs, &root, "review-blackhole-Bob", BOB_TOKEN, false);
+        bob_config.tcp_addr = proxy.addr.clone();
+        let bob = spawn(bob_config);
+        wait_authenticated(&bob, "blackhole Bob");
+        proxy.blackhole.store(true, Ordering::Relaxed);
+        bob.handle
+            .try_send(NetworkCommand::SendChat {
+                room_id: PUBLIC_ROOM,
+                body: "into the void".to_string(),
+            })
+            .unwrap();
+        let events = drain_for(&bob, Duration::from_secs(60));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, NetworkEvent::ReconnectScheduled { .. })),
+            "client never noticed the unresponsive server within 60 s"
+        );
+    }
+}
+
+/// Review repro: runtime P2P opt-out is lost on reconnect.
+mod client_net_review_p2p {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn start_p2p_server(root: &Path) -> Addrs {
+        let mut config = ServerConfig::default();
+        config.network.bind.tcp = "127.0.0.1:0".parse().unwrap();
+        config.network.bind.udp = "127.0.0.1:0".parse().unwrap();
+        config.network.udp_probe_addr = None;
+        config.network.public_addr.tcp.clear();
+        config.network.public_addr.udp.clear();
+        config.network.public_udp_probe_addr = None;
+        config.network.p2p = true;
+        config.security.server_identity_seed = dev_server_seed_hex();
+        config.security.transport_encryption = true;
+        config.storage.data_dir = Some(root.join("server").display().to_string());
+        config.rooms = vec![RoomConfig {
+            id: PUBLIC_ROOM.0,
+            name: "lobby".into(),
+            members: None,
+            persistence: RoomPersistenceConfig::None,
+            memory_limit: None,
+            mls_retention_days: None,
+            is_default: true,
+        }];
+        let mut server = Server::bind(config).unwrap();
+        server
+            .seed_users(vec![
+                UserConfig {
+                    id: UserId(1),
+                    internal_reference: "alice".into(),
+                    username: "Alice".into(),
+                    token_hash: hash_secret(ALICE_TOKEN),
+                },
+                UserConfig {
+                    id: UserId(2),
+                    internal_reference: "bob".into(),
+                    username: "Bob".into(),
+                    token_hash: hash_secret(BOB_TOKEN),
+                },
+            ])
+            .unwrap();
+        let tcp = server.tcp_local_addr().unwrap().to_string();
+        let udp = server.udp_local_addr().unwrap().to_string();
+        let admin = server.admin_sender();
+        let worker = thread::spawn(move || {
+            let _ = server.run();
+        });
+        Addrs {
+            tcp,
+            udp,
+            admin,
+            worker: Some(worker),
+        }
+    }
+
+    /// Transparent TCP relay whose live connections can all be cut at once.
+    struct SeverProxy {
+        addr: String,
+        live: Arc<Mutex<Vec<TcpStream>>>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl SeverProxy {
+        fn spawn(server_addr: &str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server_addr = server_addr.to_string();
+            let live = Arc::new(Mutex::new(Vec::<TcpStream>::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_live = Arc::clone(&live);
+            let worker_stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let Ok((client, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    client.set_nonblocking(false).unwrap();
+                    let Ok(server) = TcpStream::connect(&server_addr) else {
+                        continue;
+                    };
+                    {
+                        let mut live = worker_live.lock().unwrap();
+                        live.push(client.try_clone().unwrap());
+                        live.push(server.try_clone().unwrap());
+                    }
+                    for (mut from, mut to) in [
+                        (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                        (server, client),
+                    ] {
+                        thread::spawn(move || {
+                            let _ = std::io::copy(&mut from, &mut to);
+                            let _ = to.shutdown(Shutdown::Both);
+                        });
+                    }
+                }
+            });
+            Self { addr, live, stop }
+        }
+
+        fn sever(&self) {
+            for stream in self.live.lock().unwrap().drain(..) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    impl Drop for SeverProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.sever();
+        }
+    }
+
+    fn wait_quiet<F>(client: &Client, timeout: Duration, mut predicate: F) -> bool
+    where
+        F: FnMut(&NetworkEvent) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match client.events.recv_timeout(remaining) {
+                Ok(AppEvent::NetworkFor { event, .. }) => {
+                    client.observe_network_event(&event);
+                    if predicate(&event) {
+                        return true;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    fn bob_direct(event: &NetworkEvent) -> bool {
+        matches!(
+            event,
+            NetworkEvent::PeerTransport { user_id, direct: true } if *user_id == UserId(2)
+        )
+    }
+
+    /// `NetworkCommand::SetP2pEnabled` only updates the running voice session;
+    /// `run_worker` keeps reusing the `ClientConfig` captured at spawn, so the
+    /// next `StartSession` after any reconnect re-enables P2P and publishes the
+    /// user's host/reflexive addresses to peers they opted out of exposing
+    /// them to. (The app does not re-send the toggle after `Authenticated`.)
+    #[test]
+    #[ignore = "BUG: runtime P2P opt-out is silently re-enabled after a reconnect — see review"]
+    fn review_runtime_p2p_opt_out_survives_reconnect() {
+        let _guard = live_mls_e2e_guard();
+        let root = temp_dir("review-p2p-optout");
+        std::fs::create_dir_all(root.join("server")).unwrap();
+        let addrs = start_p2p_server(&root);
+        let proxy = SeverProxy::spawn(&addrs.tcp);
+        let mut alice_config = config(&addrs, &root, "review-p2p-Alice", ALICE_TOKEN, false);
+        alice_config.p2p_enabled = true;
+        let mut bob_config = config(&addrs, &root, "review-p2p-Bob", BOB_TOKEN, false);
+        bob_config.p2p_enabled = true;
+        bob_config.tcp_addr = proxy.addr.clone();
+        let alice = spawn(alice_config);
+        let bob = spawn(bob_config);
+        wait_authenticated(&alice, "p2p Alice");
+        wait_authenticated(&bob, "p2p Bob");
+
+        bob.handle
+            .try_send(NetworkCommand::SetP2pEnabled(false))
+            .unwrap();
+        join_voice(&alice, PUBLIC_ROOM, UserId(1));
+        join_voice(&bob, PUBLIC_ROOM, UserId(2));
+        assert!(
+            !wait_quiet(&alice, Duration::from_secs(6), bob_direct),
+            "baseline: Bob opted out of P2P, so no direct path may form"
+        );
+
+        proxy.sever();
+        assert!(
+            wait_quiet(&bob, Duration::from_secs(15), |event| {
+                matches!(event, NetworkEvent::Authenticated { .. })
+            }),
+            "Bob did not re-authenticate"
+        );
+        // The app re-joins the last call after every re-authentication.
+        bob.handle
+            .try_send(NetworkCommand::JoinVoice(PUBLIC_ROOM))
+            .unwrap();
+        assert!(
+            !wait_quiet(&alice, Duration::from_secs(10), bob_direct),
+            "Bob's P2P opt-out was lost on reconnect: a direct path to Bob formed"
+        );
+    }
+}
