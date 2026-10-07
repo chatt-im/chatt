@@ -193,6 +193,160 @@ fn leak_cycles() {
     );
 }
 
+/// Both live streams under the app supervisor's detection rules: a
+/// direction counts as failed when its progress watch reports a stall or its
+/// fatal error count rises, and (unless rebuilds are off) is then rebuilt.
+struct SupervisedStreams {
+    echo: Arc<EchoCancellationControl>,
+    rebuild: bool,
+    playback_watchdog: bool,
+    capture: Option<crate::audio::LiveCapture>,
+    playback: Option<crate::audio::LivePlayback>,
+    capture_watch: StreamProgressWatch,
+    playback_watch: StreamProgressWatch,
+    capture_fatal: u64,
+    playback_fatal: u64,
+    capture_rebuilds: u32,
+    playback_rebuilds: u32,
+    /// Callback counts the current streams had at the last tick, and the
+    /// time either direction last advanced.
+    capture_callbacks: u64,
+    playback_callbacks: u64,
+    capture_progress_at: Option<Instant>,
+    playback_progress_at: Option<Instant>,
+}
+
+impl SupervisedStreams {
+    fn start(rebuild: bool, playback_watchdog: bool) -> Self {
+        let echo = Arc::new(EchoCancellationControl::new(false));
+        let capture = Some(start_live_capture(capture_config(&echo), |_| {}).expect("capture"));
+        let playback = Some(start_live_playback(playback_config(&echo)).expect("playback"));
+        Self {
+            echo,
+            rebuild,
+            playback_watchdog,
+            capture,
+            playback,
+            capture_watch: StreamProgressWatch::default(),
+            playback_watch: StreamProgressWatch::default(),
+            capture_fatal: 0,
+            playback_fatal: 0,
+            capture_rebuilds: 0,
+            playback_rebuilds: 0,
+            capture_callbacks: 0,
+            playback_callbacks: 0,
+            capture_progress_at: None,
+            playback_progress_at: None,
+        }
+    }
+
+    /// Observes both directions, rebuilds failed ones, and returns a
+    /// timeline line.
+    fn tick(&mut self, now: Instant, at: u128) -> String {
+        let mut line = format!("{at:>6} ms ");
+        let mut capture_failed = None;
+        match &self.capture {
+            Some(stream) => {
+                let stats = stream.stats().snapshot();
+                line += &format!(
+                    " cap cb={:>5} err={:>8} fatal={:>8}",
+                    stats.callbacks, stats.stream_errors, stats.fatal_stream_errors
+                );
+                if stats.callbacks > self.capture_callbacks {
+                    self.capture_progress_at = Some(now);
+                }
+                self.capture_callbacks = stats.callbacks;
+                if self
+                    .capture_watch
+                    .observe(now, stats.callbacks, true, CAPTURE_STALL)
+                {
+                    capture_failed = Some("STALL");
+                } else if stats.fatal_stream_errors > self.capture_fatal {
+                    capture_failed = Some("FATAL");
+                }
+                self.capture_fatal = stats.fatal_stream_errors;
+            }
+            None => line += " cap (down)                            ",
+        }
+        let mut playback_failed = None;
+        match &self.playback {
+            Some(stream) => {
+                let stats = stream.stats();
+                line += &format!(
+                    " | spk cb={:>5} err={:>8} xrun={:>8} fatal={:>8}",
+                    stats.playback_callbacks,
+                    stats.backend_stream_errors,
+                    stats.backend_xruns,
+                    stats.backend_fatal_stream_errors
+                );
+                if stats.playback_callbacks > self.playback_callbacks {
+                    self.playback_progress_at = Some(now);
+                }
+                self.playback_callbacks = stats.playback_callbacks;
+                if self.playback_watch.observe(
+                    now,
+                    stats.playback_callbacks,
+                    self.playback_watchdog,
+                    PLAYBACK_STALL,
+                ) {
+                    playback_failed = Some("STALL");
+                } else if stats.backend_fatal_stream_errors > self.playback_fatal {
+                    playback_failed = Some("FATAL");
+                }
+                self.playback_fatal = stats.backend_fatal_stream_errors;
+            }
+            None => line += " | spk (down)",
+        }
+        if let Some(reason) = capture_failed {
+            line += &format!("  CAPTURE {reason}");
+        }
+        if let Some(reason) = playback_failed {
+            line += &format!("  PLAYBACK {reason}");
+        }
+
+        if self.rebuild && (capture_failed.is_some() || self.capture.is_none()) {
+            self.capture = None;
+            self.capture_watch = StreamProgressWatch::default();
+            self.capture_fatal = 0;
+            self.capture_callbacks = 0;
+            self.capture_rebuilds += 1;
+            match start_live_capture(capture_config(&self.echo), |_| {}) {
+                Ok(stream) => self.capture = Some(stream),
+                Err(error) => line += &format!("\n{at:>6} ms  capture rebuild failed: {error}"),
+            }
+        }
+        if self.rebuild && (playback_failed.is_some() || self.playback.is_none()) {
+            self.playback = None;
+            self.playback_watch = StreamProgressWatch::default();
+            self.playback_fatal = 0;
+            self.playback_callbacks = 0;
+            self.playback_rebuilds += 1;
+            match start_live_playback(playback_config(&self.echo)) {
+                Ok(stream) => self.playback = Some(stream),
+                Err(error) => line += &format!("\n{at:>6} ms  playback rebuild failed: {error}"),
+            }
+        }
+        line
+    }
+
+    /// Whether both directions delivered callbacks within `window` of `now`.
+    fn both_live(&self, now: Instant, window: Duration) -> bool {
+        let recent = |at: Option<Instant>| at.is_some_and(|at| now.duration_since(at) <= window);
+        recent(self.capture_progress_at) && recent(self.playback_progress_at)
+    }
+
+    fn finish(self) {
+        println!(
+            "rebuilds: capture {}, playback {}",
+            self.capture_rebuilds, self.playback_rebuilds
+        );
+        let drop_started = Instant::now();
+        drop(self.capture);
+        drop(self.playback);
+        println!("streams dropped in {:?}", drop_started.elapsed());
+    }
+}
+
 /// Runs both live streams, flips the injected fault on at 2 s and off at
 /// 6 s, and prints each direction's callback progress. Like the app
 /// supervisor, a direction is rebuilt when its progress watch reports a stall
@@ -208,16 +362,10 @@ fn fault_timeline() {
     // playback is rebuilt only on a fatal backend error.
     let playback_watchdog =
         std::env::var("CHATT_SOAK_PLAYBACK_WATCHDOG").map_or(true, |value| value != "0");
-    let echo = Arc::new(EchoCancellationControl::new(false));
     write_fault("none");
-    let mut capture = Some(start_live_capture(capture_config(&echo), |_| {}).expect("capture"));
-    let mut playback = Some(start_live_playback(playback_config(&echo)).expect("playback"));
+    let mut streams = SupervisedStreams::start(rebuild, playback_watchdog);
 
     let start = Instant::now();
-    let mut capture_watch = StreamProgressWatch::default();
-    let mut playback_watch = StreamProgressWatch::default();
-    let (mut capture_fatal, mut playback_fatal) = (0, 0);
-    let (mut capture_rebuilds, mut playback_rebuilds) = (0, 0);
     let mut fault_on = false;
     let mut fault_cleared = false;
     while start.elapsed() < Duration::from_secs(10) {
@@ -233,85 +381,84 @@ fn fault_timeline() {
             fault_cleared = true;
             println!("{at:>6} ms  fault -> none");
         }
-
-        let mut line = format!("{at:>6} ms ");
-        let mut capture_failed = None;
-        match &capture {
-            Some(stream) => {
-                let stats = stream.stats().snapshot();
-                line += &format!(
-                    " cap cb={:>5} err={:>8} fatal={:>8}",
-                    stats.callbacks, stats.stream_errors, stats.fatal_stream_errors
-                );
-                if capture_watch.observe(now, stats.callbacks, true, CAPTURE_STALL) {
-                    capture_failed = Some("STALL");
-                } else if stats.fatal_stream_errors > capture_fatal {
-                    capture_failed = Some("FATAL");
-                }
-                capture_fatal = stats.fatal_stream_errors;
-            }
-            None => line += " cap (down)                            ",
-        }
-        let mut playback_failed = None;
-        match &playback {
-            Some(stream) => {
-                let stats = stream.stats();
-                line += &format!(
-                    " | spk cb={:>5} err={:>8} xrun={:>8} fatal={:>8}",
-                    stats.playback_callbacks,
-                    stats.backend_stream_errors,
-                    stats.backend_xruns,
-                    stats.backend_fatal_stream_errors
-                );
-                if playback_watch.observe(
-                    now,
-                    stats.playback_callbacks,
-                    playback_watchdog,
-                    PLAYBACK_STALL,
-                ) {
-                    playback_failed = Some("STALL");
-                } else if stats.backend_fatal_stream_errors > playback_fatal {
-                    playback_failed = Some("FATAL");
-                }
-                playback_fatal = stats.backend_fatal_stream_errors;
-            }
-            None => line += " | spk (down)",
-        }
-        if let Some(reason) = capture_failed {
-            line += &format!("  CAPTURE {reason}");
-        }
-        if let Some(reason) = playback_failed {
-            line += &format!("  PLAYBACK {reason}");
-        }
-        println!("{line}");
-
-        if rebuild && (capture_failed.is_some() || capture.is_none()) {
-            capture = None;
-            capture_watch = StreamProgressWatch::default();
-            capture_fatal = 0;
-            capture_rebuilds += 1;
-            match start_live_capture(capture_config(&echo), |_| {}) {
-                Ok(stream) => capture = Some(stream),
-                Err(error) => println!("{at:>6} ms  capture rebuild failed: {error}"),
-            }
-        }
-        if rebuild && (playback_failed.is_some() || playback.is_none()) {
-            playback = None;
-            playback_watch = StreamProgressWatch::default();
-            playback_fatal = 0;
-            playback_rebuilds += 1;
-            match start_live_playback(playback_config(&echo)) {
-                Ok(stream) => playback = Some(stream),
-                Err(error) => println!("{at:>6} ms  playback rebuild failed: {error}"),
-            }
-        }
+        println!("{}", streams.tick(now, at));
         std::thread::sleep(Duration::from_millis(250));
     }
-    println!("rebuilds: capture {capture_rebuilds}, playback {playback_rebuilds}");
-    let drop_started = Instant::now();
-    drop(capture);
-    drop(playback);
-    println!("streams dropped in {:?}", drop_started.elapsed());
+    streams.finish();
+}
+
+/// Runs both live streams through a real system suspend and asserts both
+/// recover. At 2 s it runs `CHATT_SOAK_SUSPEND_CMD` (default
+/// `rtcwake -m mem -s 3`), which suspends the whole machine and wakes it 3 s
+/// later. The kernel suspends the PCMs, so on resume the streams see
+/// SUSPENDED / -ESTRPIPE from the real driver rather than the fault
+/// injector's imitation.
+///
+/// Because `--ignored` runs every ignored test, this one does nothing unless
+/// `CHATT_SOAK_ALLOW_SUSPEND=1` is also set:
+///
+/// ```text
+/// CHATT_SOAK_ALLOW_SUSPEND=1 CHATT_SOAK_DEVICE=<pcm> \
+///   cargo test --lib alsa_soak::suspend_resume -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "suspends the machine; needs CHATT_SOAK_ALLOW_SUSPEND=1"]
+fn suspend_resume() {
+    if std::env::var("CHATT_SOAK_ALLOW_SUSPEND").as_deref() != Ok("1") {
+        println!("skipped: set CHATT_SOAK_ALLOW_SUSPEND=1 to suspend this machine");
+        return;
+    }
+    let command = std::env::var("CHATT_SOAK_SUSPEND_CMD")
+        .unwrap_or_else(|_| "rtcwake -m mem -s 3".to_string());
+    let mut streams = SupervisedStreams::start(true, true);
+
+    let start = Instant::now();
+    let mut suspend_started = false;
+    let mut suspend: Option<std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>> =
+        None;
+    let mut resumed_at = None;
+    while resumed_at.is_none_or(|at: Instant| at.elapsed() < Duration::from_secs(8))
+        && start.elapsed() < Duration::from_secs(60)
+    {
+        let now = Instant::now();
+        let at = now.duration_since(start).as_millis();
+        if !suspend_started && at >= 2_000 {
+            suspend_started = true;
+            println!("{at:>6} ms  suspend: {command}");
+            let command = command.clone();
+            suspend = Some(std::thread::spawn(move || {
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .status()
+            }));
+        }
+        if let Some(handle) = suspend.take_if(|handle| handle.is_finished()) {
+            let status = handle.join().expect("suspend thread panicked");
+            println!("{at:>6} ms  resumed: {status:?}");
+            assert!(
+                status.as_ref().is_ok_and(|status| status.success()),
+                "suspend command failed: {status:?}"
+            );
+            resumed_at = Some(now);
+        }
+        println!("{}", streams.tick(now, at));
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let now = Instant::now();
+    assert!(
+        resumed_at.is_some(),
+        "the machine never resumed within 60 s"
+    );
+    let live = streams.both_live(now, Duration::from_secs(1));
+    let (capture_rebuilds, playback_rebuilds) =
+        (streams.capture_rebuilds, streams.playback_rebuilds);
+    streams.finish();
+    assert!(
+        live,
+        "streams did not recover after resume (rebuilds: capture {capture_rebuilds}, \
+         playback {playback_rebuilds})"
+    );
 }
 
 /// Hangs the PCMs inside libasound calls, then drops both live streams and
