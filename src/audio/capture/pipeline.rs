@@ -3038,7 +3038,13 @@ mod review_tests {
     /// `queue_processed_capture_frame` is armed too.)
     #[test]
     fn randomized_sessions_never_send_backwards_opus_timestamps() {
-        for seed in 0..200u64 {
+        // 12 seeds keep the default suite fast (~2 s); the review ran 200.
+        // Set CHATT_REVIEW_CAPTURE_SEEDS=200 for the full sweep (~40 s).
+        let seeds = std::env::var("CHATT_REVIEW_CAPTURE_SEEDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(12);
+        for seed in 0..seeds {
             let packets = random_session(seed);
             let v = check(&packets);
             assert!(v.backwards.is_empty(), "seed {seed}: {v:?}");
