@@ -7109,7 +7109,7 @@ impl App {
             self.note_default_device_changes(now, previous, &probe);
             self.note_missing_stream_devices(now, previous, &probe);
         }
-        self.note_target_device_sightings(now, &probe);
+        self.note_target_device_sightings(now, previous.as_ref(), &probe);
         self.supervisor.device_probe.last = Some(probe);
     }
 
@@ -7204,24 +7204,46 @@ impl App {
     }
 
     /// Rebuilds immediately when the device a stream is waiting for — or the
-    /// configured device it was displaced from — shows up in the probe.
-    fn note_target_device_sightings(&mut self, now: Instant, probe: &DeviceIdentityProbe) {
-        let capture_target_present = match self.config.audio.input_device_id.as_deref() {
-            Some(id) => probe.inputs_contain(id),
-            None => probe.default_input.is_some(),
-        };
-        if capture_target_present && self.supervisor.capture.on_target_device_seen(now) {
+    /// configured device it was displaced from — shows up in the probe. With
+    /// no previous probe, a listed device counts as having just returned.
+    fn note_target_device_sightings(
+        &mut self,
+        now: Instant,
+        previous: Option<&DeviceIdentityProbe>,
+        probe: &DeviceIdentityProbe,
+    ) {
+        let input_present =
+            |probe: &DeviceIdentityProbe| match self.config.audio.input_device_id.as_deref() {
+                Some(id) => probe.inputs_contain(id),
+                None => probe.default_input.is_some(),
+            };
+        let capture_target_present = input_present(probe);
+        let capture_target_returned = !previous.is_some_and(input_present);
+        if capture_target_present
+            && self
+                .supervisor
+                .capture
+                .on_target_device_seen(now, capture_target_returned)
+        {
             self.note_audio_event(
                 now,
                 AudioDeviceEventKind::DeviceReturned,
                 "mic device available again",
             );
         }
-        let playback_target_present = match self.config.audio.output_device_id.as_deref() {
-            Some(id) => probe.outputs_contain(id),
-            None => probe.default_output.is_some(),
-        };
-        if playback_target_present && self.supervisor.playback.on_target_device_seen(now) {
+        let output_present =
+            |probe: &DeviceIdentityProbe| match self.config.audio.output_device_id.as_deref() {
+                Some(id) => probe.outputs_contain(id),
+                None => probe.default_output.is_some(),
+            };
+        let playback_target_present = output_present(probe);
+        let playback_target_returned = !previous.is_some_and(output_present);
+        if playback_target_present
+            && self
+                .supervisor
+                .playback
+                .on_target_device_seen(now, playback_target_returned)
+        {
             self.note_audio_event(
                 now,
                 AudioDeviceEventKind::DeviceReturned,
@@ -9414,7 +9436,7 @@ impl App {
             self.capture_packet_handler(),
         ) {
             Ok(capture) => {
-                self.supervisor.capture.set_wants_configured_device(false);
+                self.supervisor.capture.on_configured_device_opened();
                 Ok(capture)
             }
             Err(error) if configured_input.is_some() => {
@@ -9431,9 +9453,10 @@ impl App {
                     self.capture_packet_handler(),
                 ) {
                     Ok(capture) => {
-                        self.supervisor.capture.set_wants_configured_device(true);
+                        let now = Instant::now();
+                        self.supervisor.capture.on_configured_device_fallback(now);
                         self.note_audio_event(
-                            Instant::now(),
+                            now,
                             AudioDeviceEventKind::FallbackToDefault,
                             format!("mic: {error}"),
                         );
@@ -9577,7 +9600,7 @@ impl App {
             self.live_playback_config(resolved_output.clone(), Some(feedback_tx.clone())),
         ) {
             Ok(playback) => {
-                self.supervisor.playback.set_wants_configured_device(false);
+                self.supervisor.playback.on_configured_device_opened();
                 Ok(playback)
             }
             Err(error) if resolved_output.is_some() => {
@@ -9592,9 +9615,10 @@ impl App {
                 match audio::start_live_playback(self.live_playback_config(None, Some(feedback_tx)))
                 {
                     Ok(playback) => {
-                        self.supervisor.playback.set_wants_configured_device(true);
+                        let now = Instant::now();
+                        self.supervisor.playback.on_configured_device_fallback(now);
                         self.note_audio_event(
-                            Instant::now(),
+                            now,
                             AudioDeviceEventKind::FallbackToDefault,
                             format!("spk: {error}"),
                         );

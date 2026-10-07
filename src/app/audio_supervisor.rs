@@ -176,16 +176,19 @@ pub(crate) struct RebuildTrigger {
 /// Whether rebuilding one direction should also restart the other.
 ///
 /// Only device and profile transitions (an AirPods A2DP/HFP flip, a default
-/// switch, a device that vanished or came back) can break both directions at
-/// once. A stall, a worker exit or a backend error on a device that still
-/// exists is local to its own stream, and restarting the healthy direction
-/// would only glitch it: a mic restart cuts the user's outgoing voice, and a
-/// playback restart drops every peer's jitter buffer. If a transition does
-/// show up only as a stall, the other direction's own progress watch still
-/// catches it.
+/// switch, a device that vanished) can break both directions at once. Moving
+/// back onto a configured device that showed up again is not one: it changes
+/// only this direction's device, never the default the other one follows. A
+/// stall, a worker exit or a backend error on a device that still exists is
+/// local to its own stream, and restarting the healthy direction would only
+/// glitch it: a mic restart cuts the user's outgoing voice, and a playback
+/// restart drops every peer's jitter buffer. If a transition does show up
+/// only as a stall, the other direction's own progress watch still catches
+/// it.
 pub(crate) fn rebuild_restarts_paired_stream(trigger: RebuildTrigger) -> bool {
     match trigger.cause {
-        RebuildCause::DefaultChanged | RebuildCause::DeviceReturned => true,
+        RebuildCause::DefaultChanged => true,
+        RebuildCause::DeviceReturned => false,
         RebuildCause::StreamError => trigger.kind == Some(AudioErrorKind::DeviceGone),
     }
 }
@@ -271,6 +274,12 @@ pub(crate) struct AudioStreamSupervisor {
     /// was unavailable; a sighting of the configured device rebuilds back
     /// onto it.
     wants_configured_device: bool,
+    /// Consecutive opens of the configured device that failed while the
+    /// fallback opened. A device can stay listed while it refuses to open (a
+    /// busy hw: PCM), so sightings that merely find it still listed retry no
+    /// sooner than `configured_retry_at`.
+    configured_failures: u32,
+    configured_retry_at: Option<Instant>,
     /// The stream can recover by swapping only its output (playback).
     swap_allowed: bool,
     /// A recent swap did not hold, so failures rebuild fully until the stream
@@ -307,8 +316,21 @@ impl AudioStreamSupervisor {
         self.wants_configured_device
     }
 
-    pub(crate) fn set_wants_configured_device(&mut self, wants: bool) {
-        self.wants_configured_device = wants;
+    /// The stream opened on the device it was configured for (or on the
+    /// default, when none is configured).
+    pub(crate) fn on_configured_device_opened(&mut self) {
+        self.wants_configured_device = false;
+        self.configured_failures = 0;
+        self.configured_retry_at = None;
+    }
+
+    /// The configured device failed to open and the stream fell back to the
+    /// system default. Moving back is retried on sightings, backed off by
+    /// [`AUDIO_BACKOFF_SCHEDULE`].
+    pub(crate) fn on_configured_device_fallback(&mut self, now: Instant) {
+        self.wants_configured_device = true;
+        self.configured_failures = self.configured_failures.saturating_add(1);
+        self.configured_retry_at = Some(now + backoff_delay(self.configured_failures));
     }
 
     /// Feeds a runtime stream error. Kinds that do not warrant recovery
@@ -378,17 +400,25 @@ impl AudioStreamSupervisor {
         }
     }
 
-    /// The device observer saw the target device (re)appear: retry now
-    /// instead of waiting out a probe interval or backoff delay. Returns
-    /// whether a rebuild was actually scheduled.
-    pub(crate) fn on_target_device_seen(&mut self, now: Instant) -> bool {
+    /// The device observer saw the target device: retry now instead of
+    /// waiting out a probe interval or backoff delay. `returned` is whether
+    /// the previous probe lacked it. A stream displaced from its configured
+    /// device moves back at once only when the device returns; while it just
+    /// stays listed, the move back waits out the configured-device backoff.
+    /// Returns whether a rebuild was actually scheduled.
+    pub(crate) fn on_target_device_seen(&mut self, now: Instant, returned: bool) -> bool {
         let device_gone_backoff = matches!(self.phase(), RecoveryPhase::BackoffRetry { .. })
             && matches!(self.last_error, Some((AudioErrorKind::DeviceGone, _)));
         let rebuild_now = match self.phase() {
             RecoveryPhase::WaitingForDevice { .. } => true,
             RecoveryPhase::BackoffRetry { .. } => device_gone_backoff,
-            RecoveryPhase::Healthy => self.wants_configured_device,
-            RecoveryPhase::RebuildPending { .. } => false,
+            RecoveryPhase::Healthy if self.wants_configured_device => {
+                if returned {
+                    self.configured_failures = 0;
+                }
+                returned || self.configured_retry_at.is_none_or(|at| now >= at)
+            }
+            RecoveryPhase::Healthy | RecoveryPhase::RebuildPending { .. } => false,
         };
         if !rebuild_now {
             return false;
@@ -449,6 +479,7 @@ impl AudioStreamSupervisor {
         if self.swap_allowed
             && !self.escalated
             && !retry
+            && cause == RebuildCause::StreamError
             && !rebuild_restarts_paired_stream(trigger)
         {
             trigger.action = RecoveryAction::SwapOutput;
@@ -735,7 +766,7 @@ mod tests {
         let start = Instant::now();
         let mut supervisor = AudioStreamSupervisor::default();
         supervisor.on_rebuild_failed(start, AudioErrorKind::DeviceGone, "gone".to_string());
-        supervisor.on_target_device_seen(at(start, 500));
+        supervisor.on_target_device_seen(at(start, 500), true);
         assert_eq!(
             take_cause(&mut supervisor, at(start, 500)),
             Some(RebuildCause::DeviceReturned)
@@ -752,7 +783,7 @@ mod tests {
             AudioErrorKind::DeviceGone,
             "gone".to_string(),
         );
-        supervisor.on_target_device_seen(at(start, 20));
+        supervisor.on_target_device_seen(at(start, 20), true);
         assert_eq!(
             take_cause(&mut supervisor, at(start, 20)),
             Some(RebuildCause::DeviceReturned)
@@ -763,15 +794,45 @@ mod tests {
     fn device_seen_is_ignored_while_healthy_unless_wanting_configured() {
         let start = Instant::now();
         let mut supervisor = AudioStreamSupervisor::default();
-        supervisor.on_target_device_seen(start);
+        supervisor.on_target_device_seen(start, true);
         assert_eq!(take_cause(&mut supervisor, at(start, 60_000)), None);
 
-        supervisor.set_wants_configured_device(true);
-        supervisor.on_target_device_seen(start);
+        supervisor.on_configured_device_fallback(start);
+        supervisor.on_target_device_seen(start, false);
         assert_eq!(
             take_cause(&mut supervisor, start),
             Some(RebuildCause::DeviceReturned)
         );
+    }
+
+    #[test]
+    fn configured_device_that_stays_listed_is_retried_on_backoff() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        supervisor.on_configured_device_fallback(start);
+        supervisor.on_rebuild_ok(start);
+        assert!(supervisor.on_target_device_seen(at(start, 2_000), false));
+        let trigger = supervisor.take_due_rebuild(at(start, 2_000)).unwrap();
+        assert_eq!(trigger.cause, RebuildCause::DeviceReturned);
+        assert_eq!(trigger.action, RecoveryAction::FullRebuild);
+        assert!(!rebuild_restarts_paired_stream(trigger));
+
+        // The configured device failed again: the second failure waits 1 s.
+        supervisor.on_configured_device_fallback(at(start, 2_000));
+        supervisor.on_rebuild_ok(at(start, 2_000));
+        assert!(!supervisor.on_target_device_seen(at(start, 2_999), false));
+        assert!(supervisor.on_target_device_seen(at(start, 3_000), false));
+        supervisor.take_due_rebuild(at(start, 3_000)).unwrap();
+        supervisor.on_configured_device_fallback(at(start, 3_000));
+        supervisor.on_rebuild_ok(at(start, 3_000));
+        assert!(!supervisor.on_target_device_seen(at(start, 4_000), false));
+
+        // A device that actually came back is tried at once.
+        assert!(supervisor.on_target_device_seen(at(start, 4_000), true));
+        supervisor.take_due_rebuild(at(start, 4_000)).unwrap();
+        supervisor.on_configured_device_opened();
+        supervisor.on_rebuild_ok(at(start, 4_000));
+        assert!(!supervisor.on_target_device_seen(at(start, 6_000), true));
     }
 
     #[test]
@@ -825,7 +886,7 @@ mod tests {
         for step in 0..4 {
             fail_transient(&mut supervisor, at(start, step * 10));
         }
-        supervisor.set_wants_configured_device(true);
+        supervisor.on_configured_device_fallback(at(start, 50));
         supervisor.reset();
         assert!(supervisor.is_healthy());
         assert!(!supervisor.wants_configured_device());
@@ -955,7 +1016,8 @@ mod tests {
         ] {
             for kind in kinds {
                 let expected = match cause {
-                    RebuildCause::DefaultChanged | RebuildCause::DeviceReturned => true,
+                    RebuildCause::DefaultChanged => true,
+                    RebuildCause::DeviceReturned => false,
                     RebuildCause::StreamError => kind == Some(AudioErrorKind::DeviceGone),
                 };
                 let trigger = RebuildTrigger {

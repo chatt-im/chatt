@@ -216,9 +216,9 @@ fn capture_waiting_for_device_does_not_restart_playback_on_every_probe() {
 /// is enumerated but will not open (busy hw: PCM, unsupported format, an id
 /// spelling `outputs_contain` accepts but `select_output_device_by_id` does
 /// not) and the system default opens instead: `start_playback_stream` calls
-/// `set_wants_configured_device(true)` then `on_rebuild_ok`.
+/// `on_configured_device_fallback` then `on_rebuild_ok`.
 fn fallback_rebuild_succeeds(supervisor: &mut AudioStreamSupervisor, now: Instant) {
-    supervisor.set_wants_configured_device(true);
+    supervisor.on_configured_device_fallback(now);
     supervisor.on_rebuild_ok(now);
 }
 
@@ -229,7 +229,6 @@ fn fallback_rebuild_succeeds(supervisor: &mut AudioStreamSupervisor, now: Instan
 /// is `DeviceReturned`, which also restarts the paired stream: both the mic
 /// and every peer's jitter buffer are restarted every 2 s for the whole call.
 #[test]
-#[ignore = "BUG: configured-but-unopenable device triggers a rebuild storm every probe — see review"]
 fn configured_device_that_will_not_open_does_not_rebuild_on_every_probe() {
     let start = Instant::now();
     let mut playback = AudioStreamSupervisor::with_output_swap();
@@ -240,8 +239,9 @@ fn configured_device_that_will_not_open_does_not_rebuild_on_every_probe() {
     let minute = 60_000 / PROBE_RECOVERING.as_millis() as u64;
     for probe in 1..=minute {
         let now = start + PROBE_RECOVERING * probe as u32;
-        // `note_target_device_sightings`: the configured id is in the probe.
-        playback.on_target_device_seen(now);
+        // `note_target_device_sightings`: the configured id is in this probe
+        // and was in the previous one.
+        playback.on_target_device_seen(now, false);
         if let Some(trigger) = playback.take_due_rebuild(now) {
             rebuilds += 1;
             assert_eq!(trigger.action, RecoveryAction::FullRebuild);
