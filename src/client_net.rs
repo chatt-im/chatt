@@ -96,6 +96,13 @@ const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Shorter sessions escalate the ordinary reconnect backoff so a server that
 /// drops every session soon after it starts is not redialed in a hot loop.
 const HEALTHY_SESSION_MIN_DURATION: Duration = Duration::from_secs(15);
+/// Control-channel `Ping` cadence once authenticated. Keeps the server's idle
+/// timeout from dropping a quiet client that is not in a call, and draws the
+/// `Pong` that [`SERVER_INBOUND_DEADLINE`] relies on.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// A session that receives no bytes from the server for this long is treated
+/// as dead (hung server or a silently black-holed flow).
+const SERVER_INBOUND_DEADLINE: Duration = Duration::from_secs(90);
 const MAX_PENDING_MLS_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PENDING_MLS_FILE_ITEMS: usize = 1024;
 const MAX_PENDING_MLS_FILE_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
@@ -1841,6 +1848,9 @@ fn run_worker_inner(
         auth_failure: None,
         local_identity_failure: None,
         shutdown_requested: false,
+        last_inbound: Instant::now(),
+        next_keepalive: Instant::now() + KEEPALIVE_INTERVAL,
+        next_keepalive_nonce: 0,
     };
     worker.loop_work.queue_tcp_read();
 
@@ -1997,6 +2007,9 @@ fn run_worker_inner(
             return SessionEnd::Disconnected(error);
         }
         let now = Instant::now();
+        if let Err(error) = worker.poll_liveness(now) {
+            return SessionEnd::Disconnected(error);
+        }
         poll_timeout = worker.next_poll_timeout(command_drain, now);
         #[cfg(debug_assertions)]
         if poll_timeout != Duration::ZERO {
@@ -2618,6 +2631,11 @@ struct WorkerState<'a> {
     /// Distinguishes a terminal local request from a session failure which
     /// should reconnect. Both may be observed in the same poll iteration.
     shutdown_requested: bool,
+    /// Last time any bytes arrived from the server, for
+    /// [`SERVER_INBOUND_DEADLINE`].
+    last_inbound: Instant,
+    next_keepalive: Instant,
+    next_keepalive_nonce: u64,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -3628,7 +3646,7 @@ impl WorkerState<'_> {
     }
 
     #[inline]
-    fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, _now: Instant) -> Duration {
+    fn next_poll_timeout(&mut self, command_drain: CommandDrainOutcome, now: Instant) -> Duration {
         self.queue_runnable_io();
         let mut schedule = PollSchedule::after(IDLE_POLL_TIMEOUT);
         schedule.include(self.loop_work.wake());
@@ -3636,7 +3654,44 @@ impl WorkerState<'_> {
         schedule.include(self.bug_report_wake());
         schedule.include(self.receive_wake());
         schedule.include(self.upload_wake());
+        schedule.include(self.liveness_wake(now));
         schedule.timeout()
+    }
+
+    /// Sends the keepalive `Ping` when due and fails the session once the
+    /// server has been silent for [`SERVER_INBOUND_DEADLINE`].
+    fn poll_liveness(&mut self, now: Instant) -> Result<(), String> {
+        // A full receive buffer means reads are paused on local processing,
+        // not that the server went quiet.
+        if self.read_buf.len() >= MAX_BUFFERED_SERVER_BYTES {
+            self.last_inbound = now;
+        }
+        let silent = now.saturating_duration_since(self.last_inbound);
+        if silent >= SERVER_INBOUND_DEADLINE {
+            kvlog::warn!("server unresponsive", silent_ms = silent.as_millis() as u64);
+            return Err(format!(
+                "server unresponsive: no data for {} s",
+                silent.as_secs()
+            ));
+        }
+        if now >= self.next_keepalive {
+            self.next_keepalive = now + KEEPALIVE_INTERVAL;
+            // The server answers `Ping` only once the session is ready.
+            if self.user_id.is_some() {
+                let nonce = self.next_keepalive_nonce;
+                self.next_keepalive_nonce = nonce.wrapping_add(1);
+                self.queue_control(ClientControl::Ping { nonce })?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn liveness_wake(&self, now: Instant) -> WakeIntent {
+        let deadline = self
+            .next_keepalive
+            .min(self.last_inbound + SERVER_INBOUND_DEADLINE);
+        WakeIntent::After(deadline.saturating_duration_since(now))
     }
 
     #[inline]
@@ -3777,6 +3832,7 @@ impl WorkerState<'_> {
             format!("TCP read failed: {error}")
         })?;
         if outcome.bytes_read > 0 {
+            self.last_inbound = Instant::now();
             kvlog::debug!(
                 "tcp bytes received",
                 size = outcome.bytes_read,

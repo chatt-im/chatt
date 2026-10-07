@@ -2679,7 +2679,7 @@ mod client_net_review {
     /// `JoinVoice`; a client that is not in a call (e.g. `voice_left` after a
     /// reconnect) sends nothing and is dropped every five minutes.
     #[test]
-    #[ignore = "BUG: idle client outside voice is dropped by the server idle timeout every 5 min (slow: ~5.5 min) — see review"]
+    #[ignore = "slow (~5.5 min): waits past the server idle timeout"]
     fn review_idle_client_outside_voice_is_not_dropped_by_server() {
         let _guard = live_mls_e2e_guard();
         let root = temp_dir("review-idle-drop");
@@ -2775,7 +2775,7 @@ mod client_net_review {
     /// silently drops the flow) leaves the client "connected" indefinitely —
     /// chat sends queue forever and no reconnect is ever attempted.
     #[test]
-    #[ignore = "BUG: authenticated session never detects an unresponsive server (slow: 60 s) — see review"]
+    #[ignore = "slow (~2 min): waits for the client's server inbound deadline"]
     fn review_unresponsive_server_is_detected() {
         let _guard = live_mls_e2e_guard();
         let root = temp_dir("review-blackhole");
@@ -2793,12 +2793,13 @@ mod client_net_review {
                 body: "into the void".to_string(),
             })
             .unwrap();
-        let events = drain_for(&bob, Duration::from_secs(60));
+        // The client gives up after 90 s without inbound bytes.
+        let events = drain_for(&bob, Duration::from_secs(120));
         assert!(
             events
                 .iter()
                 .any(|event| matches!(event, NetworkEvent::ReconnectScheduled { .. })),
-            "client never noticed the unresponsive server within 60 s"
+            "client never noticed the unresponsive server within 120 s"
         );
     }
 }
