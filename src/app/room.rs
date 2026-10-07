@@ -2783,8 +2783,10 @@ impl RoomSession {
                             voice_state: VoiceState::default(),
                         });
                     }
+                    // Without a known local user, pair the peer with itself so
+                    // `dm_peer` still resolves (and re-saves) the real peer.
                     ClientRoomKind::Dm {
-                        user_a: local_user.unwrap_or_default(),
+                        user_a: local_user.unwrap_or(*peer),
                         user_b: *peer,
                     }
                 }
@@ -8651,7 +8653,6 @@ mod tests {
     /// switch, or `reset_room_for_disconnect` on a failed connect) must still
     /// write the DM peer back unchanged.
     #[test]
-    #[ignore = "BUG: offline-loaded DM rooms resolve their peer as UserId(0) and a pre-auth catalog save persists dm-peer = 0 — see review"]
     fn review_offline_dm_catalog_round_trips_peer_without_local_user() {
         let catalog = RoomCatalog {
             last_viewed_room: Some(RoomId(0x8000_0001)),
