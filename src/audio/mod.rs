@@ -24,8 +24,8 @@ pub use device::{
 pub use errors::{AudioErrorKind, AudioStartError};
 pub use lifecycle::{
     AudioDeviceInfo, LiveCapture, LiveCaptureConfig, LivePlayback, LivePlaybackConfig,
-    LivePlaybackSink, Playback, Recording, RecordingConfig, start_live_capture,
-    start_live_playback, start_playback, start_recording,
+    LivePlaybackSink, Playback, Recording, RecordingConfig, stalled_stream_teardowns,
+    start_live_capture, start_live_playback, start_playback, start_recording,
 };
 pub use notifications::{NotificationSound, sound_samples};
 pub(crate) use report::{

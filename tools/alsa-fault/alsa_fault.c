@@ -13,6 +13,9 @@
 //            answers -EAGAIN forever: a resume that never completes
 //   ebadfd   every PCM transfer and status call fails with -EBADFD: a PCM left
 //            in a state prepare() cannot fix
+//   hang     PCM transfer, status, drop and close calls block until the mode
+//            changes: a driver or sound server stuck inside a call, which
+//            pins the cpal worker and anything that joins it
 //
 // CHATT_ALSA_FAULT_DIR selects which PCMs are affected: `playback`, `capture`
 // or `both` (the default).
@@ -29,7 +32,7 @@
 #include <string.h>
 #include <time.h>
 
-enum mode { MODE_NONE, MODE_WEDGE, MODE_SUSPEND, MODE_EBADFD };
+enum mode { MODE_NONE, MODE_WEDGE, MODE_SUSPEND, MODE_EBADFD, MODE_HANG };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static enum mode cached_mode = MODE_NONE;
@@ -68,6 +71,7 @@ static enum mode current_mode(void) {
                 if (!strncmp(buf, "wedge", 5)) mode = MODE_WEDGE;
                 else if (!strncmp(buf, "suspend", 7)) mode = MODE_SUSPEND;
                 else if (!strncmp(buf, "ebadfd", 6)) mode = MODE_EBADFD;
+                else if (!strncmp(buf, "hang", 4)) mode = MODE_HANG;
             }
             fclose(file);
         }
@@ -103,6 +107,12 @@ static int fd_faulted(int fd, enum mode want) {
     }
     pthread_mutex_unlock(&lock);
     return hit;
+}
+
+// Blocks the calling thread while `pcm` is hung.
+static void hang_while_faulted(snd_pcm_t *pcm) {
+    struct timespec step = {0, 10 * 1000 * 1000};
+    while (pcm_faulted(pcm, MODE_HANG)) nanosleep(&step, NULL);
 }
 
 int snd_pcm_poll_descriptors(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int space) {
@@ -185,6 +195,7 @@ snd_pcm_state_t snd_pcm_state(snd_pcm_t *pcm) {
 int snd_pcm_avail_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *avail, snd_pcm_sframes_t *delay) {
     static int (*next)(snd_pcm_t *, snd_pcm_sframes_t *, snd_pcm_sframes_t *);
     if (!next) next = real("snd_pcm_avail_delay");
+    hang_while_faulted(pcm);
     if (pcm_faulted(pcm, MODE_SUSPEND)) return -ESTRPIPE;
     if (pcm_faulted(pcm, MODE_EBADFD)) return -EBADFD;
     return next(pcm, avail, delay);
@@ -193,6 +204,7 @@ int snd_pcm_avail_delay(snd_pcm_t *pcm, snd_pcm_sframes_t *avail, snd_pcm_sframe
 snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t size) {
     static snd_pcm_sframes_t (*next)(snd_pcm_t *, void *, snd_pcm_uframes_t);
     if (!next) next = real("snd_pcm_readi");
+    hang_while_faulted(pcm);
     if (pcm_faulted(pcm, MODE_SUSPEND)) return -ESTRPIPE;
     if (pcm_faulted(pcm, MODE_EBADFD)) return -EBADFD;
     return next(pcm, buffer, size);
@@ -201,6 +213,7 @@ snd_pcm_sframes_t snd_pcm_readi(snd_pcm_t *pcm, void *buffer, snd_pcm_uframes_t 
 snd_pcm_sframes_t snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size) {
     static snd_pcm_sframes_t (*next)(snd_pcm_t *, const void *, snd_pcm_uframes_t);
     if (!next) next = real("snd_pcm_writei");
+    hang_while_faulted(pcm);
     if (pcm_faulted(pcm, MODE_SUSPEND)) return -ESTRPIPE;
     if (pcm_faulted(pcm, MODE_EBADFD)) return -EBADFD;
     return next(pcm, buffer, size);
@@ -224,5 +237,19 @@ int snd_pcm_start(snd_pcm_t *pcm) {
     static int (*next)(snd_pcm_t *);
     if (!next) next = real("snd_pcm_start");
     if (pcm_faulted(pcm, MODE_EBADFD)) return -EBADFD;
+    return next(pcm);
+}
+
+int snd_pcm_drop(snd_pcm_t *pcm) {
+    static int (*next)(snd_pcm_t *);
+    if (!next) next = real("snd_pcm_drop");
+    hang_while_faulted(pcm);
+    return next(pcm);
+}
+
+int snd_pcm_close(snd_pcm_t *pcm) {
+    static int (*next)(snd_pcm_t *);
+    if (!next) next = real("snd_pcm_close");
+    hang_while_faulted(pcm);
     return next(pcm);
 }

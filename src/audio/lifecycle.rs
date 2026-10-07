@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
         mpsc::TrySendError,
         mpsc::{Receiver, Sender, SyncSender, sync_channel},
     },
@@ -296,13 +296,17 @@ impl LiveCapture {
     }
 
     fn stop_inner(&mut self) -> StatsSnapshot {
-        self.stream.take();
-        if let Some(worker) = self.worker.take() {
-            if worker.join().is_err() {
-                self.stats
-                    .set_error("live audio worker panicked".to_string());
+        let stream = self.stream.take();
+        let worker = self.worker.take();
+        let stats = self.stats.clone();
+        bounded_teardown("capture", move || {
+            drop(stream);
+            if let Some(worker) = worker
+                && worker.join().is_err()
+            {
+                stats.set_error("live audio worker panicked".to_string());
             }
-        }
+        });
         self.stats.snapshot()
     }
 }
@@ -313,6 +317,79 @@ impl Drop for LiveCapture {
             let _ = self.stop_inner();
         }
     }
+}
+
+/// How long dropping a live stream may block its caller. The app drops streams
+/// on its UI thread, and closing a PCM whose driver or sound server is stuck
+/// can block indefinitely, so teardown runs on its own thread and the caller
+/// stops waiting after this budget. A normal close finishes well within it,
+/// so the old device is still released before a successor opens.
+const STREAM_TEARDOWN_BUDGET: Duration = Duration::from_millis(300);
+
+/// Live stream teardowns still running past [`STREAM_TEARDOWN_BUDGET`].
+static STALLED_TEARDOWNS: AtomicU64 = AtomicU64::new(0);
+
+/// Number of live stream teardowns that are stuck in the backend right now.
+pub fn stalled_stream_teardowns() -> u64 {
+    STALLED_TEARDOWNS.load(Ordering::Relaxed)
+}
+
+/// Runs `teardown` on a dedicated thread and waits at most
+/// [`STREAM_TEARDOWN_BUDGET`] for it. A teardown that overruns keeps running
+/// detached and is counted in [`stalled_stream_teardowns`] until it finishes.
+fn bounded_teardown(direction: &'static str, teardown: impl FnOnce() + Send + 'static) {
+    const RUNNING: u8 = 0;
+    const DONE: u8 = 1;
+    const ABANDONED: u8 = 2;
+    let state = Arc::new(AtomicU8::new(RUNNING));
+    let thread_state = Arc::clone(&state);
+    let (done_tx, done_rx) = sync_channel::<()>(1);
+    let started = Instant::now();
+    let spawned = thread::Builder::new()
+        .name("chatt-audio-teardown".to_owned())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            teardown();
+            if thread_state
+                .compare_exchange(RUNNING, DONE, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                STALLED_TEARDOWNS.fetch_sub(1, Ordering::Relaxed);
+                kvlog::info!(
+                    "audio stream teardown finished late",
+                    direction,
+                    elapsed_ms = started.elapsed().as_millis() as u64
+                );
+            }
+            let _ = done_tx.send(());
+        });
+    if let Err(error) = spawned {
+        kvlog::warn!(
+            "failed to spawn audio teardown thread",
+            direction,
+            error = error.to_string().as_str()
+        );
+        return;
+    }
+    if done_rx.recv_timeout(STREAM_TEARDOWN_BUDGET).is_ok() {
+        return;
+    }
+    // Count before abandoning, so the late finisher's decrement (which only
+    // happens after it sees ABANDONED) can never run first.
+    STALLED_TEARDOWNS.fetch_add(1, Ordering::Relaxed);
+    if state
+        .compare_exchange(RUNNING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Finished just after the timeout.
+        STALLED_TEARDOWNS.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    kvlog::warn!(
+        "audio stream teardown stalled in the backend; continuing without it",
+        direction,
+        budget_ms = STREAM_TEARDOWN_BUDGET.as_millis() as u64
+    );
 }
 
 impl LivePlayback {
@@ -400,16 +477,25 @@ impl LivePlayback {
     }
 
     fn stop_inner(&mut self) {
-        self.stream.take();
-        if let Some(recording) = self.playback_recording.take() {
-            recording.stop();
+        let stream = self.stream.take();
+        let recording = self.playback_recording.take();
+        let sender = self.sender.take();
+        let worker = self.worker.take();
+        if stream.is_none() && recording.is_none() && sender.is_none() && worker.is_none() {
+            return;
         }
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.send(LivePlaybackCommand::Shutdown);
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        bounded_teardown("playback", move || {
+            drop(stream);
+            if let Some(recording) = recording {
+                recording.stop();
+            }
+            if let Some(sender) = sender {
+                let _ = sender.send(LivePlaybackCommand::Shutdown);
+            }
+            if let Some(worker) = worker {
+                let _ = worker.join();
+            }
+        });
     }
 }
 

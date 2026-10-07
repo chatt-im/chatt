@@ -12,7 +12,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -204,31 +204,20 @@ impl HostTrait for Host {
     }
 }
 
-/// Global count of active ALSA context instances.
-static ALSA_CONTEXT_COUNT: Mutex<usize> = Mutex::new(0);
-
 /// ALSA backend context shared between `Host`, `Device`, and `Stream` via `Arc`.
+///
+/// Loads the global ALSA configuration but never frees it. Freeing it when the
+/// last context dropped unloaded PCM plugins, and the PipeWire plugin leaks
+/// roughly 17 KiB of heap per load, so every stream opened after an idle gap
+/// (a lingering notification stream, a rebuild) leaked. `snd_pcm_open` still
+/// reloads the configuration when its files change.
 #[derive(Debug)]
 pub(super) struct AlsaContext;
 
 impl AlsaContext {
     fn new() -> Result<Self, alsa::Error> {
-        let mut count = ALSA_CONTEXT_COUNT.lock().unwrap_or_else(|e| e.into_inner());
-        if *count == 0 {
-            alsa::config::update()?;
-        }
-        *count += 1;
+        alsa::config::update()?;
         Ok(Self)
-    }
-}
-
-impl Drop for AlsaContext {
-    fn drop(&mut self) {
-        let mut count = ALSA_CONTEXT_COUNT.lock().unwrap_or_else(|e| e.into_inner());
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            let _ = alsa::config::update_free_global();
-        }
     }
 }
 

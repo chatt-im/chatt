@@ -16,12 +16,14 @@
 //!
 //! Environment:
 //! - `CHATT_SOAK_DEVICE`: ALSA PCM to open (default `default`).
-//! - `CHATT_ALSA_FAULT`: `wedge`, `suspend` or `ebadfd` (see the injector).
+//! - `CHATT_ALSA_FAULT`: `wedge`, `suspend`, `ebadfd` or `hang` (see the
+//!   injector). `hang_drop` sets `hang` itself.
 //! - `CHATT_SOAK_REBUILD=0`: observe only, never rebuild a failed stream.
 //! - `CHATT_SOAK_PLAYBACK_WATCHDOG=0`: rebuild playback only on fatal errors,
 //!   as the supervisor did before playback had a progress watch.
 //! - `CHATT_SOAK_ITERS`, `CHATT_SOAK_CYCLE` (`probe`, `playback`, `capture`)
-//!   and `CHATT_SOAK_HOLD_HOST`: shape the `leak_cycles` run.
+//!   and `CHATT_SOAK_HOLD_HOST`: shape the `leak_cycles` run; `CHATT_SOAK_CYCLE`
+//!   also limits `hang_drop` to one direction.
 
 use std::{
     sync::{Arc, atomic::AtomicU32},
@@ -77,6 +79,9 @@ struct ProcessResources {
     fds: usize,
     threads: usize,
     rss_kib: u64,
+    /// Bytes glibc reports as allocated and not yet freed. Exact, unlike RSS,
+    /// which moves with allocator page retention.
+    heap_bytes: usize,
 }
 
 fn process_resources() -> ProcessResources {
@@ -91,10 +96,13 @@ fn process_resources() -> ProcessResources {
                 .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
         })
         .unwrap_or(0);
+    // SAFETY: mallinfo2 only reads allocator statistics.
+    let heap_bytes = unsafe { libc::mallinfo2() }.uordblks;
     ProcessResources {
         fds,
         threads,
         rss_kib,
+        heap_bytes,
     }
 }
 
@@ -116,21 +124,27 @@ fn leak_cycles() {
         .unwrap_or(200);
     let echo = Arc::new(EchoCancellationControl::new(false));
 
-    let warm_capture = start_live_capture(capture_config(&echo), |_| {}).expect("capture");
-    let warm_playback = start_live_playback(playback_config(&echo)).expect("playback");
-    drop(warm_capture);
-    drop(warm_playback);
+    // `probe`, `playback`, `capture`, or anything else for all three.
+    let cycle = std::env::var("CHATT_SOAK_CYCLE").unwrap_or_default();
+    let run = |name: &str| cycle.is_empty() || cycle == "all" || cycle == name;
+
+    // Warm only the cycled directions, so a PCM without a capture side (a
+    // PipeWire session with no source) can still soak playback.
+    if run("capture") {
+        drop(start_live_capture(capture_config(&echo), |_| {}).expect("capture"));
+    }
+    if run("playback") {
+        drop(start_live_playback(playback_config(&echo)).expect("playback"));
+    }
     let _ = crate::audio::probe_device_identities();
     let baseline = process_resources();
     println!("baseline {baseline:?}");
 
-    // `probe`, `playback`, `capture`, or anything else for all three.
-    let cycle = std::env::var("CHATT_SOAK_CYCLE").unwrap_or_default();
     // Holding a host keeps cpal's ALSA context count above zero, so stream
     // closes stop freeing (and the next open stop reloading) the global
     // ALSA configuration. Separates config churn from per-stream leaks.
     let _held_host = std::env::var_os("CHATT_SOAK_HOLD_HOST").map(|_| cpal::default_host());
-    let run = |name: &str| cycle.is_empty() || cycle == "all" || cycle == name;
+    let mut slowest_drop = Duration::ZERO;
     for iteration in 1..=iterations {
         if run("probe") {
             let _ = crate::audio::probe_device_identities();
@@ -138,12 +152,16 @@ fn leak_cycles() {
         if run("playback") {
             let playback = start_live_playback(playback_config(&echo)).expect("playback");
             std::thread::sleep(Duration::from_millis(20));
+            let started = Instant::now();
             drop(playback);
+            slowest_drop = slowest_drop.max(started.elapsed());
         }
         if run("capture") {
             let capture = start_live_capture(capture_config(&echo), |_| {}).expect("capture");
             std::thread::sleep(Duration::from_millis(20));
+            let started = Instant::now();
             drop(capture);
+            slowest_drop = slowest_drop.max(started.elapsed());
         }
         if iteration % (iterations / 10).max(1) == 0 {
             println!("iter {iteration:>6} {:?}", process_resources());
@@ -151,6 +169,16 @@ fn leak_cycles() {
     }
     let end = process_resources();
     println!("end {end:?}");
+    println!(
+        "slowest stream drop {slowest_drop:?}, stalled teardowns {}",
+        crate::audio::stalled_stream_teardowns()
+    );
+    let heap_growth = end.heap_bytes as f64 - baseline.heap_bytes as f64;
+    println!(
+        "heap growth {:.0} B total, {:.1} B per cycle",
+        heap_growth,
+        heap_growth / iterations as f64
+    );
     assert!(
         end.fds <= baseline.fds + 2,
         "fd count grew from {} to {} over {iterations} cycles",
@@ -284,4 +312,54 @@ fn fault_timeline() {
     drop(capture);
     drop(playback);
     println!("streams dropped in {:?}", drop_started.elapsed());
+}
+
+/// Hangs the PCMs inside libasound calls, then drops both live streams and
+/// times the drop. The app drops streams on its UI thread, so a drop that
+/// waits on a hung worker freezes the UI. Needs `LD_PRELOAD` of the fault
+/// injector; `CHATT_SOAK_CYCLE` (`playback`, `capture`) limits the streams.
+#[test]
+#[ignore = "needs a real ALSA PCM and the fault injector"]
+fn hang_drop() {
+    let cycle = std::env::var("CHATT_SOAK_CYCLE").unwrap_or_default();
+    let run = |name: &str| cycle.is_empty() || cycle == "all" || cycle == name;
+    let echo = Arc::new(EchoCancellationControl::new(false));
+    write_fault("none");
+    let baseline = process_resources();
+    let capture =
+        run("capture").then(|| start_live_capture(capture_config(&echo), |_| {}).expect("capture"));
+    let playback =
+        run("playback").then(|| start_live_playback(playback_config(&echo)).expect("playback"));
+    std::thread::sleep(Duration::from_millis(500));
+    write_fault("hang");
+    // Long enough for both workers to enter a hung call.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let drop_started = Instant::now();
+    drop(capture);
+    drop(playback);
+    let drop_time = drop_started.elapsed();
+    println!("streams dropped in {drop_time:?} while hung");
+
+    write_fault("none");
+    let release_started = Instant::now();
+    while process_resources().threads > baseline.threads
+        && release_started.elapsed() < Duration::from_secs(5)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    println!(
+        "hung teardown finished {:?} after release, threads {} -> {}",
+        release_started.elapsed(),
+        baseline.threads,
+        process_resources().threads
+    );
+    assert!(
+        drop_time < Duration::from_secs(1),
+        "dropping hung streams blocked the caller for {drop_time:?}"
+    );
+    assert!(
+        process_resources().threads <= baseline.threads,
+        "hung teardown threads never exited after the fault cleared"
+    );
 }
