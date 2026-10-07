@@ -15,7 +15,7 @@ use std::{
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
     vec::IntoIter as VecIntoIter,
 };
 
@@ -878,15 +878,16 @@ struct StreamWorkerContext {
     descriptors: Box<[libc::pollfd]>,
     transfer_buffer: Box<[u8]>,
     poll_timeout: i32,
+    failures: FailureBackoff,
 }
 
 impl StreamWorkerContext {
     fn new(poll_timeout: &Option<Duration>, stream: &StreamInner, rx: &TriggerReceiver) -> Self {
-        let poll_timeout: i32 = if let Some(d) = poll_timeout {
-            d.as_millis().min(i32::MAX as u128) as i32
-        } else {
-            -1 // Don't timeout, wait forever.
-        };
+        // Without a caller timeout, still wake up periodically so the PCM state
+        // is re-checked: some suspend paths and plugin shims never deliver
+        // POLLERR/POLLHUP, and an unbounded wait would park the worker forever.
+        let poll_timeout = poll_timeout.unwrap_or(STATE_CHECK_INTERVAL);
+        let poll_timeout = poll_timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
 
         // Pre-allocate a period-sized working buffer. Contents are overwritten each callback.
         let transfer_buffer = vec![0u8; stream.period_size * stream.frame_size].into_boxed_slice();
@@ -924,6 +925,133 @@ impl StreamWorkerContext {
             descriptors,
             transfer_buffer,
             poll_timeout,
+            failures: FailureBackoff::new(frames_to_duration(
+                stream.period_size as FrameCount,
+                stream.sample_rate,
+            )),
+        }
+    }
+}
+
+/// Poll timeout used when the caller passed none. Only bounds how long a PCM
+/// that raises no events goes without a state check; a timeout never surfaces
+/// as an error.
+const STATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Failed iterations with no period transferred for this long mean the PCM is
+/// not coming back on its own. The worker reports
+/// [`ErrorKind::StreamInvalidated`] and exits so the owner can rebuild it,
+/// instead of retrying `prepare()` against it for the rest of the process.
+const PERSISTENT_FAILURE_LIMIT: Duration = Duration::from_secs(2);
+
+/// Ceiling on the pause between consecutive failed iterations.
+const MAX_FAILURE_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Paces a worker through a run of failed iterations.
+///
+/// A lone xrun recovers immediately, but a PCM that fails every iteration
+/// (an error `prepare()` cannot clear) would otherwise spin the possibly
+/// realtime worker at millions of error callbacks per second.
+#[derive(Debug)]
+struct FailureBackoff {
+    period: Duration,
+    failures: u32,
+    since: Option<Instant>,
+}
+
+enum FailureAction {
+    Retry(Duration),
+    Abandon(Duration),
+}
+
+impl FailureBackoff {
+    fn new(period: Duration) -> Self {
+        Self {
+            period: period.max(Duration::from_millis(1)),
+            failures: 0,
+            since: None,
+        }
+    }
+
+    /// A period was transferred: the stream is healthy again.
+    fn success(&mut self) {
+        self.failures = 0;
+        self.since = None;
+    }
+
+    fn failure(&mut self, now: Instant) -> FailureAction {
+        let since = *self.since.get_or_insert(now);
+        self.failures = self.failures.saturating_add(1);
+        let failing_for = now.saturating_duration_since(since);
+        if self.failures > 1 && failing_for >= PERSISTENT_FAILURE_LIMIT {
+            return FailureAction::Abandon(failing_for);
+        }
+        if self.failures == 1 {
+            return FailureAction::Retry(Duration::ZERO);
+        }
+        let doublings = (self.failures - 2).min(16);
+        FailureAction::Retry((self.period * (1u32 << doublings)).min(MAX_FAILURE_BACKOFF))
+    }
+}
+
+/// Sleeps for `delay`, returning early if the stream is being dropped.
+fn wait_for_retry(rx: &TriggerReceiver, delay: Duration) {
+    if delay.is_zero() {
+        return;
+    }
+    let mut pipe = [libc::pollfd {
+        fd: rx.0,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let timeout = delay.as_millis().clamp(1, i32::MAX as u128) as i32;
+    // The self-pipe is left unread: the worker's next poll sees and clears it.
+    // SAFETY: `pipe` is a valid one-element pollfd array for the call.
+    let _ = unsafe { libc::poll(pipe.as_mut_ptr(), 1, timeout) };
+}
+
+/// Handles one failed worker iteration: reports `err`, runs the xrun
+/// recovery, and paces the retry. Returns false when the worker should exit.
+fn handle_worker_failure(
+    rx: &TriggerReceiver,
+    stream: &StreamInner,
+    failures: &mut FailureBackoff,
+    err: Error,
+    error_callback: &mut (dyn FnMut(Error) + Send + 'static),
+) -> bool {
+    match err.kind() {
+        ErrorKind::DeviceNotAvailable => {
+            error_callback(err);
+            return false;
+        }
+        ErrorKind::Xrun => {
+            error_callback(err);
+            if let Err(err) = stream.handle.prepare() {
+                error_callback(err.into());
+            } else if stream.direction == DeviceDirection::Input {
+                if let Err(err) = stream.handle.start() {
+                    error_callback(err.into());
+                }
+            }
+            // No start() for output streams after prepare(); ALSA restarts
+            // them once the buffer is refilled past the start threshold.
+        }
+        _ => error_callback(err),
+    }
+    match failures.failure(Instant::now()) {
+        FailureAction::Retry(delay) => {
+            wait_for_retry(rx, delay);
+            true
+        }
+        FailureAction::Abandon(failing_for) => {
+            error_callback(Error::with_message(
+                ErrorKind::StreamInvalidated,
+                format!(
+                    "ALSA stream did not recover after {} ms of failed recovery",
+                    failing_for.as_millis()
+                ),
+            ));
+            false
         }
     }
 }
@@ -965,21 +1093,12 @@ fn input_stream_worker(
             ),
             Err(err) => Err(err),
         };
-        if let Err(err) = result {
-            match err.kind() {
-                ErrorKind::Xrun => {
-                    error_callback(err);
-                    if let Err(err) = stream.handle.prepare() {
-                        error_callback(err.into());
-                    } else if let Err(err) = stream.handle.start() {
-                        error_callback(err.into());
-                    }
-                }
-                ErrorKind::DeviceNotAvailable => {
-                    error_callback(err);
+        match result {
+            Ok(()) => ctxt.failures.success(),
+            Err(err) => {
+                if !handle_worker_failure(&rx, stream, &mut ctxt.failures, err, error_callback) {
                     return;
                 }
-                _ => error_callback(err),
             }
         }
     }
@@ -1023,26 +1142,19 @@ fn output_stream_worker(
             ),
             Err(err) => Err(err),
         };
-        if let Err(err) = result {
-            match err.kind() {
-                ErrorKind::Xrun => {
-                    error_callback(err);
-                    if let Err(err) = stream.handle.prepare() {
-                        error_callback(err.into());
-                    }
-                    // No need to call start() for output streams after prepare();
-                    // ALSA automatically restarts them when the buffer is refilled
-                    // and the stream is triggered again.
-                }
-                ErrorKind::DeviceNotAvailable => {
-                    error_callback(err);
+        match result {
+            Ok(()) => ctxt.failures.success(),
+            Err(err) => {
+                if !handle_worker_failure(&rx, stream, &mut ctxt.failures, err, error_callback) {
                     return;
                 }
-                _ => error_callback(err),
             }
         }
     }
 }
+
+/// Pause between `snd_pcm_resume()` attempts that answered `EAGAIN`.
+const RESUME_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Attempt hardware resume from a suspend event (`ESTRPIPE`).
 fn try_resume(handle: &alsa::PCM) -> Result<Poll, Error> {
@@ -1072,8 +1184,13 @@ fn try_resume(handle: &alsa::PCM) -> Result<Poll, Error> {
             }
             Ok(Poll::Pending)
         }
-        // device is still resuming; poll again until it is ready.
-        Err(e) if e.errno() == libc::EAGAIN => Ok(Poll::Pending),
+        // Device is still resuming; poll again until it is ready. alsa-lib's
+        // own recovery sleeps between attempts: the PCM keeps reporting
+        // POLLERR meanwhile, so retrying at once spins the worker.
+        Err(e) if e.errno() == libc::EAGAIN => {
+            thread::sleep(RESUME_RETRY_INTERVAL);
+            Ok(Poll::Pending)
+        }
         // hardware does not support soft resume; treat as xrun so the worker calls prepare()
         Err(e) if e.errno() == libc::ENOSYS => Err(ErrorKind::Xrun.into()),
         Err(e) => Err(e.into()),
@@ -1762,5 +1879,49 @@ impl From<alsa::Error> for Error {
             libc::EPIPE => ErrorKind::Xrun.into(),
             _ => Error::with_message(ErrorKind::BackendError, err.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_backoff_tests {
+    use super::*;
+
+    fn retry_delay(action: FailureAction) -> Duration {
+        match action {
+            FailureAction::Retry(delay) => delay,
+            FailureAction::Abandon(_) => panic!("abandoned too early"),
+        }
+    }
+
+    #[test]
+    fn lone_failure_retries_immediately_and_success_resets() {
+        let start = Instant::now();
+        let mut backoff = FailureBackoff::new(Duration::from_millis(10));
+        assert_eq!(retry_delay(backoff.failure(start)), Duration::ZERO);
+        backoff.success();
+        let later = start + PERSISTENT_FAILURE_LIMIT * 4;
+        assert_eq!(retry_delay(backoff.failure(later)), Duration::ZERO);
+    }
+
+    #[test]
+    fn repeated_failures_back_off_up_to_the_cap() {
+        let start = Instant::now();
+        let mut backoff = FailureBackoff::new(Duration::from_millis(10));
+        let delays: Vec<_> = (0..6)
+            .map(|_| retry_delay(backoff.failure(start)))
+            .collect();
+        assert_eq!(delays, [0, 10, 20, 40, 80, 100].map(Duration::from_millis));
+    }
+
+    #[test]
+    fn failures_without_a_transferred_period_abandon_after_the_limit() {
+        let start = Instant::now();
+        let mut backoff = FailureBackoff::new(Duration::from_millis(10));
+        let _ = backoff.failure(start);
+        let _ = backoff.failure(start + Duration::from_millis(500));
+        assert!(matches!(
+            backoff.failure(start + PERSISTENT_FAILURE_LIMIT),
+            FailureAction::Abandon(_)
+        ));
     }
 }

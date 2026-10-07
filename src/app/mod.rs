@@ -77,7 +77,8 @@ use crate::audio::{
 use crate::audio::{AudioErrorKind, DeviceIdentityProbe};
 use audio_diagnostics::AudioDiagnostics;
 use audio_supervisor::{
-    AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, RebuildCause,
+    AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, CAPTURE_STALL,
+    PLAYBACK_STALL, RebuildCause, StreamProgressWatch,
 };
 use commands::slash_command_help;
 pub(crate) use join::{JoinOwner, JoinStart};
@@ -634,17 +635,15 @@ pub(crate) struct AudioSideHealth {
 /// feeds the supervisor exactly once instead of re-arming it every tick.
 #[derive(Default)]
 struct CaptureWatch {
-    callbacks: u64,
-    captured_samples: u64,
+    progress: StreamProgressWatch,
     fatal_stream_errors: u64,
     worker_stopped: bool,
     worker_finished: bool,
-    stall_reported: bool,
-    last_progress_at: Option<Instant>,
 }
 
 #[derive(Default)]
 struct PlaybackWatch {
+    progress: StreamProgressWatch,
     backend_fatal_stream_errors: u64,
     worker_finished: bool,
 }
@@ -674,7 +673,6 @@ const TICK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TICK_IDLE_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(30);
 const RECOVERY_MAX_ATTEMPTS: usize = 3;
-const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_millis(750);
 /// Device-observer poll cadence while streams are open and healthy.
 const DEVICE_PROBE_INTERVAL_HEALTHY: Duration = Duration::from_secs(5);
 /// Faster cadence while a stream is recovering or waiting to move back onto
@@ -7303,20 +7301,13 @@ impl App {
             ));
         }
 
-        let progressed = snapshot.callbacks != self.supervisor.capture_watch.callbacks
-            || snapshot.captured_samples != self.supervisor.capture_watch.captured_samples;
-        if progressed || self.supervisor.capture_watch.last_progress_at.is_none() {
-            self.supervisor.capture_watch.last_progress_at = Some(now);
-            self.supervisor.capture_watch.stall_reported = false;
-        } else if self.capture_should_be_live()
-            && !self.supervisor.capture_watch.stall_reported
-            && self
-                .supervisor
-                .capture_watch
-                .last_progress_at
-                .is_some_and(|last| now.saturating_duration_since(last) >= CAPTURE_STALL_TIMEOUT)
-        {
-            self.supervisor.capture_watch.stall_reported = true;
+        let armed = self.capture_should_be_live();
+        if self.supervisor.capture_watch.progress.observe(
+            now,
+            snapshot.callbacks,
+            armed,
+            CAPTURE_STALL,
+        ) {
             // The typical shape of a device vanishing on ALSA and CoreAudio is
             // callbacks silently stopping, not an error callback.
             failure = Some((
@@ -7325,8 +7316,6 @@ impl App {
             ));
         }
 
-        self.supervisor.capture_watch.callbacks = snapshot.callbacks;
-        self.supervisor.capture_watch.captured_samples = snapshot.captured_samples;
         self.supervisor.capture_watch.fatal_stream_errors = snapshot.fatal_stream_errors;
         self.supervisor.capture_watch.worker_stopped = snapshot.worker_stopped;
         self.supervisor.capture_watch.worker_finished = worker_finished;
@@ -7364,6 +7353,23 @@ impl App {
             failure = Some((
                 AudioErrorKind::Transient,
                 "playback decoder worker exited".to_string(),
+            ));
+        }
+        // A playback stream wedged inside the backend raises no error and no
+        // other signal; without this it stays silent until the process exits.
+        // The callback count is published by the decode worker, so a dead
+        // worker also reads as a stall, which recovery handles the same way.
+        if failure.is_none()
+            && self.supervisor.playback_watch.progress.observe(
+                now,
+                snapshot.playback_callbacks,
+                true,
+                PLAYBACK_STALL,
+            )
+        {
+            failure = Some((
+                AudioErrorKind::Transient,
+                "playback stream stopped requesting audio".to_string(),
             ));
         }
         self.supervisor.playback_watch.backend_fatal_stream_errors =

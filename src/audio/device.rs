@@ -1402,26 +1402,39 @@ where
                 downmix_to_mono_i16_scale_into(input, channels.get(), &mut mono);
                 callback_core.process(mono, callback_at, timing);
             },
-            move |error| {
-                let kind = AudioErrorKind::from_cpal(error.kind());
-                if kind == AudioErrorKind::RealtimeDenied {
-                    let error_message = error.to_string();
-                    kvlog::warn!(
-                        "audio realtime priority denied",
-                        direction = "capture",
-                        error = error_message.as_str(),
-                        hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
-                    );
-                } else if kind != AudioErrorKind::Xrun {
-                    let error_message = error.to_string();
-                    kvlog::warn!(
-                        "capture backend error",
-                        kind = kind.label(),
-                        recovers = kind.triggers_recovery(),
-                        error = error_message.as_str()
-                    );
+            {
+                let mut log_throttle = BackendErrorLogThrottle::default();
+                move |error| {
+                    let kind = AudioErrorKind::from_cpal(error.kind());
+                    let log_count = if kind == AudioErrorKind::Xrun {
+                        None
+                    } else {
+                        log_throttle.note()
+                    };
+                    if let Some(count) = log_count
+                        && kind == AudioErrorKind::RealtimeDenied
+                    {
+                        let error_message = error.to_string();
+                        kvlog::warn!(
+                            "audio realtime priority denied",
+                            direction = "capture",
+                            error = error_message.as_str(),
+                            hint =
+                                "grant rtprio or build with audio-realtime-dbus on rtkit systems",
+                            count
+                        );
+                    } else if let Some(count) = log_count {
+                        let error_message = error.to_string();
+                        kvlog::warn!(
+                            "capture backend error",
+                            kind = kind.label(),
+                            recovers = kind.triggers_recovery(),
+                            error = error_message.as_str(),
+                            count
+                        );
+                    }
+                    error_stats.record_stream_error(kind, format!("stream error: {error}"));
                 }
-                error_stats.record_stream_error(kind, format!("stream error: {error}"));
             },
             None,
         )
@@ -1754,35 +1767,68 @@ where
                     staged_samples,
                 );
             },
-            move |error| {
-                record_live_playback_stream_error(&error_snapshot, error);
+            {
+                let mut log_throttle = BackendErrorLogThrottle::default();
+                move |error| {
+                    record_live_playback_stream_error(&error_snapshot, &mut log_throttle, error);
+                }
             },
             None,
         )
         .map_err(|error| stream_build_error("failed to build live output stream", error))
 }
 
+/// Thins out repeated backend error logs for one stream.
+///
+/// A backend stuck failing every iteration reports millions of errors a
+/// second; logging each one filled 680 MB of log in four seconds under the
+/// ALSA fault harness (`src/audio/alsa_soak.rs`). Logs the 1st, 2nd, 4th,
+/// 8th, ... error, each carrying the running count, so a burst stays visible
+/// without its volume.
+#[derive(Default)]
+pub(crate) struct BackendErrorLogThrottle {
+    errors: u64,
+}
+
+impl BackendErrorLogThrottle {
+    /// Counts one error and returns its running total when it should be logged.
+    pub(crate) fn note(&mut self) -> Option<u64> {
+        self.errors = self.errors.saturating_add(1);
+        self.errors.is_power_of_two().then_some(self.errors)
+    }
+}
+
 fn record_live_playback_stream_error(
     shared_snapshot: &Arc<LivePlaybackSharedSnapshot>,
+    log_throttle: &mut BackendErrorLogThrottle,
     error: cpal::Error,
 ) {
     let kind = AudioErrorKind::from_cpal(error.kind());
     let error = error.to_string();
-    if kind == AudioErrorKind::RealtimeDenied {
+    let log_count = if kind == AudioErrorKind::Xrun {
+        None
+    } else {
+        log_throttle.note()
+    };
+    if let Some(count) = log_count
+        && kind == AudioErrorKind::RealtimeDenied
+    {
         kvlog::warn!(
             "audio realtime priority denied",
             direction = "live playback",
             error = error.as_str(),
-            hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems"
+            hint = "grant rtprio or build with audio-realtime-dbus on rtkit systems",
+            count
         );
-    } else if kind != AudioErrorKind::Xrun {
+    } else if let Some(count) = log_count {
         // Kinds that do not trigger recovery are dropped by the supervisor, so
         // without this a host reroute or device change leaves no trace at all.
         kvlog::warn!(
             "live playback backend error",
             kind = kind.label(),
             recovers = kind.triggers_recovery(),
-            error = error.as_str()
+            error = error.as_str(),
+            count
         );
     }
     shared_snapshot.record_backend_stream_error(error, kind, Instant::now());

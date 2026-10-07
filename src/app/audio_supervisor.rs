@@ -43,6 +43,82 @@ pub(crate) const REBUILD_DEFER_CAP: Duration = Duration::from_secs(3);
 
 const AUDIO_EVENT_LOG_CAPACITY: usize = 32;
 
+/// How long a stream may go without a device callback before its progress
+/// watch reports a stall.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StallPolicy {
+    /// Allowance from stream start to the first callback.
+    pub(crate) first_callback: Duration,
+    /// Allowance between callbacks once the stream is running.
+    pub(crate) between_callbacks: Duration,
+}
+
+/// ALSA and CoreAudio commonly lose a capture device by silently stopping
+/// callbacks rather than raising an error.
+pub(crate) const CAPTURE_STALL: StallPolicy = StallPolicy {
+    first_callback: Duration::from_millis(750),
+    between_callbacks: Duration::from_millis(750),
+};
+
+/// Playback allows more than capture. Nothing is lost while it waits, a
+/// Bluetooth sink can take seconds to deliver its first callback, and a
+/// rebuild that times out the same way every time would loop forever. But a
+/// stream that is never going to call back again must not stay open for the
+/// rest of the process lifetime.
+pub(crate) const PLAYBACK_STALL: StallPolicy = StallPolicy {
+    first_callback: Duration::from_secs(5),
+    between_callbacks: Duration::from_secs(2),
+};
+
+/// Detects a stream whose device callback counter stopped advancing.
+///
+/// Edge-triggered: [`Self::observe`] reports a stall once per episode, and
+/// any later progress re-arms it. Without this a stream wedged inside the
+/// backend (a resume that never completes, a sound-server eventfd that stops
+/// firing, a PCM stuck in an error `prepare()` cannot clear) raises no error
+/// and keeps the direction silent until the process restarts. Start a fresh
+/// watch for each stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StreamProgressWatch {
+    callbacks: u64,
+    started: bool,
+    last_progress_at: Option<Instant>,
+    stall_reported: bool,
+}
+
+impl StreamProgressWatch {
+    /// Feeds the stream's current callback count. Returns true exactly once
+    /// when `armed` and the count has not advanced within `policy`. Disarmed
+    /// observations still track progress, so arming later never reports a
+    /// stall from before it was armed.
+    pub(crate) fn observe(
+        &mut self,
+        now: Instant,
+        callbacks: u64,
+        armed: bool,
+        policy: StallPolicy,
+    ) -> bool {
+        let progressed = callbacks != self.callbacks;
+        self.callbacks = callbacks;
+        self.started |= progressed;
+        let Some(last_progress_at) = self.last_progress_at.filter(|_| armed && !progressed) else {
+            self.last_progress_at = Some(now);
+            self.stall_reported = false;
+            return false;
+        };
+        let timeout = if self.started {
+            policy.between_callbacks
+        } else {
+            policy.first_callback
+        };
+        if self.stall_reported || now.saturating_duration_since(last_progress_at) < timeout {
+            return false;
+        }
+        self.stall_reported = true;
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RebuildCause {
     StreamError,
@@ -624,6 +700,55 @@ mod tests {
         supervisor.on_rebuild_ok(at(start, 20));
         assert!(supervisor.is_healthy());
         assert_eq!(supervisor.health().since, None);
+    }
+
+    #[test]
+    fn progress_watch_reports_a_stall_once_per_episode() {
+        let start = Instant::now();
+        let mut watch = StreamProgressWatch::default();
+        assert!(!watch.observe(start, 10, true, CAPTURE_STALL));
+        assert!(!watch.observe(at(start, 749), 10, true, CAPTURE_STALL));
+        assert!(watch.observe(at(start, 750), 10, true, CAPTURE_STALL));
+        assert!(
+            !watch.observe(at(start, 5_000), 10, true, CAPTURE_STALL),
+            "one report per stall episode"
+        );
+        assert!(!watch.observe(at(start, 5_100), 11, true, CAPTURE_STALL));
+        assert!(watch.observe(at(start, 5_850), 11, true, CAPTURE_STALL));
+    }
+
+    #[test]
+    fn playback_watch_allows_a_slow_first_callback_then_tightens() {
+        let start = Instant::now();
+        let mut watch = StreamProgressWatch::default();
+        assert!(!watch.observe(start, 0, true, PLAYBACK_STALL));
+        assert!(
+            !watch.observe(at(start, 4_999), 0, true, PLAYBACK_STALL),
+            "a Bluetooth sink may take seconds to start calling back"
+        );
+        assert!(watch.observe(at(start, 5_000), 0, true, PLAYBACK_STALL));
+
+        let mut watch = StreamProgressWatch::default();
+        assert!(!watch.observe(start, 0, true, PLAYBACK_STALL));
+        assert!(!watch.observe(at(start, 3_000), 1, true, PLAYBACK_STALL));
+        assert!(!watch.observe(at(start, 4_999), 1, true, PLAYBACK_STALL));
+        assert!(
+            watch.observe(at(start, 5_000), 1, true, PLAYBACK_STALL),
+            "a running stream that stops calling back stalls after 2 s"
+        );
+    }
+
+    #[test]
+    fn progress_watch_never_reports_a_stall_from_before_it_was_armed() {
+        let start = Instant::now();
+        let mut watch = StreamProgressWatch::default();
+        assert!(!watch.observe(start, 3, false, CAPTURE_STALL));
+        assert!(!watch.observe(at(start, 10_000), 3, false, CAPTURE_STALL));
+        assert!(
+            !watch.observe(at(start, 10_001), 3, true, CAPTURE_STALL),
+            "time spent disarmed must not count toward the stall"
+        );
+        assert!(watch.observe(at(start, 10_751), 3, true, CAPTURE_STALL));
     }
 
     #[test]
