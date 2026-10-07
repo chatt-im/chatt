@@ -2609,7 +2609,6 @@ mod client_net_review {
     /// frame this client version cannot decode) is therefore hammered in a
     /// tight loop instead of being retried on the 1 s/2 s/5 s schedule.
     #[test]
-    #[ignore = "BUG: reconnect after an established session drop has no backoff (hot loop) — see review"]
     fn review_reconnect_after_post_handshake_drop_is_rate_limited() {
         let _guard = live_mls_e2e_guard();
         let root = temp_dir("review-hot-reconnect");

@@ -291,6 +291,11 @@ impl Runtime {
         Ok(())
     }
 
+    /// Whether the actor thread has exited. Nothing restarts it.
+    pub(super) fn is_stopped(&self) -> bool {
+        self.outputs.stopped.load(Ordering::Acquire)
+    }
+
     pub(super) fn drain_outputs(&self, drain: &mut Vec<Output>) -> bool {
         debug_assert!(drain.is_empty());
         let mut outputs = self.outputs.outputs.lock().unwrap();

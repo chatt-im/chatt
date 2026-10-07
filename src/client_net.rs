@@ -91,6 +91,11 @@ const WAKE: Token = Token(1);
 /// deadline wakes in [`WorkerState::next_poll_timeout`] drive the loop; this
 /// only bounds how long a missed schedule could sleep.
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a session must stay authenticated before its end counts as a
+/// drop of a healthy session that earns an immediate, backoff-free retry.
+/// Shorter sessions escalate the ordinary reconnect backoff so a server that
+/// drops every session soon after it starts is not redialed in a hot loop.
+const HEALTHY_SESSION_MIN_DURATION: Duration = Duration::from_secs(15);
 const MAX_PENDING_MLS_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PENDING_MLS_FILE_ITEMS: usize = 1024;
 const MAX_PENDING_MLS_FILE_GLOBAL_BYTES: usize = 16 * 1024 * 1024;
@@ -1572,6 +1577,7 @@ fn run_worker(
             break;
         }
         mls_generation = mls_generation.wrapping_add(1).max(1);
+        let mut authenticated_at = None;
         let session_end = run_worker_inner(
             &config,
             &events,
@@ -1581,6 +1587,7 @@ fn run_worker(
             &mls_runtime,
             mls_generation,
             &voice,
+            &mut authenticated_at,
         );
         let _ = voice.submit(voice::VoiceCommand::EndSession {
             generation: mls_generation,
@@ -1606,15 +1613,42 @@ fn run_worker(
                 }
             }
             SessionEnd::Disconnected(reason) => {
-                reconnect.reset();
                 kvlog::warn!("network session disconnected", reason = reason.as_str());
-                // A socket event already told us that an established session
-                // ended. Retry it immediately once instead of imposing the
+                // Nothing restarts the MLS actor, so every later session
+                // would authenticate and end again the same way.
+                if mls_runtime.is_stopped() {
+                    let _ = events.send(NetworkEvent::WorkerStopped {
+                        reason: format!("client MLS worker stopped: {reason}"),
+                    });
+                    break;
+                }
+                // A session that stayed authenticated long enough was
+                // healthy: retry it immediately once instead of imposing the
                 // connection-attempt backoff before discovering whether the
                 // server is already available again. If it is not, the next
                 // iteration ends in ConnectFailed and uses the ordinary
-                // bounded backoff below.
-                report_reconnect_scheduled(&events, Duration::ZERO, &reason);
+                // bounded backoff. A session that ended sooner is treated as a
+                // failed attempt without resetting, so repeated short sessions
+                // escalate the backoff.
+                if session_was_healthy(authenticated_at, Instant::now()) {
+                    reconnect.reset();
+                    report_reconnect_scheduled(&events, Duration::ZERO, &reason);
+                } else {
+                    match schedule_reconnect(
+                        &events,
+                        &commands,
+                        &mut reconnect,
+                        &mls_runtime,
+                        &reason,
+                    ) {
+                        RetryWait::Retry => {}
+                        RetryWait::Shutdown => break,
+                        RetryWait::Fatal(reason) => {
+                            let _ = events.send(NetworkEvent::WorkerStopped { reason });
+                            break;
+                        }
+                    }
+                }
             }
             SessionEnd::AuthFailed { code, reason } => {
                 kvlog::warn!("network auth failed", code, reason = reason.as_str());
@@ -1648,6 +1682,7 @@ fn run_worker_inner(
     mls_runtime: &mls_actor::Runtime,
     mls_generation: u64,
     voice_control: &voice::VoiceControl,
+    authenticated_at: &mut Option<Instant>,
 ) -> SessionEnd {
     let (std_tcp, transport, _trusted) = match connect_and_handshake(config, false, dial) {
         Ok(value) => value,
@@ -1901,6 +1936,9 @@ fn run_worker_inner(
         if let Err(error) = worker.process_server_controls() {
             return SessionEnd::Disconnected(error);
         }
+        if authenticated_at.is_none() && worker.user_id.is_some() {
+            *authenticated_at = Some(Instant::now());
+        }
 
         let mut command_drain = CommandDrainOutcome::Empty;
         if worker.user_id.is_some()
@@ -2064,6 +2102,13 @@ impl ReconnectSchedule {
             _ => Duration::from_secs(5),
         }
     }
+}
+
+/// Whether a session that authenticated at `authenticated_at` and ended at
+/// `now` stayed up for [`HEALTHY_SESSION_MIN_DURATION`].
+fn session_was_healthy(authenticated_at: Option<Instant>, now: Instant) -> bool {
+    authenticated_at
+        .is_some_and(|at| now.saturating_duration_since(at) >= HEALTHY_SESSION_MIN_DURATION)
 }
 
 enum RetryWait {
@@ -8063,6 +8108,20 @@ mod tests {
         schedule.reset();
 
         assert_eq!(schedule.next_delay(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn only_long_authenticated_sessions_skip_reconnect_backoff() {
+        let now = Instant::now();
+        assert!(!session_was_healthy(None, now));
+        assert!(!session_was_healthy(
+            Some(now - HEALTHY_SESSION_MIN_DURATION + Duration::from_millis(1)),
+            now
+        ));
+        assert!(session_was_healthy(
+            Some(now - HEALTHY_SESSION_MIN_DURATION),
+            now
+        ));
     }
 
     #[test]
