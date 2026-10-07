@@ -17,7 +17,8 @@
 //! Environment:
 //! - `CHATT_SOAK_DEVICE`: ALSA PCM to open (default `default`).
 //! - `CHATT_ALSA_FAULT`: `wedge`, `suspend`, `ebadfd` or `hang` (see the
-//!   injector). `hang_drop` sets `hang` itself.
+//!   injector). `hang_drop` sets `hang` itself. `output_swap` uses it for
+//!   the playback failure it recovers from by swapping only the output.
 //! - `CHATT_ALSA_FAULT_DIR`: read by the injector; `fault_timeline` also
 //!   asserts that a `playback` or `capture` fault never rebuilds the other
 //!   direction.
@@ -542,4 +543,145 @@ fn hang_drop() {
         process_resources().threads <= baseline.threads,
         "hung teardown threads never exited after the fault cleared"
     );
+}
+
+/// Feeds a 220 Hz tone as remote stream 1 until `stop` is set, one Opus
+/// frame every 20 ms, so the playback NetEQ has real state to keep.
+fn feed_tone(
+    sink: crate::audio::LivePlaybackSink,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use crate::audio::{
+        RemoteVoicePacket, SAMPLE_RATE, VoicePayload, capture::OpusVoiceEncoder,
+        shared::LIVE_OPUS_FRAME_SAMPLES,
+    };
+    std::thread::spawn(move || {
+        let mut encoder = OpusVoiceEncoder::new(32_000).expect("opus encoder");
+        let mut sequence = 0u32;
+        let mut next = Instant::now();
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let base = sequence as usize * LIVE_OPUS_FRAME_SAMPLES;
+            let frame: Vec<i16> = (0..LIVE_OPUS_FRAME_SAMPLES)
+                .map(|n| {
+                    let t = (base + n) as f32 / SAMPLE_RATE as f32;
+                    ((2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.3 * i16::MAX as f32) as i16
+                })
+                .collect();
+            let mut opus = vec![0u8; 4_000];
+            let len = encoder.encode(&frame, &mut opus).expect("encode");
+            opus.truncate(len);
+            sink.push(RemoteVoicePacket {
+                stream_id: 1,
+                sequence,
+                timestamp: sequence.wrapping_mul(LIVE_OPUS_FRAME_SAMPLES as u32),
+                flags: 0,
+                payload: VoicePayload::Opus(opus),
+                received_at: Instant::now(),
+            });
+            sequence += 1;
+            next += Duration::from_millis(20);
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        }
+    })
+}
+
+/// Swaps only the playback output stream while a peer stream plays, the
+/// recovery the app uses for a failure local to the output device. Injects
+/// `CHATT_ALSA_FAULT` (default `wedge`; `hang` also checks the swap does
+/// not block on the stuck stream), waits for the playback stall, calls
+/// `reopen_output()` while the fault is still active, then clears it. With
+/// `CHATT_ALSA_FAULT_DIR=playback` it also asserts capture kept running.
+#[test]
+#[ignore = "needs a real ALSA PCM and the fault injector"]
+fn output_swap() {
+    let fault = std::env::var("CHATT_ALSA_FAULT").unwrap_or_else(|_| "wedge".to_string());
+    let playback_only = std::env::var("CHATT_ALSA_FAULT_DIR").as_deref() == Ok("playback");
+    let echo = Arc::new(EchoCancellationControl::new(false));
+    write_fault("none");
+    let capture = start_live_capture(capture_config(&echo), |_| {}).expect("capture");
+    let mut playback = start_live_playback(playback_config(&echo)).expect("playback");
+    let worker = playback.worker_thread_id();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let feeder = feed_tone(playback.sink().expect("sink"), Arc::clone(&stop));
+    std::thread::sleep(Duration::from_millis(1_500));
+
+    let before = playback.stats();
+    let capture_before = capture.stats().snapshot().callbacks;
+    println!(
+        "before: cb={} streams={} direct={} expand={}",
+        before.playback_callbacks,
+        before.active_streams,
+        before.direct_samples,
+        before.expand_count
+    );
+    assert_eq!(before.active_streams, 1, "the peer stream never started");
+    assert!(before.direct_samples > 0, "the peer stream never rendered");
+
+    write_fault(&fault);
+    println!("fault -> {fault}");
+    let mut watch = StreamProgressWatch::default();
+    let stall_started = Instant::now();
+    while !watch.observe(
+        Instant::now(),
+        playback.stats().playback_callbacks,
+        true,
+        PLAYBACK_STALL,
+    ) {
+        assert!(
+            stall_started.elapsed() < Duration::from_secs(10),
+            "playback never stalled under {fault}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!("playback stalled after {:?}", stall_started.elapsed());
+
+    let swap_started = Instant::now();
+    let swapped = playback.reopen_output();
+    let swap_time = swap_started.elapsed();
+    println!("reopen_output took {swap_time:?}: {swapped:?}");
+    write_fault("none");
+    swapped.expect("reopen_output");
+
+    let swapped_cb = playback.stats().playback_callbacks;
+    let resume_started = Instant::now();
+    while playback.stats().playback_callbacks <= swapped_cb
+        && resume_started.elapsed() < PLAYBACK_STALL.first_callback
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let resumed_in = resume_started.elapsed();
+    // Let the new mixer render the peer stream for a while.
+    std::thread::sleep(Duration::from_millis(1_500));
+    let after = playback.stats();
+    let capture_after = capture.stats().snapshot().callbacks;
+    let worker_after = playback.worker_thread_id();
+    println!(
+        "after: cb={} streams={} direct={} expand={} resumed in {resumed_in:?}",
+        after.playback_callbacks, after.active_streams, after.direct_samples, after.expand_count
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    feeder.join().expect("feeder");
+    drop(playback);
+    drop(capture);
+
+    assert!(
+        swap_time < Duration::from_secs(1),
+        "reopen_output blocked for {swap_time:?}"
+    );
+    assert!(
+        resumed_in < PLAYBACK_STALL.first_callback,
+        "playback callbacks did not resume after the swap"
+    );
+    assert_eq!(worker, worker_after, "decode worker was replaced");
+    assert_eq!(after.active_streams, 1, "the peer stream was dropped");
+    assert!(
+        after.direct_samples > before.direct_samples && after.expand_count >= before.expand_count,
+        "NetEQ counters reset instead of continuing"
+    );
+    if playback_only {
+        assert!(
+            capture_after > capture_before,
+            "capture stopped during a playback-only swap"
+        );
+    }
 }

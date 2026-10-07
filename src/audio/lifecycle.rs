@@ -32,7 +32,7 @@ use crate::{
             select_input_device_by_id, select_output_config, select_output_device_by_id,
             stable_device_id,
         },
-        diagnostics::LivePlaybackWavRecorder,
+        diagnostics::{LivePlaybackWavRecorder, LivePlaybackWavRecorderHandle},
         errors::{AudioErrorKind, AudioStartError, format_file_error},
         playback::{
             LivePlaybackMixer, LivePlaybackMixerEvent, LivePlaybackPlayoutHints,
@@ -213,7 +213,30 @@ pub struct LivePlayback {
     /// Resolved backend, device, and buffer the playback stream opened.
     device_info: AudioDeviceInfo,
     playback_recording: Option<LivePlaybackWavRecorder>,
+    output: LiveOutputParts,
 }
+
+/// Everything needed to open the live output stream, kept so
+/// [`LivePlayback::reopen_output`] can replace a failed stream while the
+/// decode worker and its NetEQ cores keep running.
+struct LiveOutputParts {
+    output_device_id: Option<String>,
+    buffer_request: BufferRequest,
+    tuning: LiveAudioTuning,
+    echo_control: Option<Arc<EchoCancellationControl>>,
+    output_volume_percent: Arc<AtomicU32>,
+    audio_report: Arc<AudioReportHub>,
+    observer: Arc<AudioCallbackBufferObserver>,
+    playback_recording: Option<LivePlaybackWavRecorderHandle>,
+    /// Shared by every output stream of this playback, so callback counters
+    /// stay monotonic across a reopen.
+    playout_hints: Arc<LivePlaybackPlayoutHints>,
+    shared_snapshot: Arc<LivePlaybackSharedSnapshot>,
+}
+
+/// How long [`LivePlayback::reopen_output`] retries handing the new mixer
+/// queue to a decode worker whose command channel is full.
+const ATTACH_MIXER_BUDGET: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 pub struct LivePlaybackSink {
@@ -236,6 +259,9 @@ pub(crate) enum LivePlaybackCommand {
     },
     /// Mix a one-shot notification clip (48 kHz mono `f32`) into the output.
     PlayNotification(Arc<[f32]>),
+    /// The output stream was replaced: send mixer events to this queue, the
+    /// new stream's mixer, from now on.
+    AttachMixer(Arc<SpscSwapQueue<LivePlaybackMixerEvent>>),
     Shutdown,
 }
 
@@ -470,6 +496,57 @@ impl LivePlayback {
 
     pub fn worker_finished(&self) -> bool {
         self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_thread_id(&self) -> Option<thread::ThreadId> {
+        self.worker.as_ref().map(|worker| worker.thread().id())
+    }
+
+    /// Replaces only the output stream and its mixer, keeping the decode
+    /// worker, the sinks and every peer's NetEQ state. Recovers a failure
+    /// local to the output device without restarting every peer's audio.
+    ///
+    /// Notification clips playing in the old mixer are lost. On error the
+    /// playback is left half-open and the caller must rebuild it fully.
+    pub fn reopen_output(&mut self) -> Result<(), AudioStartError> {
+        let Some(sender) = self.sender.clone() else {
+            return Err(AudioStartError::transient("live playback is stopped"));
+        };
+        if self.worker_finished() {
+            return Err(AudioStartError::transient("live playback decoder exited"));
+        }
+        // Release the old device before the new stream opens it again.
+        if let Some(stream) = self.stream.take() {
+            bounded_teardown("playback", move || drop(stream));
+        }
+        let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
+            LIVE_PLAYBACK_COMMAND_CAPACITY,
+        ));
+        let opened = open_live_output(&self.output, &mixer_events)?;
+        self.stream = Some(opened.stream);
+        self.device_info = opened.device_info;
+        self.buffer_fallback = opened.buffer_fallback;
+
+        let deadline = Instant::now() + ATTACH_MIXER_BUDGET;
+        let mut command = LivePlaybackCommand::AttachMixer(mixer_events);
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
+                    command = returned;
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(TrySendError::Full(_)) => {
+                    return Err(AudioStartError::transient(
+                        "live playback decoder did not accept the new output",
+                    ));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(AudioStartError::transient("live playback decoder exited"));
+                }
+            }
+        }
     }
 
     pub fn stop(mut self) {
@@ -1000,23 +1077,6 @@ pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Play
 }
 
 pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, AudioStartError> {
-    let (device, selection, backend) = with_audio_backend_stderr_suppressed(|| {
-        let host = cpal::default_host();
-        let backend = host.id().name();
-        let (device, selection) = if let Some(id) = config.output_device_id.as_deref() {
-            select_output_device_by_id(&host, id, config.buffer_request)?
-        } else {
-            let device = host
-                .default_output_device()
-                .ok_or_else(|| AudioStartError::device_gone("no default output device found"))?;
-            let selection = select_output_config(&device, config.buffer_request)
-                .map_err(|error| AudioStartError::new(AudioErrorKind::ConfigInvalid, error))?;
-            (device, selection)
-        };
-        Ok::<_, AudioStartError>((device, selection, backend))
-    })?;
-
-    let device_name = device.to_string();
     let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
         LIVE_PLAYBACK_COMMAND_CAPACITY,
     ));
@@ -1027,23 +1087,99 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
     ));
     let playback_recording =
         LivePlaybackWavRecorder::from_env().map_err(AudioStartError::transient)?;
-    let playback_recording_handle = playback_recording
-        .as_ref()
-        .map(|recording| recording.handle());
+    let output = LiveOutputParts {
+        output_device_id: config.output_device_id,
+        buffer_request: config.buffer_request,
+        tuning: config.tuning,
+        echo_control: config.echo_control,
+        output_volume_percent: config.output_volume_percent,
+        audio_report: Arc::clone(&config.audio_report),
+        observer: Arc::new(AudioCallbackBufferObserver::new("live_playback")),
+        playback_recording: playback_recording
+            .as_ref()
+            .map(|recording| recording.handle()),
+        playout_hints: Arc::clone(&playout_hints),
+        shared_snapshot: Arc::clone(&shared_snapshot),
+    };
+    let opened = open_live_output(&output, &mixer_events)?;
 
-    let echo_control = config.echo_control.clone();
-    let observer = Arc::new(AudioCallbackBufferObserver::new("live_playback"));
+    let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
+    let worker_shared_snapshot = Arc::clone(&shared_snapshot);
+    let feedback_sender = config.feedback_sender;
+    let worker = thread::Builder::new()
+        .name("chatt-audio-live-dec".to_string())
+        // 1M. This thread runs Opus + DRED decode, whose libopus-internal stack depth is not
+        // bounded by inspection. 1M is an overly safe margin over the default 2M with no
+        // measurable cost.
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            run_live_decoder_worker(
+                receiver,
+                mixer_events,
+                config.tuning,
+                feedback_sender,
+                worker_shared_snapshot,
+                playout_hints,
+                config.audio_report,
+            )
+        })
+        .map_err(|error| {
+            AudioStartError::transient(format!("failed to spawn chatt-audio-live-dec: {error}"))
+        })?;
+
+    Ok(LivePlayback {
+        stream: Some(opened.stream),
+        worker: Some(worker),
+        sender: Some(sender),
+        shared_snapshot,
+        input_queue_drops: Arc::new(AtomicU64::new(0)),
+        buffer_fallback: opened.buffer_fallback,
+        device_info: opened.device_info,
+        playback_recording,
+        output,
+    })
+}
+
+struct OpenedOutput {
+    stream: Stream,
+    device_info: AudioDeviceInfo,
+    buffer_fallback: bool,
+}
+
+/// Resolves the output device, then opens and starts a stream on it with a
+/// fresh mixer that drains `mixer_events`.
+fn open_live_output(
+    parts: &LiveOutputParts,
+    mixer_events: &Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+) -> Result<OpenedOutput, AudioStartError> {
+    let (device, selection, backend) = with_audio_backend_stderr_suppressed(|| {
+        let host = cpal::default_host();
+        let backend = host.id().name();
+        let (device, selection) = if let Some(id) = parts.output_device_id.as_deref() {
+            select_output_device_by_id(&host, id, parts.buffer_request)?
+        } else {
+            let device = host
+                .default_output_device()
+                .ok_or_else(|| AudioStartError::device_gone("no default output device found"))?;
+            let selection = select_output_config(&device, parts.buffer_request)
+                .map_err(|error| AudioStartError::new(AudioErrorKind::ConfigInvalid, error))?;
+            (device, selection)
+        };
+        Ok::<_, AudioStartError>((device, selection, backend))
+    })?;
+
+    let device_name = device.to_string();
     let build = |selection: &ConfigSelection| -> Result<Stream, AudioStartError> {
-        let device_report = config.audio_report.device_tap(
+        let device_report = parts.audio_report.device_tap(
             crate::audio::AudioReportDeviceDirection::Playback,
             selection.device_rate,
         );
         let mut mixer = LivePlaybackMixer::with_live_capacity_and_device_report(
-            config.tuning,
-            Arc::clone(&config.audio_report),
+            parts.tuning,
+            Arc::clone(&parts.audio_report),
             device_report,
         );
-        mixer.set_playout_hints(Arc::clone(&playout_hints));
+        mixer.set_playout_hints(Arc::clone(&parts.playout_hints));
         with_audio_backend_stderr_suppressed(|| {
             build_live_output_stream(
                 &device,
@@ -1051,13 +1187,13 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
                 selection.stream_config,
                 usize::from(selection.supported_config.channels()),
                 mixer,
-                Arc::clone(&mixer_events),
-                Arc::clone(&shared_snapshot),
-                echo_control.clone(),
-                Some(Arc::clone(&observer)),
+                Arc::clone(mixer_events),
+                Arc::clone(&parts.shared_snapshot),
+                parts.echo_control.clone(),
+                Some(Arc::clone(&parts.observer)),
                 selection.device_rate,
-                playback_recording_handle.clone(),
-                Arc::clone(&config.output_volume_percent),
+                parts.playback_recording.clone(),
+                Arc::clone(&parts.output_volume_percent),
             )
         })
     };
@@ -1065,7 +1201,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
         "playback",
         backend,
         &device_name,
-        config.buffer_request,
+        parts.buffer_request,
         selection,
         build,
         || {
@@ -1097,7 +1233,7 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
         backend,
         stable_id: stable_device_id(&device_name),
         device_name,
-        is_default: config.output_device_id.is_none(),
+        is_default: parts.output_device_id.is_none(),
         channels: selection.stream_config.channels,
         device_rate: selection.device_rate,
         buffer_size: audio_buffer_size_label(selection.preview.buffer_size),
@@ -1105,41 +1241,10 @@ pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, A
         acquired_buffer_frames: stream.buffer_size().ok(),
         buffer_fallback,
     };
-    let (sender, receiver) = sync_channel(LIVE_PLAYBACK_COMMAND_CAPACITY);
-    let worker_mixer_events = Arc::clone(&mixer_events);
-    let worker_shared_snapshot = Arc::clone(&shared_snapshot);
-    let worker_playout_hints = Arc::clone(&playout_hints);
-    let feedback_sender = config.feedback_sender;
-    let worker = thread::Builder::new()
-        .name("chatt-audio-live-dec".to_string())
-        // 1M. This thread runs Opus + DRED decode, whose libopus-internal stack depth is not
-        // bounded by inspection. 1M is an overly safe margin over the default 2M with no
-        // measurable cost.
-        .stack_size(1024 * 1024)
-        .spawn(move || {
-            run_live_decoder_worker(
-                receiver,
-                worker_mixer_events,
-                config.tuning,
-                feedback_sender,
-                worker_shared_snapshot,
-                worker_playout_hints,
-                config.audio_report,
-            )
-        })
-        .map_err(|error| {
-            AudioStartError::transient(format!("failed to spawn chatt-audio-live-dec: {error}"))
-        })?;
-
-    Ok(LivePlayback {
-        stream: Some(stream),
-        worker: Some(worker),
-        sender: Some(sender),
-        shared_snapshot,
-        input_queue_drops: Arc::new(AtomicU64::new(0)),
-        buffer_fallback,
+    Ok(OpenedOutput {
+        stream,
         device_info,
-        playback_recording,
+        buffer_fallback,
     })
 }
 

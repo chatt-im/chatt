@@ -47,6 +47,15 @@ impl NetEqMixerSource {
             assist: Arc::new(NetEqRenderAssist::new(render_assist_enabled)),
         }
     }
+
+    /// Gives the source a new, empty render ring for a new mixer. The ring
+    /// allows one reader, and the old mixer may still hold the old ring
+    /// while its stream is torn down.
+    pub(crate) fn replace_render_ring(&mut self) {
+        self.render_ring = Arc::new(SampleRing::with_capacity(
+            MIX_FRAME_SAMPLES * NETEQ_RENDER_ASSIST_RING_BLOCKS,
+        ));
+    }
 }
 
 /// What the consumer renders a registered stream from.

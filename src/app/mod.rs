@@ -7597,6 +7597,11 @@ impl App {
             cause = cause.label(),
             kind = trigger.kind.map_or("none", AudioErrorKind::label)
         );
+        // A failure local to the output device only needs a new output
+        // stream; the decode worker and every peer's jitter buffer survive.
+        if !rebuild_restarts_paired_stream(trigger) && self.swap_playback_output(now) {
+            return;
+        }
         self.note_audio_event(
             now,
             AudioDeviceEventKind::RebuildStarted,
@@ -7617,6 +7622,51 @@ impl App {
         {
             self.restart_capture_stream();
         }
+    }
+
+    /// Replaces only the playback output stream. Returns false when there is
+    /// no playback to swap or the swap failed, and the caller must rebuild.
+    fn swap_playback_output(&mut self, now: Instant) -> bool {
+        if self.playback.is_none() {
+            return false;
+        }
+        self.note_audio_event(now, AudioDeviceEventKind::RebuildStarted, "spk output swap");
+        let Some(playback) = self.playback.as_mut() else {
+            return false;
+        };
+        let swapped = playback.reopen_output().map(|()| playback.stats());
+        let snapshot = match swapped {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                kvlog::warn!(
+                    "playback output swap failed",
+                    kind = error.kind.label(),
+                    error = error.message.as_str()
+                );
+                self.note_audio_event(
+                    now,
+                    AudioDeviceEventKind::StreamError,
+                    format!("spk output swap failed: {}", error.message),
+                );
+                return false;
+            }
+        };
+        // The snapshot outlives the swap, so start the watch from its current
+        // counts: old errors must not re-fail the new stream, and the new
+        // stream still gets the first-callback allowance.
+        self.supervisor.playback_watch = PlaybackWatch {
+            progress: StreamProgressWatch::starting_at(snapshot.playback_callbacks),
+            backend_fatal_stream_errors: snapshot.backend_fatal_stream_errors,
+            worker_finished: false,
+        };
+        self.supervisor.playback.on_rebuild_ok(now);
+        self.note_audio_event(
+            now,
+            AudioDeviceEventKind::Recovered,
+            "playback output swapped",
+        );
+        self.set_status("playback recovered");
+        true
     }
 
     fn restart_capture_stream(&mut self) {

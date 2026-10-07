@@ -61,16 +61,17 @@ pub(crate) fn run_live_decoder_worker(
     audio_report: Arc<AudioReportHub>,
 ) {
     let mut streams = LiveDecodeStreams::with_hints_and_report(tuning, hints, audio_report);
+    let mut mixer_events = mixer_events;
     let mut last_diagnostic_log: Option<Instant> = None;
 
     loop {
         match receiver.recv_timeout(LIVE_PLAYBACK_DRAIN_INTERVAL) {
             Ok(command) => {
-                if !handle_live_playback_command(command, &mut streams, &mixer_events) {
+                if !handle_worker_command(command, &mut streams, &mut mixer_events) {
                     break;
                 }
                 while let Ok(command) = receiver.try_recv() {
-                    if !handle_live_playback_command(command, &mut streams, &mixer_events) {
+                    if !handle_worker_command(command, &mut streams, &mut mixer_events) {
                         return;
                     }
                 }
@@ -137,6 +138,21 @@ fn log_neteq_diagnostics(snapshot: &LivePlaybackSnapshot) {
     );
 }
 
+/// [`handle_live_playback_command`] plus the commands that replace the
+/// worker's mixer queue.
+fn handle_worker_command(
+    command: LivePlaybackCommand,
+    streams: &mut LiveDecodeStreams,
+    mixer_events: &mut Arc<SpscSwapQueue<LivePlaybackMixerEvent>>,
+) -> bool {
+    if let LivePlaybackCommand::AttachMixer(events) = command {
+        *mixer_events = events;
+        streams.attach_mixer(mixer_events);
+        return true;
+    }
+    handle_live_playback_command(command, streams, mixer_events)
+}
+
 pub(crate) fn handle_live_playback_command(
     command: LivePlaybackCommand,
     streams: &mut LiveDecodeStreams,
@@ -160,6 +176,9 @@ pub(crate) fn handle_live_playback_command(
         }
         LivePlaybackCommand::PlayNotification(samples) => {
             streams.play_notification(&samples, mixer_events);
+        }
+        LivePlaybackCommand::AttachMixer(_) => {
+            debug_assert!(false, "AttachMixer is handled by the worker loop");
         }
         LivePlaybackCommand::Shutdown => return false,
     }
@@ -290,6 +309,9 @@ pub(crate) struct LiveDecodeStreams {
     /// queue, re-pushed each drain cycle until delivered so a mute is deferred
     /// rather than lost. A later delivered control clears the pending entry.
     pending_mixer_controls: HashMap<u32, PlaybackStreamControl>,
+    /// The latest control set for each stream, delivered or not, replayed to a
+    /// new mixer by [`Self::attach_mixer`].
+    last_controls: HashMap<u32, PlaybackStreamControl>,
     /// Streams whose `StopStream` push was rejected by a full mixer event queue,
     /// re-pushed each drain cycle until delivered. While an id is pending here
     /// its `EnsureStream` is withheld: the mixer's `ensure_stream` no-ops on an
@@ -352,6 +374,7 @@ impl LiveDecodeStreams {
             stopped_streams: HashSet::new(),
             pending_sender_muted: HashMap::new(),
             pending_mixer_controls: HashMap::new(),
+            last_controls: HashMap::new(),
             pending_mixer_stops: HashSet::new(),
             stats: LivePlaybackMixerStats::default(),
             hints,
@@ -528,6 +551,7 @@ impl LiveDecodeStreams {
         self.mixer_streams.remove(&stream_id);
         self.pending_sender_muted.remove(&stream_id);
         self.pending_mixer_controls.remove(&stream_id);
+        self.last_controls.remove(&stream_id);
         source
     }
 
@@ -612,6 +636,16 @@ impl LiveDecodeStreams {
         control: PlaybackStreamControl,
         mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
     ) {
+        self.last_controls.insert(stream_id, control);
+        self.push_stream_control(stream_id, control, mixer_events);
+    }
+
+    fn push_stream_control(
+        &mut self,
+        stream_id: u32,
+        control: PlaybackStreamControl,
+        mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>,
+    ) {
         let event = LivePlaybackMixerEvent::SetStreamControl { stream_id, control };
         if push_mixer_event(mixer_events, &mut self.dropped_mixer_events, event) {
             // A stale pending control must not be re-pushed after this newer one,
@@ -619,6 +653,35 @@ impl LiveDecodeStreams {
             self.pending_mixer_controls.remove(&stream_id);
         } else {
             self.pending_mixer_controls.insert(stream_id, control);
+        }
+    }
+
+    /// Switches to the fresh mixer behind `mixer_events` after the output
+    /// stream was replaced. The NetEQ cores stay; everything the old mixer
+    /// held is rebuilt: each stream is re-registered by the next drain, with
+    /// its last control sent first so it never renders a block unmuted.
+    ///
+    /// Stops the old mixer never drained can no longer be acked, so the
+    /// retiring handles are released here (the old mixer's clones drop with
+    /// its stream, off any callback) and the stop ordinal restarts from the
+    /// shared ack counter.
+    pub(crate) fn attach_mixer(&mut self, mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>) {
+        self.mixer_streams.clear();
+        for stream in self.streams.values_mut() {
+            stream.source.replace_render_ring();
+        }
+        self.pending_mixer_stops.clear();
+        self.retiring.clear();
+        self.stops_pushed = self.hints.stop_events_processed();
+        self.notification = None;
+        self.pending_mixer_controls.clear();
+        let controls: Vec<_> = self
+            .last_controls
+            .iter()
+            .map(|(&stream_id, &control)| (stream_id, control))
+            .collect();
+        for (stream_id, control) in controls {
+            self.push_stream_control(stream_id, control, mixer_events);
         }
     }
 
@@ -1939,6 +2002,182 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "stream ack ordinal desynced by the notification stop"
+        );
+    }
+
+    /// Every event currently in `queue`, oldest first.
+    fn drain_queue(queue: &SpscSwapQueue<LivePlaybackMixerEvent>) -> Vec<LivePlaybackMixerEvent> {
+        let mut events = Vec::new();
+        let mut event = LivePlaybackMixerEvent::Empty;
+        while queue.remove(&mut event) {
+            events.push(std::mem::take(&mut event));
+        }
+        events
+    }
+
+    #[test]
+    fn attach_mixer_replays_controls_then_registers_with_a_fresh_ring() {
+        let now = Instant::now();
+        let mut streams = LiveDecodeStreams::new(test_tuning());
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let old_queue = SpscSwapQueue::with_capacity(16);
+        // Stream 8's control arrives before the stream exists.
+        streams.set_stream_control(7, stream_control(true), &old_queue);
+        streams.set_stream_control(8, stream_control(true), &old_queue);
+        let opus = tone_packet(&mut encoder, 0);
+        streams.insert_packet(voice_packet(7, 0, 0, opus, now), now);
+        streams.drain_into_mixer_events(&old_queue, now, None);
+        let old_ring = drain_queue(&old_queue)
+            .into_iter()
+            .find_map(|event| match event {
+                LivePlaybackMixerEvent::EnsureStream {
+                    source: MixerStreamSource::NetEq(source),
+                    ..
+                } => Some(source.render_ring),
+                _ => None,
+            })
+            .expect("stream 7 registered with the old mixer");
+
+        let new_queue = SpscSwapQueue::with_capacity(16);
+        streams.attach_mixer(&new_queue);
+        streams.drain_into_mixer_events(&new_queue, now, None);
+
+        let events = drain_queue(&new_queue);
+        let ensure_at = events
+            .iter()
+            .position(|event| matches!(event, LivePlaybackMixerEvent::EnsureStream { .. }))
+            .expect("stream 7 was not re-registered");
+        let mut controlled: Vec<u32> = events[..ensure_at]
+            .iter()
+            .map(|event| match event {
+                LivePlaybackMixerEvent::SetStreamControl { stream_id, control } => {
+                    assert!(control.muted);
+                    *stream_id
+                }
+                other => panic!("expected SetStreamControl, got {}", other.kind()),
+            })
+            .collect();
+        controlled.sort_unstable();
+        assert_eq!(controlled, [7, 8], "controls must precede the registration");
+        let LivePlaybackMixerEvent::EnsureStream {
+            stream_id: 7,
+            source: MixerStreamSource::NetEq(source),
+        } = &events[ensure_at]
+        else {
+            panic!("expected EnsureStream for stream 7");
+        };
+        let worker_source = &streams.streams.get(&7).unwrap().source;
+        assert!(Arc::ptr_eq(&source.shared, &worker_source.shared));
+        assert!(Arc::ptr_eq(&source.render_ring, &worker_source.render_ring));
+        assert!(
+            !Arc::ptr_eq(&source.render_ring, &old_ring),
+            "the old mixer may still read the old ring"
+        );
+        assert_eq!(events.len(), ensure_at + 1);
+    }
+
+    #[test]
+    fn attach_mixer_delivers_a_control_the_old_queue_rejected() {
+        let mut streams = LiveDecodeStreams::new(test_tuning());
+        let old_queue = SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(1);
+        let mut filler = LivePlaybackMixerEvent::StopStream { stream_id: 99 };
+        assert!(old_queue.insert(&mut filler));
+        streams.set_stream_control(7, stream_control(true), &old_queue);
+        assert!(streams.pending_mixer_controls.contains_key(&7));
+
+        let new_queue = SpscSwapQueue::with_capacity(16);
+        streams.attach_mixer(&new_queue);
+
+        assert!(streams.pending_mixer_controls.is_empty());
+        match drain_queue(&new_queue).as_slice() {
+            [
+                LivePlaybackMixerEvent::SetStreamControl {
+                    stream_id: 7,
+                    control,
+                },
+            ] => {
+                assert!(control.muted);
+            }
+            other => panic!("expected one SetStreamControl, got {} events", other.len()),
+        }
+    }
+
+    #[test]
+    fn attach_mixer_skips_stopped_streams_and_their_controls() {
+        let now = Instant::now();
+        let mut streams = LiveDecodeStreams::new(test_tuning());
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let old_queue = SpscSwapQueue::with_capacity(16);
+        streams.set_stream_control(7, stream_control(true), &old_queue);
+        let opus = tone_packet(&mut encoder, 0);
+        streams.insert_packet(voice_packet(7, 0, 0, opus, now), now);
+        streams.drain_into_mixer_events(&old_queue, now, None);
+        streams.stop_stream(7, &old_queue);
+
+        let new_queue = SpscSwapQueue::with_capacity(16);
+        streams.attach_mixer(&new_queue);
+        streams.drain_into_mixer_events(&new_queue, now, None);
+
+        assert!(
+            drain_queue(&new_queue).is_empty(),
+            "a stopped stream reached the new mixer"
+        );
+    }
+
+    #[test]
+    fn attach_mixer_realigns_stop_acks_after_undrained_stops() {
+        let now = Instant::now();
+        let tuning = test_tuning();
+        let mut streams = LiveDecodeStreams::new(tuning);
+        let mut encoder = OpusVoiceEncoder::new(32_000).unwrap();
+        let mut pending_event = LivePlaybackMixerEvent::default();
+
+        let mut old_mixer = LivePlaybackMixer::with_live_capacity(tuning);
+        old_mixer.set_playout_hints(streams.playout_hints());
+        let old_queue = SpscSwapQueue::with_capacity(16);
+        for stream_id in [7, 8] {
+            let opus = tone_packet(&mut encoder, 0);
+            streams.insert_packet(voice_packet(stream_id, 0, 0, opus, now), now);
+        }
+        streams.drain_into_mixer_events(&old_queue, now, None);
+        crate::audio::device::drain_live_playback_mixer_events(
+            &mut old_mixer,
+            &old_queue,
+            &mut pending_event,
+        );
+        let weak_7 = Arc::downgrade(&streams.streams.get(&7).unwrap().source.shared);
+        let weak_8 = Arc::downgrade(&streams.streams.get(&8).unwrap().source.shared);
+
+        // The old output died: this stop is never drained or acked.
+        streams.stop_stream(7, &old_queue);
+
+        let mut new_mixer = LivePlaybackMixer::with_live_capacity(tuning);
+        new_mixer.set_playout_hints(streams.playout_hints());
+        let new_queue = SpscSwapQueue::with_capacity(16);
+        streams.attach_mixer(&new_queue);
+        streams.drain_into_mixer_events(&new_queue, now, None);
+        crate::audio::device::drain_live_playback_mixer_events(
+            &mut new_mixer,
+            &new_queue,
+            &mut pending_event,
+        );
+        drop(old_mixer);
+        drop(old_queue);
+        assert!(
+            weak_7.upgrade().is_none(),
+            "stream 7 leaked waiting for an ack from the dead mixer"
+        );
+
+        streams.stop_stream(8, &new_queue);
+        crate::audio::device::drain_live_playback_mixer_events(
+            &mut new_mixer,
+            &new_queue,
+            &mut pending_event,
+        );
+        streams.drain_into_mixer_events(&new_queue, now, None);
+        assert!(
+            weak_8.upgrade().is_none(),
+            "stop ack ordinals desynced across the attach"
         );
     }
 }

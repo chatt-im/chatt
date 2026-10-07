@@ -87,6 +87,17 @@ pub(crate) struct StreamProgressWatch {
 }
 
 impl StreamProgressWatch {
+    /// A watch for a new stream whose callback counter continues from
+    /// `callbacks` rather than zero, such as a replaced output stream that
+    /// shares its predecessor's counter. It still gets the first-callback
+    /// allowance.
+    pub(crate) fn starting_at(callbacks: u64) -> Self {
+        Self {
+            callbacks,
+            ..Self::default()
+        }
+    }
+
     /// Feeds the stream's current callback count. Returns true exactly once
     /// when `armed` and the count has not advanced within `policy`. Disarmed
     /// observations still track progress, so arming later never reports a

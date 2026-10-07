@@ -15,7 +15,9 @@
 //            in a state prepare() cannot fix
 //   hang     PCM transfer, status, drop and close calls block until the mode
 //            changes: a driver or sound server stuck inside a call, which
-//            pins the cpal worker and anything that joins it
+//            pins the cpal worker and anything that joins it. Only PCMs
+//            already running when the mode switched to hang are stuck; a
+//            stream opened afterwards (a recovery reopening the device) works
 //
 // CHATT_ALSA_FAULT_DIR selects which PCMs are affected: `playback`, `capture`
 // or `both` (the default).
@@ -44,6 +46,14 @@ static struct {
     snd_pcm_stream_t stream;
 } tracked[MAX_TRACKED];
 static int tracked_len;
+
+// Running PCMs (seen in snd_pcm_poll_descriptors), and whether each was
+// running when hang mode began.
+static struct {
+    snd_pcm_t *pcm;
+    int hung;
+} running[MAX_TRACKED];
+static int running_len;
 
 static void *real(const char *name) {
     void *sym = dlsym(RTLD_NEXT, name);
@@ -74,6 +84,9 @@ static enum mode current_mode(void) {
                 else if (!strncmp(buf, "hang", 4)) mode = MODE_HANG;
             }
             fclose(file);
+        }
+        if ((mode == MODE_HANG) != (cached_mode == MODE_HANG)) {
+            for (int i = 0; i < running_len; i++) running[i].hung = mode == MODE_HANG;
         }
         cached_mode = mode;
     }
@@ -109,10 +122,23 @@ static int fd_faulted(int fd, enum mode want) {
     return hit;
 }
 
+static int pcm_hung(snd_pcm_t *pcm) {
+    pthread_mutex_lock(&lock);
+    int hung = 0;
+    for (int i = 0; i < running_len; i++) {
+        if (running[i].pcm == pcm) {
+            hung = running[i].hung;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return hung;
+}
+
 // Blocks the calling thread while `pcm` is hung.
 static void hang_while_faulted(snd_pcm_t *pcm) {
     struct timespec step = {0, 10 * 1000 * 1000};
-    while (pcm_faulted(pcm, MODE_HANG)) nanosleep(&step, NULL);
+    while (pcm_faulted(pcm, MODE_HANG) && pcm_hung(pcm)) nanosleep(&step, NULL);
 }
 
 int snd_pcm_poll_descriptors(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int space) {
@@ -120,6 +146,13 @@ int snd_pcm_poll_descriptors(snd_pcm_t *pcm, struct pollfd *pfds, unsigned int s
     if (!next) next = real("snd_pcm_poll_descriptors");
     int filled = next(pcm, pfds, space);
     pthread_mutex_lock(&lock);
+    int seen = 0;
+    for (int i = 0; i < running_len; i++) seen |= running[i].pcm == pcm;
+    if (!seen && running_len < MAX_TRACKED) {
+        running[running_len].pcm = pcm;
+        running[running_len].hung = 0;
+        running_len++;
+    }
     for (int i = 0; i < filled; i++) {
         int known = 0;
         for (int j = 0; j < tracked_len; j++) {
@@ -251,5 +284,15 @@ int snd_pcm_close(snd_pcm_t *pcm) {
     static int (*next)(snd_pcm_t *);
     if (!next) next = real("snd_pcm_close");
     hang_while_faulted(pcm);
+    // Forget the handle before it is freed, so a later PCM allocated at the
+    // same address does not inherit its hung flag.
+    pthread_mutex_lock(&lock);
+    for (int i = 0; i < running_len; i++) {
+        if (running[i].pcm == pcm) {
+            running[i] = running[--running_len];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&lock);
     return next(pcm);
 }
