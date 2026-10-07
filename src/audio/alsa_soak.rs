@@ -66,6 +66,7 @@ fn capture_config(echo: &Arc<EchoCancellationControl>) -> LiveCaptureConfig {
         echo_control: Some(Arc::clone(echo)),
         voice_state: Arc::new(AtomicVoiceState::new(VoiceState::Live)),
         audio_report: AudioReportHub::new(),
+        timeline: Default::default(),
     }
 }
 

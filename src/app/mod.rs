@@ -492,6 +492,9 @@ pub(crate) struct App {
     pub voice_packets_received: u64,
     pub voice_bytes_received: u64,
     pub encoder_profile: LiveEncoderProfile,
+    /// Outgoing media timeline shared by successive capture pipelines, so a
+    /// capture rebuild continues it; reset when a local voice stream starts.
+    capture_timeline: Arc<audio::CaptureTimeline>,
     pub last_network_notice: Option<String>,
     /// Command-line navigation is retained until the primary terminal channel
     /// exists. Emitting an overlay during `App::new` would otherwise drop it.
@@ -1644,6 +1647,7 @@ impl App {
             voice_packets_received: 0,
             voice_bytes_received: 0,
             encoder_profile: LiveEncoderProfile::INITIAL,
+            capture_timeline: Arc::default(),
             last_network_notice: None,
             pending_startup_join: pending_join,
             pending_after_welcome: None,
@@ -5064,6 +5068,8 @@ impl App {
                     self.apply_remote_sender_mute(user_id, self.room.voice_muted(user_id));
                 }
                 if notice.local {
+                    // A new stream id: its timeline may start anywhere.
+                    self.capture_timeline.reset();
                     self.start_room_voice();
                     if self.config.soundboard.enabled {
                         self.set_status("soundboard ready");
@@ -9339,6 +9345,7 @@ impl App {
             echo_control: Some(Arc::clone(&self.echo_control)),
             voice_state: Arc::clone(&self.voice_state),
             audio_report: Arc::clone(&self.audio_report),
+            timeline: Arc::clone(&self.capture_timeline),
         }
     }
 

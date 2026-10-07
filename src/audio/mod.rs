@@ -15,6 +15,7 @@ mod shared;
 mod sim;
 mod wav;
 
+pub(crate) use capture::CaptureTimeline;
 pub use capture::EchoCancellationControl;
 pub use device::{
     DeviceIdentity, DeviceIdentityProbe, DeviceInfo, StreamPreview, configured_output_is_default,

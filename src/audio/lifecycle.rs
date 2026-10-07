@@ -22,8 +22,8 @@ use crate::{
         backend::with_audio_backend_stderr_suppressed,
         callback::prefill_recycle_pool,
         capture::{
-            EchoCancellationControl, EchoReferenceSource, OpusVoiceEncoder, run_encoder_worker,
-            run_live_encoder_worker,
+            CaptureTimeline, EchoCancellationControl, EchoReferenceSource, OpusVoiceEncoder,
+            run_encoder_worker, run_live_encoder_worker,
         },
         device::{
             AudioCallbackBufferObserver, ConfigSelection, audio_buffer_size_label,
@@ -75,6 +75,8 @@ pub struct LiveCaptureConfig {
     /// outgoing fade/silence transition.
     pub voice_state: Arc<crate::audio::AtomicVoiceState>,
     pub(crate) audio_report: Arc<AudioReportHub>,
+    /// Media timeline carried across capture rebuilds within a voice stream.
+    pub(crate) timeline: Arc<CaptureTimeline>,
 }
 
 /// Resolved device parameters captured when a capture or playback stream
@@ -1085,6 +1087,7 @@ where
                 selection.device_rate,
                 worker_stats,
                 Arc::clone(&config.audio_report),
+                Arc::clone(&config.timeline),
                 on_packet,
             );
         })

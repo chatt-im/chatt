@@ -2143,7 +2143,7 @@ mod tests {
     /// old playout point (here 40 packets = 800 ms of speech). The 5-minute
     /// and past-2^31 (12.4 h) positions recover correctly.
     #[test]
-    #[ignore = "BUG: capture restart within ~1 s of the previous capture start drops up to ~1 s of audio as late (sender timeline resets to 0) — see review"]
+    #[ignore = "receiver drops a young timeline restarted at 0 as late; the sender keeps the timeline continuous across capture rebuilds instead (audio::capture::pipeline::tests::rebuilt_capture_pipeline_continues_the_media_timeline)"]
     fn capture_restart_recovers_for_any_old_timeline_position() {
         let mut failures = Vec::new();
         for (label, base_ts, old) in [

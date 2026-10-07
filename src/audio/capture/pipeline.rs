@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, Ordering},
         mpsc::{Receiver, SyncSender},
     },
@@ -29,9 +29,10 @@ use crate::{
             LIVE_CAPTURE_MUTE_FADE, LIVE_OPUS_FRAME_SAMPLES, LIVE_PACKET_FLAG_MUTE,
             LIVE_PACKET_FLAG_OPUS_RESET, LIVE_PACKET_FLAG_SILENCE_HINT,
             LIVE_PACKET_FLAG_SILENCE_RESUME, LiveAudioTuning, LiveEncoderProfile, LocalVoiceFrame,
-            MAX_OPUS_PACKET_BYTES, VoicePayload, apply_gain_ramp, convert_i16_scale_to_pcm_i16,
-            duration_to_us, max_adjacent_delta, mute_gain_step, optional_duration_to_us,
-            peak_normalized, rms_normalized, samples_for_duration, vad_to_u8,
+            MAX_OPUS_PACKET_BYTES, SAMPLE_RATE, VoicePayload, apply_gain_ramp,
+            convert_i16_scale_to_pcm_i16, duration_to_us, max_adjacent_delta, mute_gain_step,
+            optional_duration_to_us, peak_normalized, rms_normalized, samples_for_duration,
+            vad_to_u8,
         },
     },
     network::{EncoderNetworkProfile, EncoderNetworkTuning},
@@ -89,6 +90,7 @@ pub(crate) fn run_live_encoder_worker<F>(
     device_rate: u32,
     stats: AudioStats,
     audio_report: Arc<AudioReportHub>,
+    timeline: Arc<CaptureTimeline>,
     mut on_packet: F,
 ) where
     F: FnMut(LocalVoiceFrame) + Send + 'static,
@@ -108,6 +110,7 @@ pub(crate) fn run_live_encoder_worker<F>(
         device_rate,
         &stats,
         Arc::clone(&audio_report),
+        &timeline,
         &mut on_packet,
     );
     if let Err(error) = result {
@@ -185,6 +188,7 @@ pub(crate) fn run_live_encoder_worker_inner(
     device_rate: u32,
     stats: &AudioStats,
     audio_report: Arc<AudioReportHub>,
+    timeline: &CaptureTimeline,
     on_packet: &mut dyn FnMut(LocalVoiceFrame),
 ) -> Result<(), String> {
     let mut pipeline = LiveEncoderPipeline::new(
@@ -201,6 +205,7 @@ pub(crate) fn run_live_encoder_worker_inner(
         Arc::clone(&audio_report),
     );
     let mut applied_loss_percent = LiveEncoderProfile::INITIAL.packet_loss_percent;
+    let mut timeline_seeded = false;
 
     for chunk in receiver {
         let CapturedAudioChunk {
@@ -213,6 +218,12 @@ pub(crate) fn run_live_encoder_worker_inner(
         let dequeued_at = Instant::now();
         let queue_depth_after_dequeue = stats.note_capture_chunk_dequeued();
         let queue_age = dequeued_at.saturating_duration_since(enqueued_at);
+        // A rebuilt capture continues the previous pipeline's media timeline,
+        // seeded once its first audio arrives (see [`CaptureTimeline`]).
+        if !timeline_seeded {
+            pipeline.next_capture_sample = timeline.resume_sample(dequeued_at);
+            timeline_seeded = true;
+        }
         // Slave the media clock to cpal's capture timestamp before processing the
         // chunk. This subsumes both capture xruns and software drops: a dropped
         // callback simply leaves the counted clock behind the authoritative
@@ -249,6 +260,7 @@ pub(crate) fn run_live_encoder_worker_inner(
                 on_packet(packet);
             },
         )?;
+        timeline.record(pipeline.captured_end_sample(), Instant::now());
         let process_time = process_start.elapsed();
         audio_report.record_capture_process(
             report_track_id,
@@ -284,6 +296,45 @@ pub(crate) fn run_live_encoder_worker_inner(
     }
 
     Ok(())
+}
+
+/// The media timeline shared by the successive capture pipelines of one voice
+/// stream. Every capture rebuild creates a fresh pipeline while the network
+/// stream id and sequence persist, so the new pipeline continues the old
+/// timeline by the wall time elapsed between them instead of restarting at 0:
+/// the receiver only rebases on a large backward jump, and would drop every
+/// packet of a restart that lands within its tolerance as late. Reset when the
+/// voice stream ends, so a fresh stream can start anywhere.
+#[derive(Debug, Default)]
+pub(crate) struct CaptureTimeline {
+    /// End of the media the last pipeline captured (48 kHz sample index) and
+    /// when it was recorded.
+    last: Mutex<Option<(u32, Instant)>>,
+}
+
+impl CaptureTimeline {
+    pub(crate) fn record(&self, end_sample: u32, at: Instant) {
+        if let Ok(mut last) = self.last.lock() {
+            *last = Some((end_sample, at));
+        }
+    }
+
+    /// The media index a pipeline starting at `now` continues from: the last
+    /// recorded end plus the elapsed wall time, or 0 on a fresh stream.
+    pub(crate) fn resume_sample(&self, now: Instant) -> u32 {
+        let Some((end_sample, at)) = self.last.lock().ok().and_then(|last| *last) else {
+            return 0;
+        };
+        let elapsed_samples =
+            now.saturating_duration_since(at).as_nanos() * u128::from(SAMPLE_RATE) / 1_000_000_000;
+        end_sample.wrapping_add(elapsed_samples as u32)
+    }
+
+    pub(crate) fn reset(&self) {
+        if let Ok(mut last) = self.last.lock() {
+            *last = None;
+        }
+    }
 }
 
 pub(crate) struct LiveEncoderPipeline {
@@ -471,6 +522,17 @@ impl LiveEncoderPipeline {
         result
     }
 
+    /// Media index just past the last captured sample, including the samples
+    /// still buffered in the accumulator and resampler.
+    fn captured_end_sample(&self) -> u32 {
+        let resampler_backlog = self
+            .resampler
+            .as_ref()
+            .map_or(0, CaptureResampler::pending_len_48k);
+        self.next_capture_sample
+            .wrapping_add((self.accumulator.pending.len() + resampler_backlog) as u32)
+    }
+
     fn apply_encoder_profile(&mut self, profile: LiveEncoderProfile) -> Result<(), String> {
         self.encoder.apply_live_encoder_profile(profile)
     }
@@ -489,13 +551,7 @@ impl LiveEncoderPipeline {
         // chunk: accumulator `pending` holds the previous chunk's leftover, which
         // the new samples are appended after, and on a non-48 kHz device the
         // resampler's partial block precedes them as well.
-        let resampler_backlog = self
-            .resampler
-            .as_ref()
-            .map_or(0, CaptureResampler::pending_len_48k);
-        let effective = self
-            .next_capture_sample
-            .wrapping_add((self.accumulator.pending.len() + resampler_backlog) as u32);
+        let effective = self.captured_end_sample();
         let gap_samples = self.capture_clock.observe(capture_ns, effective);
         self.capture_hole_suspected = self.capture_clock.hole_suspected();
         if gap_samples == 0 {
@@ -1836,6 +1892,15 @@ mod tests {
         capture_ns: impl Fn(u64) -> u64,
         dropped_before: u64,
     ) -> Vec<LocalVoiceFrame> {
+        run_worker_on_timeline(capture_ns, dropped_before, &CaptureTimeline::default())
+    }
+
+    /// [`run_worker_with_capture_timestamps`] continuing `timeline`.
+    fn run_worker_on_timeline(
+        capture_ns: impl Fn(u64) -> u64,
+        dropped_before: u64,
+        timeline: &CaptureTimeline,
+    ) -> Vec<LocalVoiceFrame> {
         use std::sync::mpsc::sync_channel;
 
         let mut tuning = test_tuning();
@@ -1887,10 +1952,40 @@ mod tests {
             device_rate,
             &stats,
             AudioReportHub::new(),
+            timeline,
             &mut |packet| packets.push(packet),
         )
         .unwrap();
         packets
+    }
+
+    /// A capture rebuild continues the previous pipeline's media timeline by
+    /// the wall time between them, rather than restarting at 0 where a young
+    /// old timeline would make the receiver drop the restart as late.
+    #[test]
+    fn rebuilt_capture_pipeline_continues_the_media_timeline() {
+        let timeline = CaptureTimeline::default();
+        let first = run_worker_on_timeline(|sequence| sequence * CALLBACK_PERIOD_NS, 0, &timeline);
+        let last = first.last().expect("first capture emits packets").timestamp;
+        assert!(last < SAMPLE_RATE, "first capture starts a fresh timeline");
+
+        // The rebuild happens 300 ms after the old pipeline's last chunk.
+        let gap = std::time::Duration::from_millis(300);
+        let (end, at) = timeline.last.lock().unwrap().expect("worker records");
+        timeline.record(end, at.checked_sub(gap).unwrap());
+        let started = Instant::now();
+        let second = run_worker_on_timeline(|sequence| sequence * CALLBACK_PERIOD_NS, 0, &timeline);
+        let slack = samples_for_duration(started.elapsed()) as u32;
+
+        let resumed = second.first().expect("second capture emits packets");
+        assert_ne!(resumed.flags & LIVE_PACKET_FLAG_OPUS_RESET, 0);
+        let advance = resumed.timestamp.wrapping_sub(last);
+        let expected = end.wrapping_sub(last) + samples_for_duration(gap) as u32;
+        assert!(
+            advance >= expected && advance <= expected + slack,
+            "advance {advance}, expected {expected} + up to {slack}"
+        );
+        assert!(advance >= LIVE_OPUS_FRAME_SAMPLES as u32 + samples_for_duration(gap) as u32);
     }
 
     /// The first Opus packet whose timestamp jumps by at least `SAMPLE_RATE` from
