@@ -41,8 +41,8 @@ const PUBLIC_ROOM: RoomId = RoomId(1);
 /// Live clients here reconnect on 1/20 of the production backoff (50 ms
 /// instead of 1 s, ...): several tests end sessions on purpose (revocation,
 /// a severed proxy) and only care that the client comes back, not when.
-/// `review_reconnect_after_post_handshake_drop_is_rate_limited` restores the
-/// production schedule because the schedule is what it checks.
+/// `review_reconnect_after_post_handshake_drop_is_rate_limited` uses its own
+/// divisor because the schedule is what it checks.
 const FAST_RECONNECT_BACKOFF_DIVISOR: u32 = 20;
 const GROUP_ROOM: RoomId = RoomId(2);
 const LINKED_MATRIX_LOG: &str = "/tmp/chatt-e2e-matrix.kvlog";
@@ -2624,10 +2624,11 @@ mod client_net_review {
         let proxy = HandshakeThenCloseProxy::spawn(&addrs.tcp);
         let mut bob_config = config(&addrs, &root, "review-hot-Bob", BOB_TOKEN, false);
         bob_config.tcp_addr = proxy.addr.clone();
-        bob_config.reconnect_backoff_divisor = 1;
+        // A tenth of the production schedule: 100 ms after each short session.
+        bob_config.reconnect_backoff_divisor = 10;
         let bob = spawn(bob_config);
 
-        let events = drain_for(&bob, Duration::from_secs(3));
+        let events = drain_for(&bob, Duration::from_millis(500));
         let sessions = proxy.accepted.load(Ordering::Relaxed);
         let zero_delay = events
             .iter()
@@ -2636,11 +2637,11 @@ mod client_net_review {
             })
             .count();
         drop(bob);
-        // A bounded schedule allows at most one immediate retry plus one per
-        // second: well under ten sessions in three seconds.
+        // The scaled schedule allows at most six sessions in 500 ms (one
+        // every 100 ms); the hot loop managed hundreds.
         assert!(
-            sessions <= 10,
-            "client opened {sessions} handshaken sessions in 3 s ({zero_delay} zero-delay reconnects)"
+            sessions <= 8,
+            "client opened {sessions} handshaken sessions in 500 ms ({zero_delay} zero-delay reconnects)"
         );
     }
 
@@ -2664,7 +2665,8 @@ mod client_net_review {
         wait_authenticated(&bob, "mailbox Bob");
 
         // Bob never joins voice. Alice joins and leaves the lobby call.
-        for _ in 0..140 {
+        const CYCLES: usize = 140;
+        for _ in 0..CYCLES {
             join_voice_room(&alice, PUBLIC_ROOM, UserId(1));
             alice.handle.try_send(NetworkCommand::LeaveVoice).unwrap();
             wait_event(&alice, "alice left", Duration::from_secs(10), |event| {
@@ -2672,12 +2674,36 @@ mod client_net_review {
             });
             alice.backlog.borrow_mut().clear();
         }
-        let events = drain_for(&bob, Duration::from_secs(2));
+        // Wait until Bob has handled every one of those broadcasts (or lost
+        // the session over them), then briefly for a late teardown.
+        let mut events = Vec::new();
+        let mut stops = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stops < CYCLES {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(AppEvent::NetworkFor { event, .. }) = bob.events.recv_timeout(remaining) else {
+                continue;
+            };
+            bob.observe_network_event(&event);
+            match &event {
+                NetworkEvent::VoiceStopped { user_id, .. } if *user_id == UserId(1) => stops += 1,
+                NetworkEvent::ReconnectScheduled { .. } => {
+                    events.push(event);
+                    break;
+                }
+                _ => {}
+            }
+            events.push(event);
+        }
+        events.extend(drain_for(&bob, Duration::from_millis(250)));
         let reasons = reconnect_reasons(&events);
         assert!(
             reasons.is_empty() && bob.reconnects.get() == 0,
             "Bob was disconnected by other users' voice activity: {reasons:?}"
         );
+        assert_eq!(stops, CYCLES, "Bob did not see every VoiceStopped");
     }
 
     /// The server drops an established connection after 300 s without
@@ -2948,6 +2974,10 @@ mod client_net_review_p2p {
         false
     }
 
+    /// How long a peer that opted out of P2P is watched for a direct path.
+    /// With P2P on, the path forms within milliseconds on loopback.
+    const NO_DIRECT_PATH_WINDOW: Duration = Duration::from_secs(1);
+
     fn bob_direct(event: &NetworkEvent) -> bool {
         matches!(
             event,
@@ -2960,6 +2990,11 @@ mod client_net_review_p2p {
     /// next `StartSession` after any reconnect re-enables P2P and publishes the
     /// user's host/reflexive addresses to peers they opted out of exposing
     /// them to. (The app does not re-send the toggle after `Authenticated`.)
+    ///
+    /// On loopback a direct path forms within milliseconds of both peers
+    /// joining when P2P is on, so the "no direct path" windows are short; the
+    /// closing control re-enables P2P and requires that path to form, which
+    /// shows those windows would have caught it.
     #[test]
     fn review_runtime_p2p_opt_out_survives_reconnect() {
         let _guard = live_mls_e2e_guard();
@@ -2983,7 +3018,7 @@ mod client_net_review_p2p {
         join_voice(&alice, PUBLIC_ROOM, UserId(1));
         join_voice(&bob, PUBLIC_ROOM, UserId(2));
         assert!(
-            !wait_quiet(&alice, Duration::from_secs(6), bob_direct),
+            !wait_quiet(&alice, NO_DIRECT_PATH_WINDOW, bob_direct),
             "baseline: Bob opted out of P2P, so no direct path may form"
         );
 
@@ -2999,8 +3034,17 @@ mod client_net_review_p2p {
             .try_send(NetworkCommand::JoinVoice(PUBLIC_ROOM))
             .unwrap();
         assert!(
-            !wait_quiet(&alice, Duration::from_secs(10), bob_direct),
+            !wait_quiet(&alice, NO_DIRECT_PATH_WINDOW, bob_direct),
             "Bob's P2P opt-out was lost on reconnect: a direct path to Bob formed"
+        );
+
+        // Control: opting back in does form the path the windows watch for.
+        bob.handle
+            .try_send(NetworkCommand::SetP2pEnabled(true))
+            .unwrap();
+        assert!(
+            wait_quiet(&alice, Duration::from_secs(10), bob_direct),
+            "control: no direct path to Bob formed after he re-enabled P2P"
         );
     }
 }
