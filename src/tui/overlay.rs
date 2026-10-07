@@ -2056,6 +2056,8 @@ impl PasswordPromptMode {
 /// The filename field is a real single-line [`Editor`] seeded with a default
 /// name. `Enter` uploads under the edited name, `Esc` cancels and removes any
 /// staged temp file. The upload pipeline takes over once confirmed.
+/// Dropping the dialog without submitting deletes a staged image, so a dialog
+/// torn down by quit, detach, or a replaced mode stack leaves no temp file.
 pub(crate) struct PasteImageUploadMode {
     editor: Editor,
     source: Option<ImagePasteSource>,
@@ -2066,6 +2068,12 @@ pub(crate) struct PasteImageUploadMode {
     error: Option<String>,
     cancel_button: Rect,
     upload_button: Rect,
+}
+
+impl Drop for PasteImageUploadMode {
+    fn drop(&mut self) {
+        self.discard_staged();
+    }
 }
 
 impl PasteImageUploadMode {
@@ -2150,12 +2158,17 @@ impl PasteImageUploadMode {
     }
 
     fn cancel(&mut self, cx: &mut ViewCx<'_>) {
-        if let Some(source) = self.source.as_ref()
+        self.discard_staged();
+        cx.request_transition(ModeTransition::Pop);
+    }
+
+    /// Deletes a staged clipboard image that was never handed to an upload.
+    fn discard_staged(&mut self) {
+        if let Some(source) = self.source.take()
             && source.is_staged()
         {
             let _ = std::fs::remove_file(source.path());
         }
-        cx.request_transition(ModeTransition::Pop);
     }
 
     fn process_command(&mut self, cx: &mut ViewCx<'_>, command: BindCommand) -> Action {
@@ -3196,7 +3209,7 @@ mod tests {
         let app = test_app();
         let mut mode = PasteImageUploadMode::new(
             image_paste(
-                ImagePasteSource::StagedFile("/tmp/staged.png".into()),
+                ImagePasteSource::ExistingPath("/tmp/staged.png".into()),
                 "clipboard-image.png",
             ),
             &app.view.theme,
@@ -3212,7 +3225,7 @@ mod tests {
         let app = test_app();
         let mode = PasteImageUploadMode::new(
             image_paste(
-                ImagePasteSource::StagedFile("/tmp/staged.png".into()),
+                ImagePasteSource::ExistingPath("/tmp/staged.png".into()),
                 "clipboard.png",
             ),
             &app.view.theme,
@@ -3278,6 +3291,20 @@ mod tests {
         }
         assert!(!path.exists());
         assert!(!app.test_navigation.is_empty());
+    }
+
+    #[test]
+    fn paste_dialog_dropped_without_submit_removes_staged_file() {
+        let app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged.png");
+        std::fs::write(&path, b"bytes").unwrap();
+        let mode = PasteImageUploadMode::new(
+            image_paste(ImagePasteSource::StagedFile(path.clone()), "staged.png"),
+            &app.view.theme,
+        );
+        drop(mode);
+        assert!(!path.exists());
     }
 
     #[test]

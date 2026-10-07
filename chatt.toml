@@ -184,9 +184,8 @@ viewer = "panel"
 "v" = "ToggleVisual"
 "{" = "ParagraphBack"
 "}" = "ParagraphForward"
-"y" = { Label = "Yank" }
-"y y" = "CopyLine"
-"y m" = "CopyMessage"
+"y" = "CopyLine"
+"M-y" = "CopyMessage"
 "Y" = "CopyMessageRef"
 "r" = "InsertMessageRef"
 "o" = "OpenMessageRef"
@@ -209,7 +208,7 @@ viewer = "panel"
 "." = "ToggleKeyPreview"
 
 # Active while the chat log has a visual-line selection (mouse drag or `v`).
-# `y` yanks the selection directly instead of opening the yank chord.
+# `y` yanks the selection instead of the cursor line.
 [bindings.chat-visual]
 inherit = ["workspace"]
 "y" = "CopySelection"

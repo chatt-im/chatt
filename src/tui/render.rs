@@ -2646,11 +2646,10 @@ fn draw_status_text_right(row: DisplayRect, app: &RenderState<'_>, buf: &mut Buf
         StatusKind::Error => fill.patch(theme.error),
     };
     let status_text = if let Some(chord) = &app.view.chrome.binding.pending_chord {
-        format!(
-            "{} chord {}ms",
-            chord.label.as_deref().unwrap_or("pending"),
-            chord.activated_at.elapsed().as_millis()
-        )
+        match &chord.label {
+            Some(label) => format!("{} {label}", chord.keys),
+            None => chord.keys.clone(),
+        }
     } else {
         app.view.status.text().to_string()
     };

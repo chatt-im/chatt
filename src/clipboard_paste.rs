@@ -2,8 +2,9 @@
 //!
 //! This is the read-side counterpart to [`crate::clipboard`], which only
 //! copies text out. A paste is user triggered, so the helpers run synchronously
-//! and are bounded by the helper process itself. No polling happens on the
-//! render loop.
+//! on the render loop. Each is bounded by [`HELPER_TIMEOUT`], because a reader
+//! such as `xclip -o` waits on the selection owner and an owner that never
+//! answers would otherwise freeze the UI.
 //!
 //! [`classify`] turns raw clipboard access ([`ClipboardBackend`]) into a
 //! [`PastePayload`]. Real clipboard access shells out to platform helpers
@@ -14,7 +15,11 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::process::{Command, Stdio};
+use std::{
+    process::{Command, Stdio},
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 /// The result of reading the clipboard for a paste action.
 #[derive(Debug)]
@@ -115,13 +120,13 @@ impl ClipboardPasteProvider for HelperClipboard {
 /// can return canned results per capability in tests.
 trait ClipboardBackend {
     /// Plain text on the clipboard, if any.
-    fn text(&self) -> Option<String>;
+    fn text(&self) -> Result<Option<String>, ClipboardPasteError>;
     /// File paths from a clipboard file list / `text/uri-list` target.
-    fn file_uris(&self) -> Vec<PathBuf>;
+    fn file_uris(&self) -> Result<Vec<PathBuf>, ClipboardPasteError>;
     /// Available `image/*` MIME types on the clipboard.
-    fn image_mimes(&self) -> Vec<String>;
+    fn image_mimes(&self) -> Result<Vec<String>, ClipboardPasteError>;
     /// Raw bytes for a specific image MIME type.
-    fn image_bytes(&self, mime: &str) -> Option<Vec<u8>>;
+    fn image_bytes(&self, mime: &str) -> Result<Option<Vec<u8>>, ClipboardPasteError>;
 }
 
 /// Image MIME types we accept, most preferred first.
@@ -137,7 +142,7 @@ const IMAGE_MIME_PRIORITY: &[&str] = &[
 /// image/file over text when the clipboard exposes both.
 fn classify(backend: &dyn ClipboardBackend) -> Result<PastePayload, ClipboardPasteError> {
     // 1. A file entry pointing at an image wins over everything else.
-    for path in backend.file_uris() {
+    for path in backend.file_uris()? {
         if path_is_image(&path) && path.is_file() {
             let dimensions = image_dimensions_of_path(&path);
             let default_name = file_name_or(&path, "clipboard");
@@ -151,13 +156,13 @@ fn classify(backend: &dyn ClipboardBackend) -> Result<PastePayload, ClipboardPas
     }
 
     // 2. Raw image bytes, staged to a temp file for upload.
-    let available = backend.image_mimes();
+    let available = backend.image_mimes()?;
     let had_image_mime = !available.is_empty();
     for mime in IMAGE_MIME_PRIORITY {
         if !available.iter().any(|candidate| candidate == mime) {
             continue;
         }
-        let Some(bytes) = backend.image_bytes(mime) else {
+        let Some(bytes) = backend.image_bytes(mime)? else {
             continue;
         };
         if bytes.is_empty() {
@@ -177,7 +182,7 @@ fn classify(backend: &dyn ClipboardBackend) -> Result<PastePayload, ClipboardPas
     }
 
     // 3. Text, which may itself name an image file.
-    if let Some(text) = backend.text() {
+    if let Some(text) = backend.text()? {
         if text.is_empty() {
             return Ok(PastePayload::Empty);
         }
@@ -305,27 +310,122 @@ fn percent_decode(input: &str) -> String {
 /// Clipboard access via platform command-line helpers.
 struct PlatformBackend;
 
-/// Runs `program args`, returning captured stdout when it exits successfully.
-/// A missing program or a non-zero exit yields `None`.
+/// How long one helper may take to answer before the paste gives up on it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn run_helper(program: &str, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new(program)
+const HELPER_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HELPER_POLL_STEP: Duration = Duration::from_millis(2);
+
+/// The outcome of one helper run that answered in time.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum HelperRun {
+    /// The helper exited successfully with this stdout.
+    Output(Vec<u8>),
+    /// The helper ran but exited with an error, typically because the
+    /// clipboard does not offer the requested target.
+    Failed,
+    /// The helper is not installed.
+    Missing,
+}
+
+#[cfg(target_os = "macos")]
+impl HelperRun {
+    fn output(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Output(bytes) => Some(bytes),
+            Self::Failed | Self::Missing => None,
+        }
+    }
+}
+
+/// Runs `program args` and captures its stdout, killing it if it has not
+/// exited within [`HELPER_TIMEOUT`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_helper(program: &str, args: &[&str]) -> Result<HelperRun, ClipboardPasteError> {
+    use std::io::Read;
+
+    let mut child = match Command::new(program)
         .args(args)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(output.stdout)
-    } else {
-        None
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HelperRun::Missing);
+        }
+        Err(error) => {
+            kvlog::warn!("clipboard paste helper failed to start", program, error = %error);
+            return Ok(HelperRun::Failed);
+        }
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate(child);
+        return Ok(HelperRun::Failed);
+    };
+    // Drained concurrently so a helper writing more than the pipe buffer
+    // (an image) is never blocked waiting for its exit to be observed.
+    let (sender, receiver) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("clipboard-read".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let read = stdout.read_to_end(&mut bytes);
+            let _ = sender.send(read.map(|_| bytes));
+        });
+    if let Err(error) = spawned {
+        kvlog::warn!("clipboard paste reader unavailable", error = %error);
+        terminate(child);
+        return Ok(HelperRun::Failed);
     }
+
+    let deadline = Instant::now() + HELPER_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(HELPER_POLL_STEP),
+            Ok(None) => {
+                kvlog::warn!("clipboard paste helper timed out", program);
+                terminate(child);
+                return Err(ClipboardPasteError(format!(
+                    "clipboard read timed out: {program} got no answer from the clipboard owner"
+                )));
+            }
+            Err(error) => {
+                kvlog::warn!("clipboard paste helper status unavailable", program, error = %error);
+                terminate(child);
+                return Ok(HelperRun::Failed);
+            }
+        }
+    };
+    if !status.success() {
+        return Ok(HelperRun::Failed);
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(Ok(bytes)) => Ok(HelperRun::Output(bytes)),
+        Ok(Err(_)) | Err(_) => Ok(HelperRun::Failed),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn terminate(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Whether a Wayland compositor is present (prefer `wl-paste`).
 #[cfg(target_os = "linux")]
 fn on_wayland() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// Whether an X11 display is reachable (including Xwayland).
+#[cfg(target_os = "linux")]
+fn on_x11() -> bool {
+    std::env::var_os("DISPLAY").is_some()
 }
 
 /// Filters helper output listing MIME types down to supported `image/*` types.
@@ -365,100 +465,126 @@ fn parse_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
     paths
 }
 
+/// Runs the first helper in `candidates` whose display server is present and
+/// returns its output. `wl-paste` needs Wayland; `xclip` and `xsel` need X11.
+#[cfg(target_os = "linux")]
+fn read_first(candidates: &[(&str, &[&str])]) -> Result<ReadFirst, ClipboardPasteError> {
+    let mut installed = false;
+    for (program, args) in candidates {
+        let present = match *program {
+            "wl-paste" => on_wayland(),
+            _ => on_x11(),
+        };
+        if !present {
+            continue;
+        }
+        match run_helper(program, args)? {
+            HelperRun::Output(bytes) => return Ok(ReadFirst::Output(bytes)),
+            HelperRun::Failed => installed = true,
+            HelperRun::Missing => {}
+        }
+    }
+    Ok(if installed {
+        ReadFirst::Nothing
+    } else {
+        ReadFirst::NoHelper
+    })
+}
+
+#[cfg(target_os = "linux")]
+enum ReadFirst {
+    Output(Vec<u8>),
+    /// A helper ran but the clipboard did not offer the target.
+    Nothing,
+    /// No helper for the session's display server is installed, or there is
+    /// no display server at all.
+    NoHelper,
+}
+
+#[cfg(target_os = "linux")]
+impl ReadFirst {
+    fn output(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Output(bytes) => Some(bytes),
+            Self::Nothing | Self::NoHelper => None,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl ClipboardBackend for PlatformBackend {
-    fn text(&self) -> Option<String> {
-        if on_wayland() {
-            if let Some(bytes) = run_helper("wl-paste", &["--no-newline"]) {
-                return String::from_utf8(bytes).ok();
-            }
+    fn text(&self) -> Result<Option<String>, ClipboardPasteError> {
+        let read = read_first(&[
+            ("wl-paste", &["--no-newline"]),
+            ("xclip", &["-selection", "clipboard", "-o"]),
+            ("xsel", &["--clipboard", "--output"]),
+        ])?;
+        match read {
+            ReadFirst::Output(bytes) => Ok(String::from_utf8(bytes).ok()),
+            ReadFirst::Nothing => Ok(None),
+            ReadFirst::NoHelper if on_wayland() => Err(ClipboardPasteError(
+                "cannot read the clipboard: install wl-clipboard".to_string(),
+            )),
+            ReadFirst::NoHelper if on_x11() => Err(ClipboardPasteError(
+                "cannot read the clipboard: install xclip or xsel".to_string(),
+            )),
+            ReadFirst::NoHelper => Err(ClipboardPasteError(
+                "no graphical clipboard in this session: paste through the terminal".to_string(),
+            )),
         }
-        if let Some(bytes) = run_helper("xclip", &["-selection", "clipboard", "-o"]) {
-            return String::from_utf8(bytes).ok();
-        }
-        if let Some(bytes) = run_helper("xsel", &["--clipboard", "--output"]) {
-            return String::from_utf8(bytes).ok();
-        }
-        None
     }
 
-    fn file_uris(&self) -> Vec<PathBuf> {
-        if on_wayland() {
-            if let Some(bytes) = run_helper("wl-paste", &["--type", "text/uri-list"]) {
-                return parse_uri_list(&bytes);
-            }
-        }
-        if let Some(bytes) = run_helper(
-            "xclip",
-            &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
-        ) {
-            return parse_uri_list(&bytes);
-        }
-        Vec::new()
+    fn file_uris(&self) -> Result<Vec<PathBuf>, ClipboardPasteError> {
+        let read = read_first(&[
+            ("wl-paste", &["--type", "text/uri-list"]),
+            ("xclip", &["-selection", "clipboard", "-t", "text/uri-list", "-o"]),
+        ])?;
+        Ok(read.output().map_or_else(Vec::new, |bytes| parse_uri_list(&bytes)))
     }
 
-    fn image_mimes(&self) -> Vec<String> {
-        if on_wayland() {
-            if let Some(bytes) = run_helper("wl-paste", &["--list-types"]) {
-                return parse_image_mimes(&bytes);
-            }
-        }
-        if let Some(bytes) =
-            run_helper("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"])
-        {
-            return parse_image_mimes(&bytes);
-        }
-        Vec::new()
+    fn image_mimes(&self) -> Result<Vec<String>, ClipboardPasteError> {
+        let read = read_first(&[
+            ("wl-paste", &["--list-types"]),
+            ("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]),
+        ])?;
+        Ok(read.output().map_or_else(Vec::new, |bytes| parse_image_mimes(&bytes)))
     }
 
-    fn image_bytes(&self, mime: &str) -> Option<Vec<u8>> {
-        if on_wayland() {
-            if let Some(bytes) = run_helper("wl-paste", &["--type", mime]) {
-                if !bytes.is_empty() {
-                    return Some(bytes);
-                }
-            }
-        }
-        if let Some(bytes) = run_helper("xclip", &["-selection", "clipboard", "-t", mime, "-o"]) {
-            if !bytes.is_empty() {
-                return Some(bytes);
-            }
-        }
-        None
+    fn image_bytes(&self, mime: &str) -> Result<Option<Vec<u8>>, ClipboardPasteError> {
+        let read = read_first(&[
+            ("wl-paste", &["--type", mime]),
+            ("xclip", &["-selection", "clipboard", "-t", mime, "-o"]),
+        ])?;
+        Ok(read.output().filter(|bytes| !bytes.is_empty()))
     }
 }
 
 #[cfg(target_os = "macos")]
 impl ClipboardBackend for PlatformBackend {
-    fn text(&self) -> Option<String> {
-        let bytes = run_helper("pbpaste", &[])?;
-        String::from_utf8(bytes).ok()
+    fn text(&self) -> Result<Option<String>, ClipboardPasteError> {
+        let bytes = run_helper("pbpaste", &[])?.output();
+        Ok(bytes.and_then(|bytes| String::from_utf8(bytes).ok()))
     }
 
-    fn file_uris(&self) -> Vec<PathBuf> {
-        // Best effort: ask the pasteboard for file references via AppleScript.
-        let script = "set the clipboard to (the clipboard as «class furl») as text";
-        let _ = script;
-        Vec::new()
+    fn file_uris(&self) -> Result<Vec<PathBuf>, ClipboardPasteError> {
+        Ok(Vec::new())
     }
 
-    fn image_mimes(&self) -> Vec<String> {
+    fn image_mimes(&self) -> Result<Vec<String>, ClipboardPasteError> {
         // `pngpaste` extracts PNG bytes when the pasteboard holds an image.
-        // Advertise PNG optimistically and let `image_bytes` confirm.
-        if run_helper("pngpaste", &["--version"]).is_some()
-            || Command::new("pngpaste").arg("--help").output().is_ok()
-        {
-            return vec!["image/png".to_string()];
+        // Advertise PNG whenever it is installed and let `image_bytes` confirm.
+        match run_helper("pngpaste", &["-v"])? {
+            HelperRun::Missing => Ok(Vec::new()),
+            HelperRun::Output(_) | HelperRun::Failed => Ok(vec!["image/png".to_string()]),
         }
-        Vec::new()
     }
 
-    fn image_bytes(&self, mime: &str) -> Option<Vec<u8>> {
+    fn image_bytes(&self, mime: &str) -> Result<Option<Vec<u8>>, ClipboardPasteError> {
         if mime != "image/png" {
-            return None;
+            return Ok(None);
         }
-        let bytes = run_helper("pngpaste", &["-"])?;
-        if bytes.is_empty() { None } else { Some(bytes) }
+        let bytes = run_helper("pngpaste", &["-"])?.output();
+        Ok(bytes.filter(|bytes| !bytes.is_empty()))
     }
 }
 
@@ -466,36 +592,36 @@ impl ClipboardBackend for PlatformBackend {
 /// so every capability is a call into [`crate::clipboard_windows`].
 #[cfg(windows)]
 impl ClipboardBackend for PlatformBackend {
-    fn text(&self) -> Option<String> {
-        crate::clipboard_windows::text()
+    fn text(&self) -> Result<Option<String>, ClipboardPasteError> {
+        Ok(crate::clipboard_windows::text())
     }
 
-    fn file_uris(&self) -> Vec<PathBuf> {
-        crate::clipboard_windows::file_paths()
+    fn file_uris(&self) -> Result<Vec<PathBuf>, ClipboardPasteError> {
+        Ok(crate::clipboard_windows::file_paths())
     }
 
-    fn image_mimes(&self) -> Vec<String> {
-        crate::clipboard_windows::image_mimes()
+    fn image_mimes(&self) -> Result<Vec<String>, ClipboardPasteError> {
+        Ok(crate::clipboard_windows::image_mimes())
     }
 
-    fn image_bytes(&self, mime: &str) -> Option<Vec<u8>> {
-        crate::clipboard_windows::image_bytes(mime)
+    fn image_bytes(&self, mime: &str) -> Result<Option<Vec<u8>>, ClipboardPasteError> {
+        Ok(crate::clipboard_windows::image_bytes(mime))
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl ClipboardBackend for PlatformBackend {
-    fn text(&self) -> Option<String> {
-        None
+    fn text(&self) -> Result<Option<String>, ClipboardPasteError> {
+        Ok(None)
     }
-    fn file_uris(&self) -> Vec<PathBuf> {
-        Vec::new()
+    fn file_uris(&self) -> Result<Vec<PathBuf>, ClipboardPasteError> {
+        Ok(Vec::new())
     }
-    fn image_mimes(&self) -> Vec<String> {
-        Vec::new()
+    fn image_mimes(&self) -> Result<Vec<String>, ClipboardPasteError> {
+        Ok(Vec::new())
     }
-    fn image_bytes(&self, _mime: &str) -> Option<Vec<u8>> {
-        None
+    fn image_bytes(&self, _mime: &str) -> Result<Option<Vec<u8>>, ClipboardPasteError> {
+        Ok(None)
     }
 }
 
@@ -519,20 +645,24 @@ mod tests {
         uris: Vec<PathBuf>,
         mimes: Vec<String>,
         images: HashMap<String, Vec<u8>>,
+        text_times_out: bool,
     }
 
     impl ClipboardBackend for FakeBackend {
-        fn text(&self) -> Option<String> {
-            self.text.clone()
+        fn text(&self) -> Result<Option<String>, ClipboardPasteError> {
+            if self.text_times_out {
+                return Err(ClipboardPasteError("clipboard read timed out".to_string()));
+            }
+            Ok(self.text.clone())
         }
-        fn file_uris(&self) -> Vec<PathBuf> {
-            self.uris.clone()
+        fn file_uris(&self) -> Result<Vec<PathBuf>, ClipboardPasteError> {
+            Ok(self.uris.clone())
         }
-        fn image_mimes(&self) -> Vec<String> {
-            self.mimes.clone()
+        fn image_mimes(&self) -> Result<Vec<String>, ClipboardPasteError> {
+            Ok(self.mimes.clone())
         }
-        fn image_bytes(&self, mime: &str) -> Option<Vec<u8>> {
-            self.images.get(mime).cloned()
+        fn image_bytes(&self, mime: &str) -> Result<Option<Vec<u8>>, ClipboardPasteError> {
+            Ok(self.images.get(mime).cloned())
         }
     }
 
@@ -680,6 +810,43 @@ mod tests {
         assert!(matches!(
             classify(&FakeBackend::default()).unwrap(),
             PastePayload::Empty
+        ));
+    }
+
+    #[test]
+    fn helper_timeout_is_an_error_not_an_empty_clipboard() {
+        let backend = FakeBackend {
+            text_times_out: true,
+            ..Default::default()
+        };
+        assert!(classify(&backend).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn helper_that_never_exits_is_killed_at_the_timeout() {
+        let started = Instant::now();
+        let result = run_helper("/bin/sleep", &["30"]);
+        assert!(result.is_err());
+        assert!(started.elapsed() < HELPER_TIMEOUT + Duration::from_secs(2));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn helper_output_larger_than_a_pipe_buffer_is_read_in_full() {
+        let Ok(HelperRun::Output(bytes)) = run_helper("/bin/sh", &["-c", "head -c 1000000 /dev/zero"])
+        else {
+            panic!("expected helper output");
+        };
+        assert_eq!(bytes.len(), 1_000_000);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn missing_helper_is_distinguished_from_a_failing_one() {
+        assert!(matches!(
+            run_helper("chatt-test-no-such-clipboard-helper", &[]),
+            Ok(HelperRun::Missing)
         ));
     }
 

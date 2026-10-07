@@ -4471,8 +4471,10 @@ mod tests {
         }
     }
 
+    /// A chord prefix is held back, but a second key the chord does not bind
+    /// is processed normally rather than swallowed.
     #[test]
-    fn insert_chord_prefix_and_failed_second_key_are_not_inserted() {
+    fn insert_chord_prefix_is_held_and_failed_second_key_is_inserted() {
         let mut app = app_with_bindings("[bindings.insert]\n\"x x\" = \"ToggleMute\"\n");
         let mut room = RoomMode::default();
 
@@ -4481,7 +4483,7 @@ mod tests {
         assert!(app.view.chrome.binding.pending_chord.is_some());
 
         room.process_input(&mut app, key('z'));
-        assert_eq!(app.view.composer.text(), "");
+        assert_eq!(app.view.composer.text(), "z");
         assert!(app.view.chrome.binding.pending_chord.is_none());
     }
 
@@ -5130,20 +5132,6 @@ mod tests {
     }
 
     #[test]
-    fn y_without_visual_selection_copies_nothing() {
-        let mut app = test_app();
-        let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
-        push_room_message(&mut app, 1, UserId(2), 1_000, "first");
-
-        let mut buffer = Buffer::new(80, 24);
-        render_room(&mut app, &mut room, &mut buffer);
-        room.set_focus(&mut app, ChatPanelFocus::ChatLog);
-        room.process_input(&mut app, key('y'));
-
-        assert_eq!(app.view.take_pending_clipboard(), None);
-    }
-
-    #[test]
     fn v_then_jk_extends_visual_selection_and_y_copies_it() {
         let mut app = test_app();
         let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
@@ -5223,7 +5211,7 @@ mod tests {
     }
 
     #[test]
-    fn yy_copies_cursor_line() {
+    fn y_copies_cursor_line() {
         let mut app = test_app();
         let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
         push_room_message(&mut app, 1, UserId(2), 1_000, "alpha\nbeta");
@@ -5232,14 +5220,13 @@ mod tests {
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
 
-        room.process_input(&mut app, key('y'));
         room.process_input(&mut app, key('y'));
 
         assert_eq!(app.view.take_pending_clipboard().as_deref(), Some("beta"));
     }
 
     #[test]
-    fn ym_copies_cursor_message_body() {
+    fn alt_y_copies_cursor_message_body() {
         let mut app = test_app();
         let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
         push_room_message(&mut app, 1, UserId(2), 1_000, "alpha\nbeta");
@@ -5248,8 +5235,7 @@ mod tests {
         render_room(&mut app, &mut room, &mut buffer);
         room.set_focus(&mut app, ChatPanelFocus::ChatLog);
 
-        room.process_input(&mut app, key('y'));
-        room.process_input(&mut app, key('m'));
+        room.process_input(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
 
         assert_eq!(
             app.view.take_pending_clipboard().as_deref(),
@@ -5297,19 +5283,14 @@ mod tests {
         assert_eq!(room.workspace_layer(&app), bindings::WORKSPACE_LAYER);
     }
 
-    /// Guards the router hazard where a terminal binding and a chord prefix
-    /// share a key: workspace `y` must open the yank chord while the inherited
-    /// chat-visual override resolves `y` straight to CopySelection.
+    /// The cursor line and a visual selection look alike, so `y` must copy
+    /// whichever one is showing rather than open a chord.
     #[test]
-    fn y_is_a_chord_in_workspace_and_a_yank_in_visual() {
+    fn y_copies_the_cursor_line_in_workspace_and_the_selection_in_visual() {
         let mut app = test_app();
         match resolve_binding(&mut app, bindings::WORKSPACE_LAYER, key('y')) {
-            BindingResolution::Consumed => {}
-            other => panic!("expected chord entry, got {other:?}"),
-        }
-        match resolve_binding(&mut app, bindings::WORKSPACE_LAYER, key('m')) {
-            BindingResolution::Action(BindCommand::CopyMessage) => {}
-            other => panic!("expected CopyMessage, got {other:?}"),
+            BindingResolution::Action(BindCommand::CopyLine) => {}
+            other => panic!("expected CopyLine, got {other:?}"),
         }
         match resolve_binding(&mut app, bindings::CHAT_VISUAL_LAYER, key('y')) {
             BindingResolution::Action(BindCommand::CopySelection) => {}

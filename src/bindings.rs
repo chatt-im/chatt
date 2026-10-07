@@ -1,6 +1,6 @@
-use std::{collections::HashSet, time::Instant};
+use std::collections::HashSet;
 
-use extui_bindings::{ActionId, InputKey, LayerId, Payload, Router, RouterBuilder, parse_sequence};
+use extui_bindings::{ActionId, InputKey, LayerId, NamedKey, Payload, Router, RouterBuilder, parse_sequence};
 use toml_spanner::Toml;
 use toml_spanner::{
     Arena, Context, Error, Failed, FromToml, Item, OwnedItem, Table, ToToml, ToTomlError,
@@ -19,7 +19,7 @@ pub const PASSWORD_LAYER: LayerId = LayerId::new(8);
 pub const PASTE_LAYER: LayerId = LayerId::new(9);
 pub const USER_LIST_LAYER: LayerId = LayerId::new(10);
 /// The chat log's visual-line mode: active while a visual anchor is set, so
-/// `y` yanks the selection instead of opening the yank chord.
+/// `y` yanks the selection instead of the cursor line.
 pub const CHAT_VISUAL_LAYER: LayerId = LayerId::new(11);
 
 const LAYER_TABLES: [(&str, LayerId); 11] = [
@@ -306,7 +306,8 @@ pub struct BindingRuntime {
 pub struct PendingChord {
     pub layer: LayerId,
     pub label: Option<String>,
-    pub activated_at: Instant,
+    /// The keys typed so far, space separated, for the status bar.
+    pub keys: String,
 }
 
 pub enum ReachableKind {
@@ -326,19 +327,30 @@ pub enum Resolved {
     Unmatched,
 }
 
+/// Resolves `key` against the pending chord layer, or `base` when no chord is
+/// pending.
+///
+/// Esc cancels a pending chord. Any other key the chord does not bind cancels
+/// it and is then resolved against `base`, so a stray chord prefix never
+/// swallows the next keystroke.
 pub fn resolve(
     router: &Router,
     base: LayerId,
     pending: &mut Option<PendingChord>,
     key: InputKey,
 ) -> Resolved {
+    if let Some(chord) = pending.as_ref() {
+        if key.as_named() == Some(NamedKey::Esc) && key.modifiers().is_empty() {
+            *pending = None;
+            return Resolved::Consumed;
+        }
+        if router.lookup(chord.layer, key).first().is_none() {
+            *pending = None;
+        }
+    }
     let layer = pending.as_ref().map_or(base, |chord| chord.layer);
     let Some(entry) = router.lookup(layer, key).first() else {
-        return if pending.take().is_some() {
-            Resolved::Consumed
-        } else {
-            Resolved::Unmatched
-        };
+        return Resolved::Unmatched;
     };
 
     match entry.payload() {
@@ -347,10 +359,12 @@ pub fn resolve(
             Resolved::Action(id)
         }
         Payload::Layer(target) => {
+            let mut keys = pending.take().map_or_else(String::new, |chord| chord.keys + " ");
+            keys.push_str(&key.to_string());
             *pending = Some(PendingChord {
                 layer: target,
                 label: entry.label().map(|label| router.label(label).to_string()),
-                activated_at: Instant::now(),
+                keys,
             });
             Resolved::Consumed
         }
@@ -720,6 +734,47 @@ mod tests {
             ));
             assert!(command(&runtime, layer, "c").is_none());
         }
+    }
+
+    #[test]
+    fn unbound_key_after_chord_prefix_resolves_in_base_layer() {
+        let runtime = BindingRuntime::default();
+        assert!(matches!(
+            sequence_command(&runtime, WORKSPACE_LAYER, "z j"),
+            Some(BindCommand::ScrollDown)
+        ));
+    }
+
+    #[test]
+    fn esc_cancels_pending_chord_without_acting() {
+        let runtime = BindingRuntime::default();
+        let mut pending = None;
+        let [z, esc] = parse_sequence("z ESC").unwrap()[..] else {
+            panic!("expected two keys");
+        };
+        assert!(matches!(
+            resolve(&runtime.router, CHAT_VISUAL_LAYER, &mut pending, z),
+            Resolved::Consumed
+        ));
+        assert_eq!(pending.as_ref().map(|chord| chord.keys.as_str()), Some("z"));
+        assert!(matches!(
+            resolve(&runtime.router, CHAT_VISUAL_LAYER, &mut pending, esc),
+            Resolved::Consumed
+        ));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn default_workspace_binds_y_to_copy_line_without_a_chord() {
+        let runtime = BindingRuntime::default();
+        assert!(matches!(
+            command(&runtime, WORKSPACE_LAYER, "y"),
+            Some(BindCommand::CopyLine)
+        ));
+        assert!(matches!(
+            command(&runtime, WORKSPACE_LAYER, "M-y"),
+            Some(BindCommand::CopyMessage)
+        ));
     }
 
     #[test]

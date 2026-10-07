@@ -157,7 +157,10 @@ impl ClientThread {
                 dirty = DirtySections::ALL;
             }
             dirty |= channel.take_dirty();
-            clipboard.poll();
+            if let Some(failure) = clipboard.poll() {
+                view.set_error(failure.to_string());
+                dirty |= DirtySections::COMPOSE_BAR;
+            }
             if let Some(error) = url_opener.poll_failure() {
                 view.set_error(error);
                 dirty |= DirtySections::COMPOSE_BAR;
@@ -306,11 +309,16 @@ impl ClientThread {
                 view.take_pending_primary_clipboard(),
                 view.take_pending_url_open(),
             );
+            let mut copy_failure = None;
             if let Some(text) = clipboard_text {
-                clipboard.copy(&mut terminal, &text);
+                copy_failure = clipboard.copy(&mut terminal, &text);
             }
             if let Some(text) = primary_clipboard_text {
-                clipboard.copy_primary(&mut terminal, &text);
+                copy_failure = clipboard.copy_primary(&mut terminal, &text).or(copy_failure);
+            }
+            if let Some(failure) = copy_failure {
+                view.set_error(failure.to_string());
+                dirty |= DirtySections::COMPOSE_BAR;
             }
             if let Some(url) = url {
                 match url_opener.open(&url) {
