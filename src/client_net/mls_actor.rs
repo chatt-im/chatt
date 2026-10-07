@@ -2148,13 +2148,7 @@ impl Actor {
             .ok_or_else(|| "local MLS installation is unavailable".to_string())?
             .client
             .cached_history(room_id)?;
-        let end = before
-            .and_then(|before| {
-                history
-                    .iter()
-                    .position(|event| mls_message_id(event.sequence) == before)
-            })
-            .unwrap_or(history.len());
+        let end = cached_history_page_end(&history, before);
         let start = end.saturating_sub(usize::from(limit));
         let selected = history[start..end].to_vec();
         let mut messages = Vec::with_capacity(selected.len());
@@ -2928,6 +2922,20 @@ fn should_compact(stats: chatt_mls::RedbStorageStats) -> bool {
     stats.fragmented_bytes >= COMPACTION_MIN_FRAGMENTED_BYTES
         || u128::from(stats.fragmented_bytes) * 100
             >= u128::from(stats.allocated_bytes) * u128::from(COMPACTION_MIN_FRAGMENTED_PERCENT)
+}
+
+/// One past the newest cached event older than `before`. `history` is sorted
+/// by delivery sequence, so a `before` that is not itself cached (a record
+/// only the local capture still holds) keeps paging backwards instead of
+/// answering with the newest page.
+fn cached_history_page_end(
+    history: &[chatt_mls::CachedApplicationEvent],
+    before: Option<MessageId>,
+) -> usize {
+    match before {
+        Some(before) => history.partition_point(|event| mls_message_id(event.sequence) < before),
+        None => history.len(),
+    }
 }
 
 #[cfg(test)]
@@ -3790,5 +3798,32 @@ mod tests {
             cursor, 1,
             "the unreadable Welcome must still advance the cursor"
         );
+    }
+
+    #[test]
+    fn cached_history_page_ends_before_an_uncached_cursor() {
+        let history = [2u64, 5, 9]
+            .map(|sequence| chatt_mls::CachedApplicationEvent {
+                sequence,
+                event: rpc::mls::MlsChattEvent {
+                    version: rpc::mls::MLS_PROTOCOL_VERSION,
+                    room_id: RoomId(9),
+                    event_id: rpc::ids::EventId([sequence as u8; 16]),
+                    sender_account: rpc::ids::AccountId([1; 32]),
+                    timestamp_ms: 0,
+                    content: rpc::mls::ChattEventContent::Text {
+                        body: String::new(),
+                    },
+                },
+            })
+            .to_vec();
+        let end_before =
+            |sequence| cached_history_page_end(&history, Some(mls_message_id(sequence)));
+        assert_eq!(cached_history_page_end(&history, None), 3);
+        assert_eq!(end_before(5), 1);
+        // A cursor between cached sequences still pages strictly older.
+        assert_eq!(end_before(7), 2);
+        assert_eq!(end_before(1), 0);
+        assert_eq!(end_before(10), 3);
     }
 }
