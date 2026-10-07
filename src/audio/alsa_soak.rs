@@ -18,6 +18,9 @@
 //! - `CHATT_SOAK_DEVICE`: ALSA PCM to open (default `default`).
 //! - `CHATT_ALSA_FAULT`: `wedge`, `suspend`, `ebadfd` or `hang` (see the
 //!   injector). `hang_drop` sets `hang` itself.
+//! - `CHATT_ALSA_FAULT_DIR`: read by the injector; `fault_timeline` also
+//!   asserts that a `playback` or `capture` fault never rebuilds the other
+//!   direction.
 //! - `CHATT_SOAK_REBUILD=0`: observe only, never rebuild a failed stream.
 //! - `CHATT_SOAK_PLAYBACK_WATCHDOG=0`: rebuild playback only on fatal errors,
 //!   as the supervisor did before playback had a progress watch.
@@ -32,11 +35,15 @@ use std::{
 
 use rpc::control::VoiceState;
 
-use crate::app::audio_supervisor::{CAPTURE_STALL, PLAYBACK_STALL, StreamProgressWatch};
+use crate::app::audio_supervisor::{
+    CAPTURE_STALL, PLAYBACK_STALL, RebuildCause, RebuildTrigger, StreamProgressWatch,
+    rebuild_restarts_paired_stream,
+};
 use crate::audio::{
-    AtomicVoiceState, AudioReportHub, BufferRequest, DenoiseConfig, DenoiseSuppression,
-    DenoiseTypingSuppression, DredConfig, EchoCancellationControl, LiveAudioTuning,
-    LiveCaptureConfig, LivePlaybackConfig, start_live_capture, start_live_playback,
+    AtomicVoiceState, AudioErrorKind, AudioReportHub, BufferRequest, DenoiseConfig,
+    DenoiseSuppression, DenoiseTypingSuppression, DredConfig, EchoCancellationControl,
+    LiveAudioTuning, LiveCaptureConfig, LivePlaybackConfig, start_live_capture,
+    start_live_playback,
 };
 
 fn device_id() -> Option<String> {
@@ -196,6 +203,8 @@ fn leak_cycles() {
 /// Both live streams under the app supervisor's detection rules: a
 /// direction counts as failed when its progress watch reports a stall or its
 /// fatal error count rises, and (unless rebuilds are off) is then rebuilt.
+/// The other direction is rebuilt with it only when
+/// [`rebuild_restarts_paired_stream`] says the app would.
 struct SupervisedStreams {
     echo: Arc<EchoCancellationControl>,
     rebuild: bool,
@@ -260,9 +269,10 @@ impl SupervisedStreams {
                     .capture_watch
                     .observe(now, stats.callbacks, true, CAPTURE_STALL)
                 {
-                    capture_failed = Some("STALL");
+                    capture_failed = Some(("STALL", AudioErrorKind::Transient));
                 } else if stats.fatal_stream_errors > self.capture_fatal {
-                    capture_failed = Some("FATAL");
+                    let kind = stats.last_error_kind.unwrap_or(AudioErrorKind::Transient);
+                    capture_failed = Some(("FATAL", kind));
                 }
                 self.capture_fatal = stats.fatal_stream_errors;
             }
@@ -289,22 +299,38 @@ impl SupervisedStreams {
                     self.playback_watchdog,
                     PLAYBACK_STALL,
                 ) {
-                    playback_failed = Some("STALL");
+                    playback_failed = Some(("STALL", AudioErrorKind::Transient));
                 } else if stats.backend_fatal_stream_errors > self.playback_fatal {
-                    playback_failed = Some("FATAL");
+                    let kind = stats
+                        .last_backend_error_kind
+                        .unwrap_or(AudioErrorKind::Transient);
+                    playback_failed = Some(("FATAL", kind));
                 }
                 self.playback_fatal = stats.backend_fatal_stream_errors;
             }
             None => line += " | spk (down)",
         }
-        if let Some(reason) = capture_failed {
-            line += &format!("  CAPTURE {reason}");
+        if let Some((reason, kind)) = capture_failed {
+            line += &format!("  CAPTURE {reason} ({})", kind.label());
         }
-        if let Some(reason) = playback_failed {
-            line += &format!("  PLAYBACK {reason}");
+        if let Some((reason, kind)) = playback_failed {
+            line += &format!("  PLAYBACK {reason} ({})", kind.label());
         }
 
-        if self.rebuild && (capture_failed.is_some() || self.capture.is_none()) {
+        let restarts_paired = |failed: Option<(&str, AudioErrorKind)>| {
+            failed.is_some_and(|(_, kind)| {
+                rebuild_restarts_paired_stream(RebuildTrigger {
+                    cause: RebuildCause::StreamError,
+                    kind: Some(kind),
+                })
+            })
+        };
+        let rebuild_capture =
+            capture_failed.is_some() || self.capture.is_none() || restarts_paired(playback_failed);
+        let rebuild_playback =
+            playback_failed.is_some() || self.playback.is_none() || restarts_paired(capture_failed);
+
+        if self.rebuild && rebuild_capture {
             self.capture = None;
             self.capture_watch = StreamProgressWatch::default();
             self.capture_fatal = 0;
@@ -315,7 +341,7 @@ impl SupervisedStreams {
                 Err(error) => line += &format!("\n{at:>6} ms  capture rebuild failed: {error}"),
             }
         }
-        if self.rebuild && (playback_failed.is_some() || self.playback.is_none()) {
+        if self.rebuild && rebuild_playback {
             self.playback = None;
             self.playback_watch = StreamProgressWatch::default();
             self.playback_fatal = 0;
@@ -335,7 +361,8 @@ impl SupervisedStreams {
         recent(self.capture_progress_at) && recent(self.playback_progress_at)
     }
 
-    fn finish(self) {
+    /// Drops both streams and returns the (capture, playback) rebuild counts.
+    fn finish(self) -> (u32, u32) {
         println!(
             "rebuilds: capture {}, playback {}",
             self.capture_rebuilds, self.playback_rebuilds
@@ -344,6 +371,7 @@ impl SupervisedStreams {
         drop(self.capture);
         drop(self.playback);
         println!("streams dropped in {:?}", drop_started.elapsed());
+        (self.capture_rebuilds, self.playback_rebuilds)
     }
 }
 
@@ -384,7 +412,14 @@ fn fault_timeline() {
         println!("{}", streams.tick(now, at));
         std::thread::sleep(Duration::from_millis(250));
     }
-    streams.finish();
+    let (capture_rebuilds, playback_rebuilds) = streams.finish();
+    // A fault on one direction alone must not rebuild the other. The injected
+    // faults never report a vanished device, so no rebuild is coupled.
+    match std::env::var("CHATT_ALSA_FAULT_DIR").as_deref() {
+        Ok("playback") => assert_eq!(capture_rebuilds, 0, "playback fault rebuilt capture"),
+        Ok("capture") => assert_eq!(playback_rebuilds, 0, "capture fault rebuilt playback"),
+        _ => {}
+    }
 }
 
 /// Runs both live streams through a real system suspend and asserts both
@@ -451,9 +486,7 @@ fn suspend_resume() {
         "the machine never resumed within 60 s"
     );
     let live = streams.both_live(now, Duration::from_secs(1));
-    let (capture_rebuilds, playback_rebuilds) =
-        (streams.capture_rebuilds, streams.playback_rebuilds);
-    streams.finish();
+    let (capture_rebuilds, playback_rebuilds) = streams.finish();
     assert!(
         live,
         "streams did not recover after resume (rebuilds: capture {capture_rebuilds}, \

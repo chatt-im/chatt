@@ -78,7 +78,7 @@ use crate::audio::{AudioErrorKind, DeviceIdentityProbe};
 use audio_diagnostics::AudioDiagnostics;
 use audio_supervisor::{
     AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, CAPTURE_STALL,
-    PLAYBACK_STALL, RebuildCause, StreamProgressWatch,
+    PLAYBACK_STALL, RebuildTrigger, StreamProgressWatch, rebuild_restarts_paired_stream,
 };
 use commands::slash_command_help;
 pub(crate) use join::{JoinOwner, JoinStart};
@@ -7261,8 +7261,9 @@ impl App {
             .pending_audio_apply
             .as_ref()
             .is_some_and(|pending| pending.capture);
-        if !apply_owns_restart && let Some(cause) = self.supervisor.capture.take_due_rebuild(now) {
-            self.recover_capture_stream(now, cause);
+        if !apply_owns_restart && let Some(trigger) = self.supervisor.capture.take_due_rebuild(now)
+        {
+            self.recover_capture_stream(now, trigger);
             dirty = true;
         }
         let Some(capture) = &self.capture else {
@@ -7333,8 +7334,9 @@ impl App {
             .pending_audio_apply
             .as_ref()
             .is_some_and(|pending| pending.playback);
-        if !apply_owns_restart && let Some(cause) = self.supervisor.playback.take_due_rebuild(now) {
-            self.recover_playback_stream(now, cause);
+        if !apply_owns_restart && let Some(trigger) = self.supervisor.playback.take_due_rebuild(now)
+        {
+            self.recover_playback_stream(now, trigger);
             dirty = true;
         }
         let Some(playback) = &self.playback else {
@@ -7534,8 +7536,13 @@ impl App {
         }
     }
 
-    fn recover_capture_stream(&mut self, now: Instant, cause: RebuildCause) {
-        kvlog::warn!("recovering capture stream", cause = cause.label());
+    fn recover_capture_stream(&mut self, now: Instant, trigger: RebuildTrigger) {
+        let cause = trigger.cause;
+        kvlog::warn!(
+            "recovering capture stream",
+            cause = cause.label(),
+            kind = trigger.kind.map_or("none", AudioErrorKind::label)
+        );
         self.note_audio_event(
             now,
             AudioDeviceEventKind::RebuildStarted,
@@ -7573,16 +7580,23 @@ impl App {
                     .on_rebuild_failed(now, error.kind, error.message);
             }
         }
-        // Restart the paired stream so the echo canceller's render reference is
-        // rebuilt alongside capture, and an AirPods profile flip that changed
-        // both directions converges in one pass.
-        if self.voice_tx_enabled.load(Ordering::Relaxed) && self.supervisor.playback.is_healthy() {
+        // A device transition (an AirPods profile flip) can break both
+        // directions; restart playback too so it converges in one pass.
+        if rebuild_restarts_paired_stream(trigger)
+            && self.voice_tx_enabled.load(Ordering::Relaxed)
+            && self.supervisor.playback.is_healthy()
+        {
             self.restart_playback_stream();
         }
     }
 
-    fn recover_playback_stream(&mut self, now: Instant, cause: RebuildCause) {
-        kvlog::warn!("recovering playback stream", cause = cause.label());
+    fn recover_playback_stream(&mut self, now: Instant, trigger: RebuildTrigger) {
+        let cause = trigger.cause;
+        kvlog::warn!(
+            "recovering playback stream",
+            cause = cause.label(),
+            kind = trigger.kind.map_or("none", AudioErrorKind::label)
+        );
         self.note_audio_event(
             now,
             AudioDeviceEventKind::RebuildStarted,
@@ -7595,7 +7609,12 @@ impl App {
                 .push(now, AudioDeviceEventKind::Recovered, "playback recovered");
             self.set_status("playback recovered");
         }
-        if self.capture_should_be_live() && self.supervisor.capture.is_healthy() {
+        // Same rule as capture recovery: only a device transition restarts
+        // the healthy mic.
+        if rebuild_restarts_paired_stream(trigger)
+            && self.capture_should_be_live()
+            && self.supervisor.capture.is_healthy()
+        {
             self.restart_capture_stream();
         }
     }

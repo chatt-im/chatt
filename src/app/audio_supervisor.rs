@@ -136,6 +136,31 @@ impl RebuildCause {
     }
 }
 
+/// Why a due rebuild fires: the scheduling cause plus the error kind that
+/// armed it, when an error did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RebuildTrigger {
+    pub(crate) cause: RebuildCause,
+    pub(crate) kind: Option<AudioErrorKind>,
+}
+
+/// Whether rebuilding one direction should also restart the other.
+///
+/// Only device and profile transitions (an AirPods A2DP/HFP flip, a default
+/// switch, a device that vanished or came back) can break both directions at
+/// once. A stall, a worker exit or a backend error on a device that still
+/// exists is local to its own stream, and restarting the healthy direction
+/// would only glitch it: a mic restart cuts the user's outgoing voice, and a
+/// playback restart drops every peer's jitter buffer. If a transition does
+/// show up only as a stall, the other direction's own progress watch still
+/// catches it.
+pub(crate) fn rebuild_restarts_paired_stream(trigger: RebuildTrigger) -> bool {
+    match trigger.cause {
+        RebuildCause::DefaultChanged | RebuildCause::DeviceReturned => true,
+        RebuildCause::StreamError => trigger.kind == Some(AudioErrorKind::DeviceGone),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryPhase {
     Healthy,
@@ -209,6 +234,10 @@ pub(crate) struct AudioStreamSupervisor {
     since: Option<Instant>,
     attempt: u32,
     last_error: Option<(AudioErrorKind, String)>,
+    /// Kind of the error that armed the current recovery, reported with the
+    /// rebuild. `DeviceGone` is sticky until the stream recovers, so a burst
+    /// of follow-up errors cannot hide that the device went away.
+    armed_kind: Option<AudioErrorKind>,
     /// The stream runs on the fallback default because the configured device
     /// was unavailable; a sighting of the configured device rebuilds back
     /// onto it.
@@ -242,6 +271,7 @@ impl AudioStreamSupervisor {
         if !kind.triggers_recovery() {
             return;
         }
+        self.note_armed_kind(kind);
         self.last_error = Some((kind, message));
         self.since = self.since.or(Some(now));
         match self.phase() {
@@ -286,6 +316,12 @@ impl AudioStreamSupervisor {
                 cause,
                 ..
             } => {
+                // A device transition outranks a plain stream error: it is
+                // what decides whether the paired stream restarts too.
+                let cause = match cause {
+                    RebuildCause::StreamError => RebuildCause::DefaultChanged,
+                    cause => cause,
+                };
                 self.phase = Some(RecoveryPhase::RebuildPending {
                     due: rearmed_due(now, DEFAULT_FOLLOW_DEBOUNCE, first_trigger),
                     first_trigger,
@@ -319,9 +355,6 @@ impl AudioStreamSupervisor {
         true
     }
 
-    /// Returns the cause when a rebuild should run now. The caller must
-    /// report the outcome through [`Self::on_rebuild_ok`] or
-    /// [`Self::on_rebuild_failed`].
     /// When [`Self::take_due_rebuild`] next has work, for tick scheduling.
     pub(crate) fn due_at(&self) -> Option<Instant> {
         match self.phase() {
@@ -333,7 +366,10 @@ impl AudioStreamSupervisor {
         }
     }
 
-    pub(crate) fn take_due_rebuild(&mut self, now: Instant) -> Option<RebuildCause> {
+    /// Returns the trigger when a rebuild should run now. The caller must
+    /// report the outcome through [`Self::on_rebuild_ok`] or
+    /// [`Self::on_rebuild_failed`].
+    pub(crate) fn take_due_rebuild(&mut self, now: Instant) -> Option<RebuildTrigger> {
         let cause = match self.phase() {
             RecoveryPhase::Healthy => return None,
             RecoveryPhase::RebuildPending { due, cause, .. } => {
@@ -356,7 +392,10 @@ impl AudioStreamSupervisor {
             }
         };
         self.phase = Some(RecoveryPhase::Healthy);
-        Some(cause)
+        Some(RebuildTrigger {
+            cause,
+            kind: self.armed_kind,
+        })
     }
 
     pub(crate) fn on_rebuild_ok(&mut self, _now: Instant) {
@@ -364,6 +403,7 @@ impl AudioStreamSupervisor {
         self.since = None;
         self.attempt = 0;
         self.last_error = None;
+        self.armed_kind = None;
     }
 
     pub(crate) fn on_rebuild_failed(
@@ -372,6 +412,9 @@ impl AudioStreamSupervisor {
         kind: AudioErrorKind,
         message: String,
     ) {
+        if kind == AudioErrorKind::DeviceGone {
+            self.note_armed_kind(kind);
+        }
         self.last_error = Some((kind, message));
         self.since = self.since.or(Some(now));
         self.attempt = self.attempt.saturating_add(1);
@@ -383,6 +426,12 @@ impl AudioStreamSupervisor {
             self.phase = Some(RecoveryPhase::BackoffRetry {
                 due: now + backoff_delay(self.attempt),
             });
+        }
+    }
+
+    fn note_armed_kind(&mut self, kind: AudioErrorKind) {
+        if self.armed_kind != Some(AudioErrorKind::DeviceGone) {
+            self.armed_kind = Some(kind);
         }
     }
 
@@ -497,6 +546,12 @@ mod tests {
         start + Duration::from_millis(ms)
     }
 
+    fn take_cause(supervisor: &mut AudioStreamSupervisor, now: Instant) -> Option<RebuildCause> {
+        supervisor
+            .take_due_rebuild(now)
+            .map(|trigger| trigger.cause)
+    }
+
     fn fail_transient(supervisor: &mut AudioStreamSupervisor, now: Instant) {
         supervisor.on_rebuild_failed(now, AudioErrorKind::Transient, "boom".to_string());
     }
@@ -506,12 +561,12 @@ mod tests {
         let start = Instant::now();
         let mut supervisor = AudioStreamSupervisor::default();
         supervisor.on_error(start, AudioErrorKind::Transient, "err".to_string());
-        assert_eq!(supervisor.take_due_rebuild(start), None);
+        assert_eq!(take_cause(&mut supervisor, start), None);
         assert_eq!(
-            supervisor.take_due_rebuild(at(start, 300)),
+            take_cause(&mut supervisor, at(start, 300)),
             Some(RebuildCause::StreamError)
         );
-        assert_eq!(supervisor.take_due_rebuild(at(start, 301)), None);
+        assert_eq!(take_cause(&mut supervisor, at(start, 301)), None);
     }
 
     #[test]
@@ -522,7 +577,7 @@ mod tests {
         supervisor.on_error(start, AudioErrorKind::RealtimeDenied, "rt".to_string());
         supervisor.on_error(start, AudioErrorKind::Rerouted, "moved".to_string());
         assert!(supervisor.is_healthy());
-        assert_eq!(supervisor.take_due_rebuild(at(start, 60_000)), None);
+        assert_eq!(take_cause(&mut supervisor, at(start, 60_000)), None);
     }
 
     #[test]
@@ -539,7 +594,7 @@ mod tests {
             delays.push(due.duration_since(now));
             now = due;
             assert_eq!(
-                supervisor.take_due_rebuild(now),
+                take_cause(&mut supervisor, now),
                 Some(RebuildCause::StreamError),
                 "retry must always fire"
             );
@@ -568,9 +623,9 @@ mod tests {
             supervisor.health().state,
             AudioHealthState::WaitingForDevice
         );
-        assert_eq!(supervisor.take_due_rebuild(at(start, 29_999)), None);
+        assert_eq!(take_cause(&mut supervisor, at(start, 29_999)), None);
         assert_eq!(
-            supervisor.take_due_rebuild(at(start, 30_000)),
+            take_cause(&mut supervisor, at(start, 30_000)),
             Some(RebuildCause::StreamError)
         );
     }
@@ -582,7 +637,7 @@ mod tests {
         supervisor.on_rebuild_failed(start, AudioErrorKind::DeviceGone, "gone".to_string());
         supervisor.on_target_device_seen(at(start, 500));
         assert_eq!(
-            supervisor.take_due_rebuild(at(start, 500)),
+            take_cause(&mut supervisor, at(start, 500)),
             Some(RebuildCause::DeviceReturned)
         );
     }
@@ -599,7 +654,7 @@ mod tests {
         );
         supervisor.on_target_device_seen(at(start, 20));
         assert_eq!(
-            supervisor.take_due_rebuild(at(start, 20)),
+            take_cause(&mut supervisor, at(start, 20)),
             Some(RebuildCause::DeviceReturned)
         );
     }
@@ -609,12 +664,12 @@ mod tests {
         let start = Instant::now();
         let mut supervisor = AudioStreamSupervisor::default();
         supervisor.on_target_device_seen(start);
-        assert_eq!(supervisor.take_due_rebuild(at(start, 60_000)), None);
+        assert_eq!(take_cause(&mut supervisor, at(start, 60_000)), None);
 
         supervisor.set_wants_configured_device(true);
         supervisor.on_target_device_seen(start);
         assert_eq!(
-            supervisor.take_due_rebuild(start),
+            take_cause(&mut supervisor, start),
             Some(RebuildCause::DeviceReturned)
         );
     }
@@ -624,12 +679,12 @@ mod tests {
         let start = Instant::now();
         let mut supervisor = AudioStreamSupervisor::default();
         supervisor.on_default_changed(start);
-        assert_eq!(supervisor.take_due_rebuild(at(start, 999)), None);
+        assert_eq!(take_cause(&mut supervisor, at(start, 999)), None);
         supervisor.on_default_changed(at(start, 800));
-        assert_eq!(supervisor.take_due_rebuild(at(start, 1_000)), None);
-        assert_eq!(supervisor.take_due_rebuild(at(start, 1_799)), None);
+        assert_eq!(take_cause(&mut supervisor, at(start, 1_000)), None);
+        assert_eq!(take_cause(&mut supervisor, at(start, 1_799)), None);
         assert_eq!(
-            supervisor.take_due_rebuild(at(start, 1_800)),
+            take_cause(&mut supervisor, at(start, 1_800)),
             Some(RebuildCause::DefaultChanged)
         );
     }
@@ -645,7 +700,7 @@ mod tests {
             supervisor.on_default_changed(now);
         }
         assert_eq!(
-            supervisor.take_due_rebuild(at(start, 3_000)),
+            take_cause(&mut supervisor, at(start, 3_000)),
             Some(RebuildCause::DefaultChanged),
             "the rebuild must fire at first_trigger + REBUILD_DEFER_CAP despite flapping"
         );
@@ -658,7 +713,7 @@ mod tests {
         supervisor.on_rebuild_failed(start, AudioErrorKind::DeviceGone, "gone".to_string());
         supervisor.on_default_changed(at(start, 100));
         assert_eq!(
-            supervisor.take_due_rebuild(at(start, 1_100)),
+            take_cause(&mut supervisor, at(start, 1_100)),
             Some(RebuildCause::DefaultChanged)
         );
     }
@@ -700,6 +755,114 @@ mod tests {
         supervisor.on_rebuild_ok(at(start, 20));
         assert!(supervisor.is_healthy());
         assert_eq!(supervisor.health().since, None);
+    }
+
+    #[test]
+    fn rebuild_reports_the_kind_that_armed_it() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::default();
+        supervisor.on_error(start, AudioErrorKind::ConfigInvalid, "invalid".to_string());
+        assert_eq!(
+            supervisor.take_due_rebuild(at(start, 300)),
+            Some(RebuildTrigger {
+                cause: RebuildCause::StreamError,
+                kind: Some(AudioErrorKind::ConfigInvalid),
+            })
+        );
+    }
+
+    #[test]
+    fn coalesced_errors_report_the_last_kind() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::default();
+        supervisor.on_error(start, AudioErrorKind::Transient, "stall".to_string());
+        supervisor.on_error(
+            at(start, 100),
+            AudioErrorKind::ConfigInvalid,
+            "x".to_string(),
+        );
+        let trigger = supervisor.take_due_rebuild(at(start, 400)).unwrap();
+        assert_eq!(trigger.kind, Some(AudioErrorKind::ConfigInvalid));
+    }
+
+    #[test]
+    fn device_gone_is_never_downgraded_by_a_later_error() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::default();
+        supervisor.on_error(start, AudioErrorKind::DeviceGone, "gone".to_string());
+        supervisor.on_error(
+            at(start, 100),
+            AudioErrorKind::Transient,
+            "stall".to_string(),
+        );
+        let trigger = supervisor.take_due_rebuild(at(start, 400)).unwrap();
+        assert_eq!(trigger.kind, Some(AudioErrorKind::DeviceGone));
+    }
+
+    #[test]
+    fn armed_kind_survives_backoff_and_clears_on_recovery() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::default();
+        supervisor.on_error(start, AudioErrorKind::DeviceGone, "gone".to_string());
+        supervisor.take_due_rebuild(at(start, 300)).unwrap();
+        fail_transient(&mut supervisor, at(start, 300));
+        assert_eq!(
+            supervisor.take_due_rebuild(at(start, 300)),
+            Some(RebuildTrigger {
+                cause: RebuildCause::StreamError,
+                kind: Some(AudioErrorKind::DeviceGone),
+            })
+        );
+        supervisor.on_rebuild_ok(at(start, 400));
+        supervisor.on_error(
+            at(start, 500),
+            AudioErrorKind::Transient,
+            "stall".to_string(),
+        );
+        let trigger = supervisor.take_due_rebuild(at(start, 800)).unwrap();
+        assert_eq!(trigger.kind, Some(AudioErrorKind::Transient));
+    }
+
+    #[test]
+    fn default_change_upgrades_a_pending_stream_error() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::default();
+        supervisor.on_error(start, AudioErrorKind::Transient, "stall".to_string());
+        supervisor.on_default_changed(at(start, 100));
+        assert_eq!(
+            take_cause(&mut supervisor, at(start, 1_100)),
+            Some(RebuildCause::DefaultChanged)
+        );
+    }
+
+    #[test]
+    fn only_device_transitions_restart_the_paired_stream() {
+        let kinds = [
+            None,
+            Some(AudioErrorKind::DeviceGone),
+            Some(AudioErrorKind::Transient),
+            Some(AudioErrorKind::Xrun),
+            Some(AudioErrorKind::RealtimeDenied),
+            Some(AudioErrorKind::Rerouted),
+            Some(AudioErrorKind::ConfigInvalid),
+        ];
+        for cause in [
+            RebuildCause::StreamError,
+            RebuildCause::DefaultChanged,
+            RebuildCause::DeviceReturned,
+        ] {
+            for kind in kinds {
+                let expected = match cause {
+                    RebuildCause::DefaultChanged | RebuildCause::DeviceReturned => true,
+                    RebuildCause::StreamError => kind == Some(AudioErrorKind::DeviceGone),
+                };
+                assert_eq!(
+                    rebuild_restarts_paired_stream(RebuildTrigger { cause, kind }),
+                    expected,
+                    "{cause:?} {kind:?}"
+                );
+            }
+        }
     }
 
     #[test]
