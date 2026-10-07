@@ -67,3 +67,7 @@ pub use sim::{
 #[cfg(test)]
 #[cfg(test)]
 mod test_support;
+
+/// TEST-ONLY HOOK (pre-ship review): see `lifecycle::review_open_hook`.
+#[cfg(test)]
+pub(crate) use lifecycle::review_open_hook;

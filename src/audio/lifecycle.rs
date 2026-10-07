@@ -887,6 +887,74 @@ fn open_with_config_fallbacks<T>(
     }
 }
 
+/// TEST-ONLY HOOK (added by the pre-ship review, `#[cfg(test)]` only).
+///
+/// While armed on the current thread, [`start_live_capture`] and
+/// [`start_live_playback`] fail with the configured error kind before
+/// touching any audio backend, and every attempt is recorded. Lets app-level
+/// tests observe which stream opens the recovery logic performs without real
+/// audio hardware. Disarmed by default, so no other test is affected.
+#[cfg(test)]
+pub(crate) mod review_open_hook {
+    use std::cell::RefCell;
+
+    use crate::audio::{AudioErrorKind, AudioStartError};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct OpenAttempt {
+        pub(crate) playback: bool,
+        pub(crate) device_id: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct State {
+        armed: bool,
+        kind: Option<AudioErrorKind>,
+        attempts: Vec<OpenAttempt>,
+    }
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+
+    /// Arms the hook on this thread: every live open fails with `kind`.
+    pub(crate) fn arm(kind: AudioErrorKind) {
+        STATE.with(|state| {
+            *state.borrow_mut() = State {
+                armed: true,
+                kind: Some(kind),
+                attempts: Vec::new(),
+            }
+        });
+    }
+
+    pub(crate) fn disarm() {
+        STATE.with(|state| *state.borrow_mut() = State::default());
+    }
+
+    /// Drains the attempts recorded so far.
+    pub(crate) fn take_attempts() -> Vec<OpenAttempt> {
+        STATE.with(|state| std::mem::take(&mut state.borrow_mut().attempts))
+    }
+
+    pub(super) fn intercept(playback: bool, device_id: Option<&str>) -> Option<AudioStartError> {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if !state.armed {
+                return None;
+            }
+            state.attempts.push(OpenAttempt {
+                playback,
+                device_id: device_id.map(str::to_string),
+            });
+            Some(AudioStartError::new(
+                state.kind.unwrap_or(AudioErrorKind::Transient),
+                "review open hook: audio disabled in test",
+            ))
+        })
+    }
+}
+
 pub fn start_live_capture<F>(
     config: LiveCaptureConfig,
     on_packet: F,
@@ -894,6 +962,10 @@ pub fn start_live_capture<F>(
 where
     F: FnMut(LocalVoiceFrame) + Send + 'static,
 {
+    #[cfg(test)]
+    if let Some(error) = review_open_hook::intercept(false, config.input_device_id.as_deref()) {
+        return Err(error);
+    }
     let (device, selection, backend) = with_audio_backend_stderr_suppressed(|| {
         let host = cpal::default_host();
         let backend = host.id().name();
@@ -1087,6 +1159,10 @@ pub fn start_playback(path: &Path, buffer_request: BufferRequest) -> Result<Play
 }
 
 pub fn start_live_playback(config: LivePlaybackConfig) -> Result<LivePlayback, AudioStartError> {
+    #[cfg(test)]
+    if let Some(error) = review_open_hook::intercept(true, config.output_device_id.as_deref()) {
+        return Err(error);
+    }
     let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
         LIVE_PLAYBACK_COMMAND_CAPACITY,
     ));

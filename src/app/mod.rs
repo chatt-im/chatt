@@ -18,6 +18,8 @@ pub(crate) mod server;
 mod server_catalog;
 mod shared;
 #[cfg(test)]
+mod audio_review_tests;
+#[cfg(test)]
 pub(crate) mod testing;
 
 use hashbrown::{HashMap, HashSet};
