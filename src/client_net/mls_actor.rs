@@ -988,15 +988,25 @@ impl Actor {
                         .remove(&welcome.descriptor.room_id);
                     self.pending_mls_rooms.remove(&welcome.descriptor.room_id);
                     installation.install_room(welcome.descriptor.clone())?;
-                    installation
+                    // The Welcome body is written by a peer and opaque to the
+                    // delivery service, so a bad one is a room problem, not a
+                    // session one. The cursor still advances past it below.
+                    if let Err(error) = installation
                         .client
                         .join_welcome(&welcome.descriptor, &welcome)
-                        .map_err(|error| {
-                            format!(
-                                "failed to join MLS Welcome for room {}: {error}",
-                                welcome.descriptor.room_id.0
-                            )
-                        })?;
+                    {
+                        kvlog::warn!(
+                            "failed to join MLS Welcome",
+                            room_id = welcome.descriptor.room_id.0,
+                            delivery_id = welcome.delivery_id,
+                            error = error.as_str(),
+                        );
+                        let _ = self.events.send(NetworkEvent::Status(format!(
+                            "Could not join encrypted room {} from its invitation: {error}",
+                            welcome.descriptor.room_id.0
+                        )));
+                        continue;
+                    }
                     fetches.push((welcome.descriptor.room_id, welcome.sequence));
                 }
                 installation.client.set_welcome_cursor(processed_head)?;
@@ -3732,7 +3742,6 @@ mod tests {
     /// put an undecryptable Welcome in a peer's inbox. One bad Welcome must
     /// not fail every future session of the recipient.
     #[test]
-    #[ignore = "BUG: an undecryptable peer-authored Welcome is session-fatal and never acknowledged → recipient stuck in a reconnect loop — see review"]
     fn review_undecryptable_welcome_is_not_session_fatal() {
         let temp = tempfile::tempdir().unwrap();
         let (bob, mut welcome, alice_id, bob_id) = review_welcome_for_bob(temp.path());
@@ -3767,6 +3776,10 @@ mod tests {
         assert!(
             first.is_ok(),
             "undecryptable welcome failed the session: {first:?} (welcome cursor stays {cursor}, so every reconnect re-fails)"
+        );
+        assert_eq!(
+            cursor, 1,
+            "the unreadable Welcome must still advance the cursor"
         );
     }
 }
