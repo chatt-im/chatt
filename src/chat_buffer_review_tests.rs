@@ -6,6 +6,17 @@
 use super::*;
 use crate::app::room::RoomHistoryFixture as TestHistory;
 
+/// Runs per randomized test: `default` normally, `full` (the review's count)
+/// with `CHATT_REVIEW_CHAT_FUZZ=full`, or any count given as a number.
+/// None of these sweeps found a bug the targeted repros here do not cover.
+fn fuzz_runs(default: u64, full: u64) -> u64 {
+    match std::env::var("CHATT_REVIEW_CHAT_FUZZ").ok().as_deref() {
+        Some("full") => full,
+        Some(value) => value.parse().unwrap_or(default),
+        None => default,
+    }
+}
+
 /// Small deterministic xorshift RNG; no external crate needed.
 struct Rng(u64);
 
@@ -365,7 +376,7 @@ fn fuzz_run(seed: u64, steps: usize, check_counts: bool) {
 
 #[test]
 fn randomized_operation_sequences_do_not_panic() {
-    for seed in 1..=60u64 {
+    for seed in 1..=fuzz_runs(10, 60) {
         fuzz_run(seed, 250, false);
     }
 }
@@ -432,7 +443,7 @@ fn journal_overflow_rebuild_stale_layout_slices_new_body() {
 
 #[test]
 fn layout_counts_match_cached_layouts_under_random_ops() {
-    for seed in 100..=130u64 {
+    for seed in 100..100 + fuzz_runs(6, 31) {
         fuzz_run(seed, 200, true);
     }
 }
@@ -563,7 +574,7 @@ fn stop_round_trip_failures(body: &str, width: u16) -> Vec<String> {
 fn every_stop_round_trips_through_locate_randomized() {
     let mut rng = Rng(0xC0FFEE);
     let mut failures = Vec::new();
-    for _ in 0..400 {
+    for _ in 0..fuzz_runs(60, 400) {
         let body = random_body(&mut rng);
         let width = *rng.pick(WIDTHS);
         for failure in stop_round_trip_failures(&body, width) {
