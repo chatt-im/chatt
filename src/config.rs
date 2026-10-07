@@ -1939,6 +1939,37 @@ impl Config {
                 "audio bitrate-bps must be between 8000 and 96000",
             ));
         }
+        // Hand-edited values must stay within what the settings UI offers; the
+        // range checks also reject `inf` and NaN, which would silence the mic.
+        let (min_db, max_db) = crate::settings::MAX_AMPLIFICATION_DB_RANGE;
+        let suppressions = crate::settings::DENOISE_SUPPRESSIONS;
+        let releases = crate::settings::DENOISE_RELEASES;
+        for (name, value, min, max) in [
+            (
+                "max-amplification",
+                self.audio.max_amplification,
+                min_db,
+                max_db,
+            ),
+            (
+                "denoise-suppression",
+                self.audio.denoise_suppression,
+                suppressions[0],
+                suppressions[suppressions.len() - 1],
+            ),
+            (
+                "denoise-release",
+                self.audio.denoise_release,
+                releases[releases.len() - 1],
+                releases[0],
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                out.push(Diag::error(format!(
+                    "audio {name} must be between {min} and {max}"
+                )));
+            }
+        }
         if self.files.download_memory_mb == 0 {
             // Memory mode advertises that downloads are active but would reject
             // every non-empty file with a zero-sized ring, so reject it at load
@@ -4215,6 +4246,40 @@ media-transport = "tcp"
         tuning.neteq_base_minimum_delay = Duration::from_millis(1_200);
         let error = tuning.validate().unwrap_err();
         assert!(error.contains("neteq-base-minimum-delay-ms"));
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_non_finite_gain_and_denoise_settings() {
+        type Field = fn(&mut AudioConfig) -> &mut f32;
+        let fields: [(&str, Field, f32, f32); 3] = [
+            (
+                "max-amplification",
+                |audio| &mut audio.max_amplification,
+                -1.0,
+                31.0,
+            ),
+            (
+                "denoise-suppression",
+                |audio| &mut audio.denoise_suppression,
+                0.5,
+                3.5,
+            ),
+            (
+                "denoise-release",
+                |audio| &mut audio.denoise_release,
+                0.1,
+                1.5,
+            ),
+        ];
+        assert_eq!(validation_errors(&Config::default()), "");
+        for (name, field, below, above) in fields {
+            for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, below, above] {
+                let mut config = Config::default();
+                *field(&mut config.audio) = value;
+                let error = validation_errors(&config);
+                assert!(error.contains(name), "{name} = {value} accepted: {error:?}");
+            }
+        }
     }
 
     #[test]
