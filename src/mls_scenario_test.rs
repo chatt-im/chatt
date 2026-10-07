@@ -743,6 +743,7 @@ fn scenario_client_config(
         p2p_enabled: false,
         candidate_privacy: CandidatePrivacy::Disabled,
         prefer_ipv6: false,
+        reconnect_backoff_divisor: 1,
     })
 }
 

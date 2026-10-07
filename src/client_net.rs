@@ -364,6 +364,11 @@ pub struct ClientConfig {
     pub p2p_enabled: bool,
     pub candidate_privacy: crate::config::CandidatePrivacy,
     pub prefer_ipv6: bool,
+    /// Test-only: divides every reconnect backoff delay so live tests that
+    /// end sessions on purpose need not sit out the production 1 s/2 s/5 s
+    /// schedule. `1` (or `0`) keeps the production schedule.
+    #[cfg(test)]
+    pub reconnect_backoff_divisor: u32,
 }
 
 /// The resolved per-room download policy the worker enforces at receive time.
@@ -1557,7 +1562,12 @@ fn run_worker(
         tcp_addr = %config.tcp_addr,
         udp_addr = %config.udp_addr
     );
+    #[cfg_attr(not(test), allow(unused_mut))]
     let mut reconnect = ReconnectSchedule::new();
+    #[cfg(test)]
+    {
+        reconnect.divisor = config.reconnect_backoff_divisor;
+    }
     let mut pending_authenticated_commands = VecDeque::new();
     // The user's P2P preference outlives each session: a runtime
     // `SetP2pEnabled` must still hold for every later `StartSession`.
@@ -2110,6 +2120,9 @@ where
 #[derive(Clone, Copy, Debug, Default)]
 struct ReconnectSchedule {
     attempts: u32,
+    /// See [`ClientConfig::reconnect_backoff_divisor`].
+    #[cfg(test)]
+    divisor: u32,
 }
 
 impl ReconnectSchedule {
@@ -2123,11 +2136,14 @@ impl ReconnectSchedule {
 
     fn next_delay(&mut self) -> Duration {
         self.attempts = self.attempts.saturating_add(1);
-        match self.attempts {
+        let delay = match self.attempts {
             1..=5 => Duration::from_secs(1),
             6..=10 => Duration::from_secs(2),
             _ => Duration::from_secs(5),
-        }
+        };
+        #[cfg(test)]
+        let delay = delay / self.divisor.max(1);
+        delay
     }
 }
 
@@ -7409,6 +7425,7 @@ mod tests {
             p2p_enabled: false,
             candidate_privacy: CandidatePrivacy::Disabled,
             prefer_ipv6: false,
+            reconnect_backoff_divisor: 1,
         }
     }
 

@@ -38,6 +38,12 @@ const ALICE_TOKEN: &str = "mls-matrix-alice";
 const BOB_TOKEN: &str = "mls-matrix-bob";
 const CAROL_TOKEN: &str = "mls-matrix-carol";
 const PUBLIC_ROOM: RoomId = RoomId(1);
+/// Live clients here reconnect on 1/20 of the production backoff (50 ms
+/// instead of 1 s, ...): several tests end sessions on purpose (revocation,
+/// a severed proxy) and only care that the client comes back, not when.
+/// `review_reconnect_after_post_handshake_drop_is_rate_limited` restores the
+/// production schedule because the schedule is what it checks.
+const FAST_RECONNECT_BACKOFF_DIVISOR: u32 = 20;
 const GROUP_ROOM: RoomId = RoomId(2);
 const LINKED_MATRIX_LOG: &str = "/tmp/chatt-e2e-matrix.kvlog";
 
@@ -330,6 +336,7 @@ fn config(addrs: &Addrs, root: &Path, name: &str, token: &str, receive: bool) ->
         p2p_enabled: false,
         candidate_privacy: CandidatePrivacy::Disabled,
         prefer_ipv6: false,
+        reconnect_backoff_divisor: FAST_RECONNECT_BACKOFF_DIVISOR,
     }
 }
 
@@ -2617,6 +2624,7 @@ mod client_net_review {
         let proxy = HandshakeThenCloseProxy::spawn(&addrs.tcp);
         let mut bob_config = config(&addrs, &root, "review-hot-Bob", BOB_TOKEN, false);
         bob_config.tcp_addr = proxy.addr.clone();
+        bob_config.reconnect_backoff_divisor = 1;
         let bob = spawn(bob_config);
 
         let events = drain_for(&bob, Duration::from_secs(3));

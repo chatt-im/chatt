@@ -122,6 +122,7 @@ fn client_config(
         media_transport: crate::config::MediaTransportSetting::Auto,
         p2p_enabled: false,
         prefer_ipv6: false,
+        reconnect_backoff_divisor: 1,
     }
 }
 

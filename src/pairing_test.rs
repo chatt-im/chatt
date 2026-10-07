@@ -122,6 +122,7 @@ fn client_config(tcp_addr: &str, udp_addr: &str, root: &Path, pinned: bool) -> C
         p2p_enabled: false,
         candidate_privacy: CandidatePrivacy::Disabled,
         prefer_ipv6: false,
+        reconnect_backoff_divisor: 1,
     }
 }
 

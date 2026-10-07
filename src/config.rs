@@ -211,6 +211,8 @@ impl ServerEntry {
             p2p_enabled: config.p2p.enabled,
             candidate_privacy: config.p2p.candidate_privacy,
             prefer_ipv6: config.p2p.prefer_ipv6,
+            #[cfg(test)]
+            reconnect_backoff_divisor: 1,
         }
     }
 
