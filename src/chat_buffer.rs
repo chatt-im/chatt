@@ -1830,6 +1830,11 @@ impl ChatViewport {
             match previous.remove(&id) {
                 Some((mut entry, lines)) => {
                     entry.has_refs = has_refs;
+                    // An unseen body change would leave the layout's byte
+                    // ranges slicing the new body.
+                    if remeasure {
+                        entry.invalidate_layout();
+                    }
                     entries.push(entry);
                     line_counts.push(lines);
                 }
@@ -3815,6 +3820,8 @@ impl ChatViewport {
         // single blank line and let the following reconcile drop it.
         let Some(record) = history.record(id) else {
             let msg = &mut self.entries[idx];
+            // A layout kept from the live body would slice the empty one.
+            msg.invalidate_layout();
             let layout = msg.layout_mut();
             layout.ensure(width, "", &[], syntax);
             return layout.lines().max(1);

@@ -378,7 +378,6 @@ fn randomized_operation_sequences_do_not_panic() {
 /// dropped and re-laid fresh, and the renderer indexes rows that no longer
 /// exist.
 #[test]
-#[ignore = "BUG: journal-overflow rebuild keeps stale MessageLayout of edited bodies — see review"]
 fn journal_overflow_rebuild_does_not_keep_stale_layout_of_edited_body() {
     let mut history = TestHistory::new();
     let tall = (0..12)
@@ -411,7 +410,6 @@ fn journal_overflow_rebuild_does_not_keep_stale_layout_of_edited_body() {
 /// Same root cause, but the stale layout is read directly against the new
 /// body, which panics on a byte slice past the end.
 #[test]
-#[ignore = "BUG: journal-overflow rebuild keeps stale MessageLayout of edited bodies — see review"]
 fn journal_overflow_rebuild_stale_layout_slices_new_body() {
     let mut history = TestHistory::new();
     history.push(1, "alice", "a fairly long first body that wraps");
@@ -445,7 +443,6 @@ fn layout_counts_match_cached_layouts_under_random_ops() {
 /// Production syncs before dispatch and render under one lock, so this is
 /// defensive only.
 #[test]
-#[ignore = "BUG: ensure_lines(\"\") keeps a cached layout for a vanished record — see review"]
 fn vanished_record_with_cached_layout_does_not_slice_empty_body() {
     let mut history = TestHistory::new();
     for id in 1..=3 {
