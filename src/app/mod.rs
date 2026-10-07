@@ -620,6 +620,11 @@ struct SupervisorState {
     playback: AudioStreamSupervisor,
     capture_watch: CaptureWatch,
     playback_watch: PlaybackWatch,
+    /// The `supervise` pass (its `now`) that last rebuilt each direction, so
+    /// one device transition seen by both directions in the same pass does
+    /// not restart either of them twice.
+    capture_rebuilt_at: Option<Instant>,
+    playback_rebuilt_at: Option<Instant>,
     device_probe: DeviceProbeState,
 }
 
@@ -7591,6 +7596,7 @@ impl App {
             AudioDeviceEventKind::RebuildStarted,
             format!("mic rebuild ({})", cause.label()),
         );
+        self.supervisor.capture_rebuilt_at = Some(now);
         match self.restart_capture_stream_inner() {
             Ok(restarted) => {
                 self.supervisor.capture.on_rebuild_ok(now);
@@ -7628,7 +7634,9 @@ impl App {
         if rebuild_restarts_paired_stream(trigger)
             && self.voice_tx_enabled.load(Ordering::Relaxed)
             && self.supervisor.playback.is_healthy()
+            && self.supervisor.playback_rebuilt_at != Some(now)
         {
+            self.supervisor.playback_rebuilt_at = Some(now);
             self.restart_playback_stream();
         }
     }
@@ -7656,6 +7664,7 @@ impl App {
             AudioDeviceEventKind::RebuildStarted,
             format!("spk rebuild ({})", cause.label()),
         );
+        self.supervisor.playback_rebuilt_at = Some(now);
         self.restart_playback_stream();
         if self.playback.is_some() {
             self.supervisor.playback_watch = PlaybackWatch::default();
@@ -7664,11 +7673,13 @@ impl App {
             self.set_status("playback recovered");
         }
         // Same rule as capture recovery: only a device transition restarts
-        // the healthy mic.
+        // the healthy mic, and not when this pass already rebuilt it.
         if rebuild_restarts_paired_stream(trigger)
             && self.capture_should_be_live()
             && self.supervisor.capture.is_healthy()
+            && self.supervisor.capture_rebuilt_at != Some(now)
         {
+            self.supervisor.capture_rebuilt_at = Some(now);
             self.restart_capture_stream();
         }
     }

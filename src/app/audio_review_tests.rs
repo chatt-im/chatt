@@ -327,9 +327,9 @@ fn a_stream_that_never_calls_back_backs_off() {
 /// paired playback restart because playback is still pending. Then playback
 /// rebuilds and, since capture is now healthy, its paired restart restarts
 /// capture a second time in the same tick. Mirrors `recover_capture_stream` /
-/// `recover_playback_stream` predicates (`is_healthy()` of the other side).
+/// `recover_playback_stream` predicates (`is_healthy()` of the other side, and
+/// whether this pass already rebuilt it).
 #[test]
-#[ignore = "BUG: simultaneous default change restarts capture twice in one tick — see review"]
 fn simultaneous_default_change_restarts_each_stream_once() {
     let start = Instant::now();
     let mut capture = AudioStreamSupervisor::default();
@@ -340,11 +340,18 @@ fn simultaneous_default_change_restarts_each_stream_once() {
 
     let mut capture_restarts = 0;
     let mut playback_restarts = 0;
+    let mut capture_rebuilt_this_pass = false;
+    let mut playback_rebuilt_this_pass = false;
     // supervise_capture → recover_capture_stream
     if let Some(trigger) = capture.take_due_rebuild(now) {
+        capture_rebuilt_this_pass = true;
         capture_restarts += 1;
         capture.on_rebuild_ok(now);
-        if rebuild_restarts_paired_stream(trigger) && playback.is_healthy() {
+        if rebuild_restarts_paired_stream(trigger)
+            && playback.is_healthy()
+            && !playback_rebuilt_this_pass
+        {
+            playback_rebuilt_this_pass = true;
             playback_restarts += 1;
             playback.on_rebuild_ok(now);
         }
@@ -352,9 +359,13 @@ fn simultaneous_default_change_restarts_each_stream_once() {
     // supervise_playback → recover_playback_stream
     if let Some(trigger) = playback.take_due_rebuild(now) {
         assert_eq!(trigger.action, RecoveryAction::FullRebuild);
+        assert!(!playback_rebuilt_this_pass);
         playback_restarts += 1;
         playback.on_rebuild_ok(now);
-        if rebuild_restarts_paired_stream(trigger) && capture.is_healthy() {
+        if rebuild_restarts_paired_stream(trigger)
+            && capture.is_healthy()
+            && !capture_rebuilt_this_pass
+        {
             // restart_capture_stream
             capture_restarts += 1;
             capture.reset();
