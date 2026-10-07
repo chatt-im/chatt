@@ -15,9 +15,11 @@ use chatt_message_format::{
 };
 
 /// Wrapped body lines beyond this collapse a lone message behind an expander.
-const COLLAPSE_LIMIT: usize = 12;
+const COLLAPSE_LIMIT: usize = 40;
 /// Body lines shown while a long message is collapsed.
-const COLLAPSE_SHOW: usize = 10;
+const COLLAPSE_SHOW: usize = 30;
+/// Body lines a block of grouped messages may reach before a new heading starts.
+const GROUP_BLOCK_LIMIT: usize = 12;
 /// Maximum gap between adjacent same-sender messages that still groups them.
 const GROUP_GAP_MS: u64 = 90_000;
 
@@ -170,7 +172,7 @@ mod viewport_tests {
     #[test]
     fn grouping_and_collapse_layout_remain_view_local() {
         let mut history = TestHistory::new();
-        history.push(1, "alice", &"line\n".repeat(14));
+        history.push(1, "alice", &"line\n".repeat(44));
         let mut first = ChatViewport::new(SyntaxTheme::default());
         let mut second = ChatViewport::new(SyntaxTheme::default());
         first.reconcile(&history.history());
@@ -185,12 +187,12 @@ mod viewport_tests {
     #[test]
     fn notices_start_expanded_and_messages_start_collapsed() {
         let mut history = TestHistory::new();
-        let body = "line\n".repeat(14);
+        let body = "line\n".repeat(44);
         history.push(1, "alice", &body);
         history.notice(&body, false);
         let mut viewport = ChatViewport::new(SyntaxTheme::default());
         viewport.reconcile(&history.history());
-        viewport.visible_lines(&history.history(), 40, 40, 0);
+        viewport.visible_lines(&history.history(), 40, 100, 0);
         assert!(viewport.is_collapsed(0), "a long message still collapses");
         assert!(viewport.is_expanded(1), "a long notice opens on arrival");
     }
@@ -198,7 +200,7 @@ mod viewport_tests {
     #[test]
     fn an_expanded_notice_still_toggles_closed() {
         let mut history = TestHistory::new();
-        history.notice(&"line\n".repeat(14), false);
+        history.notice(&"line\n".repeat(44), false);
         let mut viewport = ChatViewport::new(SyntaxTheme::default());
         viewport.reconcile(&history.history());
         viewport.visible_lines(&history.history(), 40, 40, 0);
@@ -210,7 +212,7 @@ mod viewport_tests {
     #[test]
     fn explicit_fold_state_is_idempotent_and_expand_all_only_affects_current_entries() {
         let mut history = TestHistory::new();
-        let long = (0..20)
+        let long = (0..50)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -843,14 +845,14 @@ mod viewport_tests {
 
     #[test]
     fn collapse_clamps_cursor_into_preview() {
-        let body = (0..30)
+        let body = (0..60)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
         let (history, mut viewport) = viewport_with(&[&body]);
         assert!(viewport.toggle_expand(&history.history(), 0, 40));
-        step(&mut viewport, &history, ChatMotion::Down(25), 40);
-        assert_eq!(viewport.cursor_row(&history.history(), 40), Some(25));
+        step(&mut viewport, &history, ChatMotion::Down(50), 40);
+        assert_eq!(viewport.cursor_row(&history.history(), 40), Some(50));
         assert!(viewport.toggle_expand(&history.history(), 0, 40));
         assert_eq!(
             viewport.cursor_row(&history.history(), 40),
@@ -860,7 +862,7 @@ mod viewport_tests {
 
     #[test]
     fn yank_omits_text_hidden_by_collapse() {
-        let body = (0..30)
+        let body = (0..60)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -4060,7 +4062,7 @@ impl ChatViewport {
         let mut total = 0usize;
         for message in run_start..=run_end {
             let lines = line_counts[message];
-            if total > 0 && total + lines > COLLAPSE_LIMIT {
+            if total > 0 && total + lines > GROUP_BLOCK_LIMIT {
                 blocks.push(Block {
                     first: start,
                     last: message - 1,

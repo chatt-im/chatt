@@ -4941,7 +4941,10 @@ mod tests {
             1,
             UserId(2),
             1,
-            "```\n0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n```",
+            format!(
+                "```\n{}```",
+                (0..44).map(|line| format!("{line}\n")).collect::<String>()
+            ),
         );
 
         let mut buffer = Buffer::new(80, 24);
@@ -4957,7 +4960,7 @@ mod tests {
     fn vim_fold_chords_open_close_toggle_and_open_all() {
         let mut app = test_app();
         let mut room = RoomMode::with_focus(ChatPanelFocus::ChatLog);
-        let long = (0..20)
+        let long = (0..50)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -5105,7 +5108,7 @@ mod tests {
         // the viewport once the long message collapses.
         let long_body = format!(
             "```\n{}\n```",
-            (0..17).fold(String::new(), |mut acc, n| {
+            (0..47).fold(String::new(), |mut acc, n| {
                 use std::fmt::Write;
                 let _ = writeln!(acc, "line {n}");
                 acc
