@@ -48,6 +48,10 @@ impl HistoryEntryId {
 }
 
 #[cfg(test)]
+#[path = "chat_buffer_review_tests.rs"]
+mod review_tests;
+
+#[cfg(test)]
 mod viewport_tests {
     use super::*;
     use crate::app::room::RoomHistoryFixture as TestHistory;
