@@ -662,9 +662,11 @@ impl LiveDecodeStreams {
     /// its last control sent first so it never renders a block unmuted.
     ///
     /// Stops the old mixer never drained can no longer be acked, so the
-    /// retiring handles are released here (the old mixer's clones drop with
-    /// its stream, off any callback) and the stop ordinal restarts from the
-    /// shared ack counter.
+    /// retiring handles are released here and the stop ordinal restarts from
+    /// the shared ack counter. Both rely on the old stream being fully torn
+    /// down, so its mixer's clones dropped off any callback and it can never
+    /// ack again: [`crate::audio::LivePlayback::reopen_output`] fails rather
+    /// than attach when that teardown overran.
     pub(crate) fn attach_mixer(&mut self, mixer_events: &SpscSwapQueue<LivePlaybackMixerEvent>) {
         self.mixer_streams.clear();
         for stream in self.streams.values_mut() {

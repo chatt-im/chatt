@@ -37,8 +37,8 @@ use std::{
 use rpc::control::VoiceState;
 
 use crate::app::audio_supervisor::{
-    CAPTURE_STALL, PLAYBACK_STALL, RebuildCause, RebuildTrigger, StreamProgressWatch,
-    rebuild_restarts_paired_stream,
+    CAPTURE_STALL, PLAYBACK_STALL, RebuildCause, RebuildTrigger, RecoveryAction,
+    StreamProgressWatch, rebuild_restarts_paired_stream,
 };
 use crate::audio::{
     AtomicVoiceState, AudioErrorKind, AudioReportHub, BufferRequest, DenoiseConfig,
@@ -323,6 +323,7 @@ impl SupervisedStreams {
                 rebuild_restarts_paired_stream(RebuildTrigger {
                     cause: RebuildCause::StreamError,
                     kind: Some(kind),
+                    action: RecoveryAction::FullRebuild,
                 })
             })
         };

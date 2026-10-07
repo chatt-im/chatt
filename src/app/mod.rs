@@ -78,7 +78,8 @@ use crate::audio::{AudioErrorKind, DeviceIdentityProbe};
 use audio_diagnostics::AudioDiagnostics;
 use audio_supervisor::{
     AudioDeviceEventKind, AudioEventLog, AudioHealthState, AudioStreamSupervisor, CAPTURE_STALL,
-    PLAYBACK_STALL, RebuildTrigger, StreamProgressWatch, rebuild_restarts_paired_stream,
+    PLAYBACK_STALL, RebuildTrigger, RecoveryAction, StreamProgressWatch,
+    rebuild_restarts_paired_stream,
 };
 use commands::slash_command_help;
 pub(crate) use join::{JoinOwner, JoinStart};
@@ -1653,7 +1654,10 @@ impl App {
             open_e2e_reviews: HashMap::new(),
             pending_mutation_clients: HashMap::new(),
             pending_room_catalog_save: None,
-            supervisor: SupervisorState::default(),
+            supervisor: SupervisorState {
+                playback: AudioStreamSupervisor::with_output_swap(),
+                ..SupervisorState::default()
+            },
             audio_events: AudioEventLog::default(),
             web_feed,
             video_fanout,
@@ -7590,7 +7594,7 @@ impl App {
         }
     }
 
-    fn recover_playback_stream(&mut self, now: Instant, trigger: RebuildTrigger) {
+    fn recover_playback_stream(&mut self, now: Instant, mut trigger: RebuildTrigger) {
         let cause = trigger.cause;
         kvlog::warn!(
             "recovering playback stream",
@@ -7599,8 +7603,14 @@ impl App {
         );
         // A failure local to the output device only needs a new output
         // stream; the decode worker and every peer's jitter buffer survive.
-        if !rebuild_restarts_paired_stream(trigger) && self.swap_playback_output(now) {
-            return;
+        // A swap with nothing to act on (no playback, or the decode worker
+        // exited) is not the output's fault and does not escalate.
+        if trigger.action == RecoveryAction::SwapOutput {
+            match self.swap_playback_output(now) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(kind) => trigger = self.supervisor.playback.on_swap_failed(trigger, kind),
+            }
         }
         self.note_audio_event(
             now,
@@ -7624,15 +7634,20 @@ impl App {
         }
     }
 
-    /// Replaces only the playback output stream. Returns false when there is
-    /// no playback to swap or the swap failed, and the caller must rebuild.
-    fn swap_playback_output(&mut self, now: Instant) -> bool {
-        if self.playback.is_none() {
-            return false;
+    /// Replaces only the playback output stream. Returns `Ok(false)` when
+    /// there is no live playback to swap, or the kind of the error the swap
+    /// failed with; either way the caller must rebuild.
+    fn swap_playback_output(&mut self, now: Instant) -> Result<bool, AudioErrorKind> {
+        if self
+            .playback
+            .as_ref()
+            .is_none_or(LivePlayback::worker_finished)
+        {
+            return Ok(false);
         }
         self.note_audio_event(now, AudioDeviceEventKind::RebuildStarted, "spk output swap");
         let Some(playback) = self.playback.as_mut() else {
-            return false;
+            return Ok(false);
         };
         let swapped = playback.reopen_output().map(|()| playback.stats());
         let snapshot = match swapped {
@@ -7648,7 +7663,7 @@ impl App {
                     AudioDeviceEventKind::StreamError,
                     format!("spk output swap failed: {}", error.message),
                 );
-                return false;
+                return Err(error.kind);
             }
         };
         // The snapshot outlives the swap, so start the watch from its current
@@ -7659,14 +7674,14 @@ impl App {
             backend_fatal_stream_errors: snapshot.backend_fatal_stream_errors,
             worker_finished: false,
         };
-        self.supervisor.playback.on_rebuild_ok(now);
+        self.supervisor.playback.on_swap_ok(now);
         self.note_audio_event(
             now,
             AudioDeviceEventKind::Recovered,
             "playback output swapped",
         );
         self.set_status("playback recovered");
-        true
+        Ok(true)
     }
 
     fn restart_capture_stream(&mut self) {

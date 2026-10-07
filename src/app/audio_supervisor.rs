@@ -41,6 +41,13 @@ pub(crate) const DEFAULT_FOLLOW_DEBOUNCE: Duration = Duration::from_secs(1);
 /// the rebuild forever.
 pub(crate) const REBUILD_DEFER_CAP: Duration = Duration::from_secs(3);
 
+/// A failure this soon after an output swap means the swap did not fix the
+/// problem, so recovery escalates to full rebuilds.
+pub(crate) const SWAP_PROBATION: Duration = Duration::from_secs(10);
+
+/// After this long without a failure, recovery tries a swap first again.
+pub(crate) const SWAP_LEVEL_RESET: Duration = Duration::from_secs(30);
+
 const AUDIO_EVENT_LOG_CAPACITY: usize = 32;
 
 /// How long a stream may go without a device callback before its progress
@@ -147,12 +154,23 @@ impl RebuildCause {
     }
 }
 
+/// How much of a stream a due rebuild replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryAction {
+    /// Replace only the playback output stream, keeping the decode worker
+    /// and every peer's jitter buffer.
+    SwapOutput,
+    /// Tear the whole stream down and start it again.
+    FullRebuild,
+}
+
 /// Why a due rebuild fires: the scheduling cause plus the error kind that
-/// armed it, when an error did.
+/// armed it, when an error did, and how far the rebuild should go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RebuildTrigger {
     pub(crate) cause: RebuildCause,
     pub(crate) kind: Option<AudioErrorKind>,
+    pub(crate) action: RecoveryAction,
 }
 
 /// Whether rebuilding one direction should also restart the other.
@@ -253,9 +271,26 @@ pub(crate) struct AudioStreamSupervisor {
     /// was unavailable; a sighting of the configured device rebuilds back
     /// onto it.
     wants_configured_device: bool,
+    /// The stream can recover by swapping only its output (playback).
+    swap_allowed: bool,
+    /// A recent swap did not hold, so failures rebuild fully until the stream
+    /// has gone [`SWAP_LEVEL_RESET`] without one.
+    escalated: bool,
+    last_swap_at: Option<Instant>,
+    last_failure_at: Option<Instant>,
 }
 
 impl AudioStreamSupervisor {
+    /// A supervisor whose stream-local failures first try
+    /// [`RecoveryAction::SwapOutput`], escalating to full rebuilds when a swap
+    /// does not hold.
+    pub(crate) fn with_output_swap() -> Self {
+        Self {
+            swap_allowed: true,
+            ..Self::default()
+        }
+    }
+
     fn phase(&self) -> RecoveryPhase {
         self.phase.unwrap_or(RecoveryPhase::Healthy)
     }
@@ -283,6 +318,7 @@ impl AudioStreamSupervisor {
             return;
         }
         self.note_armed_kind(kind);
+        self.note_failure(now);
         self.last_error = Some((kind, message));
         self.since = self.since.or(Some(now));
         match self.phase() {
@@ -381,32 +417,43 @@ impl AudioStreamSupervisor {
     /// report the outcome through [`Self::on_rebuild_ok`] or
     /// [`Self::on_rebuild_failed`].
     pub(crate) fn take_due_rebuild(&mut self, now: Instant) -> Option<RebuildTrigger> {
-        let cause = match self.phase() {
+        // Retries after a failed rebuild are always full: a swap only ever
+        // follows a fresh failure of a stream that was running.
+        let (cause, retry) = match self.phase() {
             RecoveryPhase::Healthy => return None,
             RecoveryPhase::RebuildPending { due, cause, .. } => {
                 if now < due {
                     return None;
                 }
-                cause
+                (cause, false)
             }
             RecoveryPhase::BackoffRetry { due } => {
                 if now < due {
                     return None;
                 }
-                RebuildCause::StreamError
+                (RebuildCause::StreamError, true)
             }
             RecoveryPhase::WaitingForDevice { next_probe } => {
                 if now < next_probe {
                     return None;
                 }
-                RebuildCause::StreamError
+                (RebuildCause::StreamError, true)
             }
         };
         self.phase = Some(RecoveryPhase::Healthy);
-        Some(RebuildTrigger {
+        let mut trigger = RebuildTrigger {
             cause,
             kind: self.armed_kind,
-        })
+            action: RecoveryAction::FullRebuild,
+        };
+        if self.swap_allowed
+            && !self.escalated
+            && !retry
+            && !rebuild_restarts_paired_stream(trigger)
+        {
+            trigger.action = RecoveryAction::SwapOutput;
+        }
+        Some(trigger)
     }
 
     pub(crate) fn on_rebuild_ok(&mut self, _now: Instant) {
@@ -415,6 +462,34 @@ impl AudioStreamSupervisor {
         self.attempt = 0;
         self.last_error = None;
         self.armed_kind = None;
+    }
+
+    /// A [`RecoveryAction::SwapOutput`] succeeded. A failure within
+    /// [`SWAP_PROBATION`] escalates to full rebuilds.
+    pub(crate) fn on_swap_ok(&mut self, now: Instant) {
+        self.on_rebuild_ok(now);
+        self.last_swap_at = Some(now);
+    }
+
+    /// A [`RecoveryAction::SwapOutput`] failed with `kind`. Returns the
+    /// trigger for the full rebuild the caller runs right away and reports;
+    /// later failures rebuild fully too until the stream has been stable for
+    /// [`SWAP_LEVEL_RESET`]. A swap that found the device gone has uncovered
+    /// a device transition, so the rebuild restarts the paired stream too.
+    pub(crate) fn on_swap_failed(
+        &mut self,
+        trigger: RebuildTrigger,
+        kind: AudioErrorKind,
+    ) -> RebuildTrigger {
+        self.escalated = true;
+        if kind == AudioErrorKind::DeviceGone {
+            self.note_armed_kind(kind);
+        }
+        RebuildTrigger {
+            kind: self.armed_kind.or(trigger.kind),
+            action: RecoveryAction::FullRebuild,
+            ..trigger
+        }
     }
 
     pub(crate) fn on_rebuild_failed(
@@ -446,10 +521,24 @@ impl AudioStreamSupervisor {
         }
     }
 
+    fn note_failure(&mut self, now: Instant) {
+        let since = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
+        if since(self.last_failure_at).is_some_and(|quiet| quiet >= SWAP_LEVEL_RESET) {
+            self.escalated = false;
+        }
+        if since(self.last_swap_at).is_some_and(|held| held < SWAP_PROBATION) {
+            self.escalated = true;
+        }
+        self.last_failure_at = Some(now);
+    }
+
     /// Manual reset: forget all recovery state, including the desire to move
     /// back to a configured device.
     pub(crate) fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            swap_allowed: self.swap_allowed,
+            ..Self::default()
+        };
     }
 
     pub(crate) fn health(&self) -> AudioHealth {
@@ -778,6 +867,7 @@ mod tests {
             Some(RebuildTrigger {
                 cause: RebuildCause::StreamError,
                 kind: Some(AudioErrorKind::ConfigInvalid),
+                action: RecoveryAction::FullRebuild,
             })
         );
     }
@@ -822,6 +912,7 @@ mod tests {
             Some(RebuildTrigger {
                 cause: RebuildCause::StreamError,
                 kind: Some(AudioErrorKind::DeviceGone),
+                action: RecoveryAction::FullRebuild,
             })
         );
         supervisor.on_rebuild_ok(at(start, 400));
@@ -867,8 +958,13 @@ mod tests {
                     RebuildCause::DefaultChanged | RebuildCause::DeviceReturned => true,
                     RebuildCause::StreamError => kind == Some(AudioErrorKind::DeviceGone),
                 };
+                let trigger = RebuildTrigger {
+                    cause,
+                    kind,
+                    action: RecoveryAction::FullRebuild,
+                };
                 assert_eq!(
-                    rebuild_restarts_paired_stream(RebuildTrigger { cause, kind }),
+                    rebuild_restarts_paired_stream(trigger),
                     expected,
                     "{cause:?} {kind:?}"
                 );
@@ -940,5 +1036,167 @@ mod tests {
         assert_eq!(entries.len(), AUDIO_EVENT_LOG_CAPACITY);
         assert_eq!(entries[0].detail, "event 39");
         assert_eq!(entries.last().unwrap().detail, "event 8");
+    }
+
+    fn take_action(supervisor: &mut AudioStreamSupervisor, now: Instant) -> Option<RecoveryAction> {
+        supervisor
+            .take_due_rebuild(now)
+            .map(|trigger| trigger.action)
+    }
+
+    fn stall(supervisor: &mut AudioStreamSupervisor, now: Instant) {
+        supervisor.on_error(now, AudioErrorKind::Transient, "stall".to_string());
+    }
+
+    #[test]
+    fn first_local_playback_failure_swaps_the_output() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        stall(&mut supervisor, start);
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 300)),
+            Some(RecoveryAction::SwapOutput)
+        );
+    }
+
+    #[test]
+    fn failure_within_probation_after_a_swap_rebuilds_fully() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        stall(&mut supervisor, start);
+        take_action(&mut supervisor, at(start, 300));
+        supervisor.on_swap_ok(at(start, 300));
+
+        stall(&mut supervisor, at(start, 5_300));
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 5_600)),
+            Some(RecoveryAction::FullRebuild)
+        );
+        supervisor.on_rebuild_ok(at(start, 5_600));
+        // Still escalated: the stream has not been quiet for the reset window.
+        stall(&mut supervisor, at(start, 20_000));
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 20_300)),
+            Some(RecoveryAction::FullRebuild)
+        );
+    }
+
+    #[test]
+    fn failure_after_probation_swaps_again() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        stall(&mut supervisor, start);
+        take_action(&mut supervisor, at(start, 300));
+        supervisor.on_swap_ok(at(start, 300));
+
+        stall(&mut supervisor, at(start, 10_300));
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 10_600)),
+            Some(RecoveryAction::SwapOutput)
+        );
+    }
+
+    #[test]
+    fn escalation_resets_after_a_quiet_period() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        stall(&mut supervisor, start);
+        take_action(&mut supervisor, at(start, 300));
+        supervisor.on_swap_ok(at(start, 300));
+        stall(&mut supervisor, at(start, 1_000));
+        take_action(&mut supervisor, at(start, 1_300));
+        supervisor.on_rebuild_ok(at(start, 1_300));
+
+        stall(&mut supervisor, at(start, 31_000));
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 31_300)),
+            Some(RecoveryAction::SwapOutput)
+        );
+    }
+
+    #[test]
+    fn failed_swap_escalates() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        stall(&mut supervisor, start);
+        let trigger = supervisor.take_due_rebuild(at(start, 300)).unwrap();
+        let rebuild = supervisor.on_swap_failed(trigger, AudioErrorKind::Transient);
+        assert_eq!(rebuild.action, RecoveryAction::FullRebuild);
+        assert!(!rebuild_restarts_paired_stream(rebuild));
+        supervisor.on_rebuild_ok(at(start, 300));
+
+        stall(&mut supervisor, at(start, 15_000));
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 15_300)),
+            Some(RecoveryAction::FullRebuild)
+        );
+    }
+
+    #[test]
+    fn swap_that_finds_the_device_gone_restarts_the_paired_stream() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        stall(&mut supervisor, start);
+        let trigger = supervisor.take_due_rebuild(at(start, 300)).unwrap();
+        assert_eq!(trigger.action, RecoveryAction::SwapOutput);
+        let rebuild = supervisor.on_swap_failed(trigger, AudioErrorKind::DeviceGone);
+        assert_eq!(rebuild.kind, Some(AudioErrorKind::DeviceGone));
+        assert!(rebuild_restarts_paired_stream(rebuild));
+
+        // Sticky until recovery, so a backoff retry still reports it.
+        fail_transient(&mut supervisor, at(start, 300));
+        let retry = supervisor.take_due_rebuild(at(start, 300)).unwrap();
+        assert_eq!(retry.kind, Some(AudioErrorKind::DeviceGone));
+    }
+
+    #[test]
+    fn device_transitions_always_rebuild_fully() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        supervisor.on_error(start, AudioErrorKind::DeviceGone, "gone".to_string());
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 300)),
+            Some(RecoveryAction::FullRebuild)
+        );
+        supervisor.on_rebuild_ok(at(start, 300));
+
+        supervisor.on_default_changed(at(start, 1_000));
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 2_000)),
+            Some(RecoveryAction::FullRebuild)
+        );
+    }
+
+    #[test]
+    fn backoff_retries_always_rebuild_fully() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::with_output_swap();
+        stall(&mut supervisor, start);
+        let trigger = supervisor.take_due_rebuild(at(start, 300)).unwrap();
+        supervisor.on_swap_failed(trigger, AudioErrorKind::Transient);
+        fail_transient(&mut supervisor, at(start, 300));
+        supervisor.reset();
+        // reset keeps the stream's ability to swap but not its escalation.
+        stall(&mut supervisor, at(start, 400));
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 700)),
+            Some(RecoveryAction::SwapOutput)
+        );
+        fail_transient(&mut supervisor, at(start, 700));
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 700)),
+            Some(RecoveryAction::FullRebuild)
+        );
+    }
+
+    #[test]
+    fn supervisor_without_output_swap_never_swaps() {
+        let start = Instant::now();
+        let mut supervisor = AudioStreamSupervisor::default();
+        stall(&mut supervisor, start);
+        assert_eq!(
+            take_action(&mut supervisor, at(start, 300)),
+            Some(RecoveryAction::FullRebuild)
+        );
     }
 }

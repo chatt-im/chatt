@@ -363,7 +363,8 @@ pub fn stalled_stream_teardowns() -> u64 {
 /// Runs `teardown` on a dedicated thread and waits at most
 /// [`STREAM_TEARDOWN_BUDGET`] for it. A teardown that overruns keeps running
 /// detached and is counted in [`stalled_stream_teardowns`] until it finishes.
-fn bounded_teardown(direction: &'static str, teardown: impl FnOnce() + Send + 'static) {
+/// Returns whether the teardown finished within the budget.
+fn bounded_teardown(direction: &'static str, teardown: impl FnOnce() + Send + 'static) -> bool {
     const RUNNING: u8 = 0;
     const DONE: u8 = 1;
     const ABANDONED: u8 = 2;
@@ -395,10 +396,11 @@ fn bounded_teardown(direction: &'static str, teardown: impl FnOnce() + Send + 's
             direction,
             error = error.to_string().as_str()
         );
-        return;
+        // The failed spawn dropped `teardown`, and with it the stream, inline.
+        return true;
     }
     if done_rx.recv_timeout(STREAM_TEARDOWN_BUDGET).is_ok() {
-        return;
+        return true;
     }
     // Count before abandoning, so the late finisher's decrement (which only
     // happens after it sees ABANDONED) can never run first.
@@ -409,13 +411,14 @@ fn bounded_teardown(direction: &'static str, teardown: impl FnOnce() + Send + 's
     {
         // Finished just after the timeout.
         STALLED_TEARDOWNS.fetch_sub(1, Ordering::Relaxed);
-        return;
+        return true;
     }
     kvlog::warn!(
         "audio stream teardown stalled in the backend; continuing without it",
         direction,
         budget_ms = STREAM_TEARDOWN_BUDGET.as_millis() as u64
     );
+    false
 }
 
 impl LivePlayback {
@@ -516,9 +519,16 @@ impl LivePlayback {
         if self.worker_finished() {
             return Err(AudioStartError::transient("live playback decoder exited"));
         }
-        // Release the old device before the new stream opens it again.
-        if let Some(stream) = self.stream.take() {
-            bounded_teardown("playback", move || drop(stream));
+        // Release the old device before the new stream opens it again. A
+        // teardown still running may fire the old callback again, which would
+        // drain stops and bump the counters the new mixer shares, so only a
+        // full rebuild with fresh shared state is safe after one.
+        if let Some(stream) = self.stream.take()
+            && !bounded_teardown("playback", move || drop(stream))
+        {
+            return Err(AudioStartError::transient(
+                "old playback output did not shut down in time",
+            ));
         }
         let mixer_events = Arc::new(SpscSwapQueue::<LivePlaybackMixerEvent>::with_capacity(
             LIVE_PLAYBACK_COMMAND_CAPACITY,
