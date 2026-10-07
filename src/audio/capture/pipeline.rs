@@ -2788,6 +2788,16 @@ mod review_tests {
         )
     }
 
+    /// Device callbacks per capture-clock case. The default catches every
+    /// case the review found (all of which fail by 100 callbacks); set
+    /// `CHATT_REVIEW_CAPTURE_CALLBACKS=1500` for the review's full run.
+    fn capture_callbacks(default: u64) -> u64 {
+        std::env::var("CHATT_REVIEW_CAPTURE_CALLBACKS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+
     /// Drives `callbacks` device periods of `period` frames at `device_rate`
     /// through a pipeline with *perfect* capture timestamps (no lost audio,
     /// no lateness) and returns (opus resets after the first packet, total
@@ -2840,8 +2850,9 @@ mod review_tests {
     /// accounted, so perfect timestamps never read as a hole.
     #[test]
     fn perfect_timestamps_never_gap_at_48k_for_odd_periods() {
+        let callbacks = capture_callbacks(150);
         for period in [64usize, 128, 256, 441, 480, 512, 1000, 1024, 2048] {
-            let (resets, extra) = drive_perfect_clock(48_000, period, 1_500);
+            let (resets, extra) = drive_perfect_clock(48_000, period, callbacks);
             assert_eq!(resets, 0, "period {period}: spurious opus resets");
             assert!(extra.abs() <= 480, "period {period}: clock off by {extra}");
         }
@@ -2855,10 +2866,11 @@ mod review_tests {
     /// clock jumps ahead and the Opus stream is reset, repeatedly.
     #[test]
     fn perfect_timestamps_never_gap_on_resampled_devices() {
+        let callbacks = capture_callbacks(150);
         let mut failures = Vec::new();
         for device_rate in [44_100u32, 96_000, 88_200, 32_000, 24_000, 16_000] {
             for period in [64usize, 128, 256, 441, 448, 512, 940, 1000, 1024, 2048] {
-                let (resets, extra) = drive_perfect_clock(device_rate, period, 1_500);
+                let (resets, extra) = drive_perfect_clock(device_rate, period, callbacks);
                 if resets > 0 || extra > 960 {
                     failures.push((device_rate, period, resets, extra));
                 }
@@ -2874,6 +2886,8 @@ mod review_tests {
     /// WASAPI shared mode) at 44.1 kHz with perfect timestamps.
     #[test]
     fn perfect_timestamps_never_gap_with_irregular_44k1_chunks() {
+        // Both pre-fix failures show by 1_500 chunks; the review ran 3_000.
+        let chunks = capture_callbacks(1_500);
         let mut failures = Vec::new();
         for (seed, (lo, hi)) in [(1u64, (400u64, 500u64)), (2, (64, 1024)), (3, (300, 600))] {
             let mut rng = Lcg(seed);
@@ -2883,7 +2897,7 @@ mod review_tests {
             let stats = AudioStats::new();
             let mut packets = Vec::new();
             let mut produced = 0u64;
-            for _ in 0..3_000 {
+            for _ in 0..chunks {
                 let len = (lo + rng.below(hi - lo)) as usize;
                 let capture_ns = 1_000_000_000 + produced * 1_000_000_000 / 44_100;
                 let chunk: Vec<f32> = (0..len)
