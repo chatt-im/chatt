@@ -116,8 +116,8 @@ fn render_frame(
         for seg in viewport.line(line.message, line.line) {
             let _ = viewport.segment_text(&history, line.message, seg);
         }
-        let _ = viewport.link_at(&history, line.message, line.line, 3);
-        let _ = viewport.ref_at(&history, line.message, line.line, 3);
+        let _ = viewport.link_at(&history, line.entry, line.line, 3);
+        let _ = viewport.ref_at(&history, line.entry, line.line, 3);
     }
     lines
 }
@@ -495,7 +495,6 @@ fn inserted_message_below_notice_anchored_on_tombstone_matches_canonical() {
 /// When the shifted entry *is* cached, the click silently resolves against
 /// the wrong message (wrong URL opened / wrong reference followed).
 #[test]
-#[ignore = "BUG: link_at/ref_at by stale positional index panic or hit the wrong message — see review"]
 fn click_hit_test_with_stale_index_after_prepend_does_not_panic() {
     let mut history = TestHistory::new();
     for id in 100..130u64 {
@@ -509,7 +508,7 @@ fn click_hit_test_with_stale_index_after_prepend_does_not_panic() {
         .find(|line| line.kind == LineKind::Body)
         .expect("a body row on screen");
     let expected = viewport
-        .link_at(&history.history(), clicked.message, clicked.line, 6)
+        .link_at(&history.history(), clicked.entry, clicked.line, 6)
         .map(str::to_owned);
     assert!(expected.is_some());
 
@@ -518,7 +517,7 @@ fn click_hit_test_with_stale_index_after_prepend_does_not_panic() {
     viewport.reconcile(&history.history());
 
     let found = viewport
-        .link_at(&history.history(), clicked.message, clicked.line, 6)
+        .link_at(&history.history(), clicked.entry, clicked.line, 6)
         .map(str::to_owned);
     assert_eq!(found, expected, "click resolved against another message");
 }

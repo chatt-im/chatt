@@ -2477,23 +2477,27 @@ impl ChatViewport {
         self.entries[message].layout().line(line)
     }
 
-    /// Returns the URL at `col_in_line` on wrapped `line` of `message`, when a
+    /// Returns the URL at `col_in_line` on wrapped `line` of entry `id`, when a
     /// link segment covers that column. `col_in_line` is measured from the start
     /// of the message content, the same origin as [`Segment::col`].
+    ///
+    /// Keyed by id rather than position: a click resolves against the last
+    /// frame's rows, and a reconcile in between can shift every index.
     pub fn link_at<'a>(
         &'a self,
         history: &'a RoomHistoryRef<'a>,
-        message: usize,
+        id: HistoryEntryId,
         line: usize,
         col_in_line: u16,
     ) -> Option<&'a str> {
-        let view = self.entries.get(message)?;
-        let entry = self.resolve_record(history, self.entries.get(message)?.id)?;
+        let view = &self.entries[self.entry_index(id)?];
+        let layout = view.layout.as_deref()?;
+        let entry = self.resolve_record(history, id)?;
         let links = chatt_message_format::inline_ranges(entry.body).urls;
         if links.is_empty() {
             return None;
         }
-        let seg = view.layout().segment_at(entry.body, line, col_in_line)?;
+        let seg = layout.segment_at(entry.body, line, col_in_line)?;
         if seg.synth {
             return None;
         }
@@ -2504,24 +2508,26 @@ impl ChatViewport {
     }
 
     /// Returns the decoded message reference at `col_in_line` on wrapped `line`
-    /// of `message`, whether rendered as a pill or as a literal code.
+    /// of entry `id`, whether rendered as a pill or as a literal code. Keyed by
+    /// id for the same reason as [`Self::link_at`].
     pub fn ref_at(
         &self,
         history: &RoomHistoryRef<'_>,
-        message: usize,
+        id: HistoryEntryId,
         line: usize,
         col_in_line: u16,
     ) -> Option<rpc::msgref::MessageRef> {
-        let view = self.entries.get(message)?;
-        let entry = self.resolve_record(history, self.entries.get(message)?.id)?;
+        let view = &self.entries[self.entry_index(id)?];
+        let layout = view.layout.as_deref()?;
+        let entry = self.resolve_record(history, id)?;
         let inline = chatt_message_format::inline_ranges(entry.body);
         if inline.refs.is_empty() {
             return None;
         }
         let refs = self.build_ref_spans(history, entry.body, inline.refs);
-        let seg = view.layout().segment_at(entry.body, line, col_in_line)?;
+        let seg = layout.segment_at(entry.body, line, col_in_line)?;
         if seg.synth {
-            let index = view.layout().pill_ref_at(seg)?;
+            let index = layout.pill_ref_at(seg)?;
             return refs.get(index)?.target;
         }
         let span = refs

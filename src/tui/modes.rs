@@ -2357,9 +2357,9 @@ impl RoomMode {
                         LineKind::Heading | LineKind::Ellipsis => {
                             if let Some(history) = history_for_view(cx.session, cx.view.viewed_room)
                             {
-                                cx.view.active.chat.toggle_expand(
+                                cx.view.active.chat.toggle_expand_entry(
                                     &history,
-                                    line.message,
+                                    line.entry,
                                     self.layout.chat_width,
                                 );
                                 cx.view.active.chat.clamp_scroll(
@@ -2582,7 +2582,7 @@ impl RoomMode {
         cx.view
             .active
             .chat
-            .link_at(&history, line.message, line.line, col_in_line)
+            .link_at(&history, line.entry, line.line, col_in_line)
             .map(str::to_owned)
     }
 
@@ -2606,7 +2606,7 @@ impl RoomMode {
         cx.view
             .active
             .chat
-            .ref_at(&history, line.message, line.line, col_in_line)
+            .ref_at(&history, line.entry, line.line, col_in_line)
     }
 
     /// Jumps to a reference's target: selects and scrolls to the message when
