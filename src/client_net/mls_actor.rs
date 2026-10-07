@@ -1716,6 +1716,16 @@ impl Actor {
     fn handle_command(&mut self, command: Command) -> Result<(), String> {
         match command {
             Command::SendContent { room_id, content } => {
+                if self.installation.is_none() {
+                    // The worker rejects these while MLS is unavailable, but
+                    // one can still arrive here; that is a room problem, not
+                    // a reason to drop the whole session.
+                    let _ = self.events.send(NetworkEvent::Error(
+                        "cannot send to an encrypted room: this installation has no encrypted-room identity"
+                            .to_string(),
+                    ));
+                    return Ok(());
+                }
                 if !self.send_mls_content(room_id, content)? {
                     return Err("MLS command was routed for a public room".to_string());
                 }
@@ -3700,7 +3710,6 @@ mod tests {
     /// gated). The actor then fails the whole network session — dropping the
     /// voice call — and the message is lost.
     #[test]
-    #[ignore = "BUG: chat send to a DM/private room without an MLS installation is session-fatal (disconnects voice, drops the message) — see review"]
     fn review_send_without_installation_is_not_session_fatal() {
         let (mut actor, outputs, _poll) = test_actor(test_config(None));
         actor.generation = 1;

@@ -3855,6 +3855,9 @@ impl WorkerState<'_> {
                     body_size = body.len()
                 );
                 if self.room_requires_mls(room_id) {
+                    if self.reject_without_mls_identity("send message") {
+                        return Ok(());
+                    }
                     self.queue_mls_input(mls_actor::Input::Command(
                         mls_actor::Command::SendContent {
                             room_id,
@@ -3877,6 +3880,9 @@ impl WorkerState<'_> {
                     body_size = body.len()
                 );
                 if self.room_requires_mls(room_id) {
+                    if self.reject_without_mls_identity("edit message") {
+                        return Ok(());
+                    }
                     self.queue_mls_input(mls_actor::Input::Command(
                         mls_actor::Command::SendContent {
                             room_id,
@@ -3898,6 +3904,9 @@ impl WorkerState<'_> {
                     target = target.0
                 );
                 if self.room_requires_mls(room_id) {
+                    if self.reject_without_mls_identity("delete message") {
+                        return Ok(());
+                    }
                     self.queue_mls_input(mls_actor::Input::Command(
                         mls_actor::Command::SendContent {
                             room_id,
@@ -4345,6 +4354,19 @@ impl WorkerState<'_> {
             image_prefix: Vec::new(),
             seal,
         })
+    }
+
+    /// Encrypted rooms stay listed when this installation has no MLS
+    /// identity. Reject their chat commands here with a user-facing error
+    /// instead of routing them to the actor, which cannot encrypt them.
+    fn reject_without_mls_identity(&self, action: &str) -> bool {
+        if self.mls_available {
+            return false;
+        }
+        let _ = self.events.send(NetworkEvent::Error(format!(
+            "cannot {action}: this installation has no encrypted-room identity"
+        )));
+        true
     }
 
     /// Builds MLS file sealing state. Persistence and submission happen only
