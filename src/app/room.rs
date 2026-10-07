@@ -4438,7 +4438,8 @@ impl RoomSession {
         if voice_room == Some(room_id) {
             self.stream_users.insert(stream_id, user_id);
         }
-        if voice_room == Some(room_id) {
+        // Out of a call, the roster is the viewed room's lobby.
+        if voice_room.or(self.viewed_room) == Some(room_id) {
             if let Some(mut user) = self.users.get(&user_id).cloned() {
                 user.online = true;
                 self.participants.upsert(RosterSeed {
@@ -8557,7 +8558,6 @@ mod tests {
     /// the cached `participants` for it. A remote user joining that room's
     /// call must show up there, exactly as a fresh rebuild would show it.
     #[test]
-    #[ignore = "BUG: remote VoiceStarted in the viewed room is not reflected in the lobby roster while the local user is not in a call — see review"]
     fn review_viewed_room_roster_tracks_remote_voice_join_when_not_in_call() {
         let mut room = test_room();
         enter(
