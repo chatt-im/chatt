@@ -179,6 +179,8 @@ fn toml_quote(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // TOML basic strings reject raw control characters.
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04X}", ch as u32)),
             _ => out.push(ch),
         }
     }
@@ -282,7 +284,6 @@ mod review_tests {
     /// Room names are server-supplied. A single control character other than
     /// \n \r \t must not make the whole catalog unloadable.
     #[test]
-    #[ignore = "BUG: control char in a room name makes rooms.toml unparseable, wiping the whole catalog (read watermarks, last viewed/voice) — see review"]
     fn catalog_round_trips_control_characters_in_names() {
         let dir = room_history::server_dir("catalog-review-control-char");
         let catalog = RoomCatalog {
