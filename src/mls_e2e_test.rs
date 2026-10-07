@@ -2645,7 +2645,6 @@ mod client_net_review {
     /// (`voice_left`), so such a user is periodically disconnected by other
     /// people's call activity.
     #[test]
-    #[ignore = "BUG: client that has not joined voice is disconnected after 256 voice controls — see review"]
     fn review_client_outside_voice_survives_room_voice_churn() {
         let _guard = live_mls_e2e_guard();
         let root = temp_dir("review-voice-mailbox");

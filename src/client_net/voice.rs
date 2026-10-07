@@ -918,6 +918,25 @@ pub(super) enum VoiceCommand {
 }
 
 impl VoiceCommand {
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::StartSession { .. } => "start_session",
+            Self::Authenticated { .. } => "authenticated",
+            Self::VoiceStarted { .. } => "voice_started",
+            Self::VoiceStopped { .. } => "voice_stopped",
+            Self::RoomRttSnapshot { .. } => "room_rtt_snapshot",
+            Self::UserOffline { .. } => "user_offline",
+            Self::UdpBound { .. } => "udp_bound",
+            Self::UdpReflexive { .. } => "udp_reflexive",
+            Self::NatProbeObserved { .. } => "nat_probe_observed",
+            Self::InstallPeer { .. } => "install_peer",
+            Self::RemovePeer { .. } => "remove_peer",
+            Self::SetP2pEnabled { .. } => "set_p2p_enabled",
+            Self::EndSession { .. } => "end_session",
+            Self::Shutdown => "shutdown",
+        }
+    }
+
     fn generation(&self) -> Option<u64> {
         match self {
             Self::StartSession { generation, .. }
@@ -1063,13 +1082,45 @@ impl VoiceCommandSubmission {
                 mailbox.feedback.clear();
                 true
             }
-            _ if mailbox.controls.len() >= MAX_QUEUED_CONTROL_COMMANDS => return Err(command),
             _ if command.generation().is_some()
                 && command.generation() != mailbox.ingress_generation =>
             {
                 enqueue = false;
                 false
             }
+            // Until `activate`, the queued `StartSession` blocks the queue, so
+            // room-wide traffic would pile up behind it. The fresh session it
+            // starts has no call room, streams, or peers, so these are no-ops
+            // there: joining replays the call's members.
+            VoiceCommand::VoiceStarted { local: false, .. }
+            | VoiceCommand::VoiceStopped { local: false, .. }
+            | VoiceCommand::RoomRttSnapshot { .. }
+                if mailbox.activated_generation.is_none() =>
+            {
+                enqueue = false;
+                false
+            }
+            VoiceCommand::UserOffline { .. }
+                if mailbox.activated_generation.is_none()
+                    && !mailbox
+                        .controls
+                        .iter()
+                        .any(|queued| matches!(queued, VoiceCommand::InstallPeer { .. })) =>
+            {
+                enqueue = false;
+                false
+            }
+            // Only the latest value matters to the session these configure.
+            VoiceCommand::UdpReflexive { .. } | VoiceCommand::SetP2pEnabled { .. }
+                if mailbox.activated_generation.is_none() =>
+            {
+                let kind = std::mem::discriminant(&command);
+                mailbox
+                    .controls
+                    .retain(|queued| std::mem::discriminant(queued) != kind);
+                false
+            }
+            _ if mailbox.controls.len() >= MAX_QUEUED_CONTROL_COMMANDS => return Err(command),
             _ => mailbox.activated_generation.is_some(),
         };
         if enqueue {
@@ -4928,7 +4979,6 @@ mod tests {
     /// unrunnable `StartSession`. The 257th is rejected, which the worker turns
     /// into a session teardown.
     #[test]
-    #[ignore = "BUG: inactive voice mailbox overflows on ordinary room traffic and kills the session — see review"]
     fn review_inactive_voice_mailbox_does_not_reject_room_traffic() {
         let (_poll, submission) = submission();
         assert!(submission.submit(start_command(1)).is_ok());
@@ -4946,6 +4996,36 @@ mod tests {
                 "control {index} rejected before the session was ever activated"
             );
         }
+    }
+
+    #[test]
+    fn inactive_voice_mailbox_keeps_only_latest_session_configuration() {
+        let (_poll, submission) = submission();
+        assert!(submission.submit(start_command(1)).is_ok());
+        for port in [4000, 4001] {
+            assert!(
+                submission
+                    .submit(VoiceCommand::UdpReflexive {
+                        generation: 1,
+                        addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                    })
+                    .is_ok()
+            );
+        }
+        assert!(
+            submission
+                .submit(VoiceCommand::UserOffline {
+                    generation: 1,
+                    user_id: UserId(7),
+                })
+                .is_ok()
+        );
+        let mailbox = submission.mailbox.lock().unwrap();
+        assert_eq!(mailbox.controls.len(), 2);
+        assert!(matches!(
+            mailbox.controls.back(),
+            Some(VoiceCommand::UdpReflexive { addr, .. }) if addr.port() == 4001
+        ));
     }
 
     #[test]

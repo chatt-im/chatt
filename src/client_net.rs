@@ -3471,10 +3471,17 @@ impl IncomingFile {
 }
 
 impl WorkerState<'_> {
-    fn queue_voice_command(&self, command: voice::VoiceCommand) -> Result<(), String> {
-        self.voice
-            .submit(command)
-            .map_err(|_| "client voice command mailbox is full or stopped".to_string())
+    /// Forwards a control to the voice worker. A full or stopped mailbox
+    /// drops it rather than ending the network session: a stopped voice
+    /// worker is reported through its own outputs, and losing voice state
+    /// must not take chat down with it.
+    fn queue_voice_command(&self, command: voice::VoiceCommand) {
+        if let Err(command) = self.voice.submit(command) {
+            kvlog::warn!(
+                "client voice command dropped: mailbox full or stopped",
+                kind = command.kind()
+            );
+        }
     }
 
     fn queue_mls_input(&mut self, input: mls_actor::Input) -> Result<(), String> {
@@ -4183,7 +4190,7 @@ impl WorkerState<'_> {
                 self.queue_voice_command(voice::VoiceCommand::SetP2pEnabled {
                     generation: self.voice_generation,
                     enabled,
-                })?;
+                });
             }
             NetworkCommand::LocalVoicePacket(_)
             | NetworkCommand::SequencedLocalVoicePacket { .. }
@@ -5902,7 +5909,7 @@ impl WorkerState<'_> {
                     user_id,
                     stream_id,
                     local,
-                })?;
+                });
                 if local {
                     self.voice_room = Some(room_id);
                 }
@@ -5934,7 +5941,7 @@ impl WorkerState<'_> {
                     user_id,
                     stream_id,
                     local,
-                })?;
+                });
                 if local && self.voice_room == Some(room_id) {
                     self.voice_room = None;
                 }
@@ -5976,7 +5983,7 @@ impl WorkerState<'_> {
                     generation: self.voice_generation,
                     room_id,
                     members,
-                })?;
+                });
             }
             ServerControl::UdpBound => {
                 let _ = self
@@ -5984,7 +5991,7 @@ impl WorkerState<'_> {
                     .send(NetworkEvent::Status("udp media bound".to_string()));
                 self.queue_voice_command(voice::VoiceCommand::UdpBound {
                     generation: self.voice_generation,
-                })?;
+                });
             }
             ServerControl::UdpReflexive { addr } => match addr.parse::<SocketAddr>() {
                 Ok(addr) => {
@@ -5992,7 +5999,7 @@ impl WorkerState<'_> {
                     self.queue_voice_command(voice::VoiceCommand::UdpReflexive {
                         generation: self.voice_generation,
                         addr,
-                    })?;
+                    });
                 }
                 Err(error) => {
                     kvlog::warn!("invalid udp reflexive address", addr = addr.as_str(), error = %error);
@@ -6009,7 +6016,7 @@ impl WorkerState<'_> {
                         generation: self.voice_generation,
                         probe_id,
                         addr,
-                    })?;
+                    });
                 }
                 Err(error) => {
                     kvlog::warn!(
@@ -6024,7 +6031,7 @@ impl WorkerState<'_> {
                 self.queue_voice_command(voice::VoiceCommand::InstallPeer {
                     generation: self.voice_generation,
                     peer,
-                })?;
+                });
             }
             ServerControl::P2pPeerGone {
                 session_id,
@@ -6034,7 +6041,7 @@ impl WorkerState<'_> {
                     generation: self.voice_generation,
                     session_id,
                     user_id,
-                })?;
+                });
                 kvlog::info!(
                     "p2p peer removed",
                     session_id = session_id.0,
@@ -6187,7 +6194,7 @@ impl WorkerState<'_> {
                     self.queue_voice_command(voice::VoiceCommand::UserOffline {
                         generation: self.voice_generation,
                         user_id: user.user_id,
-                    })?;
+                    });
                 }
                 self.user_names.insert(user.user_id, user.username.clone());
                 self.queue_mls_input(mls_actor::Input::Presence {
@@ -6261,7 +6268,7 @@ impl WorkerState<'_> {
         self.queue_voice_command(voice::VoiceCommand::Authenticated {
             generation: self.voice_generation,
             session_id,
-        })?;
+        });
         let _ = self.events.send(NetworkEvent::Authenticated {
             session_id,
             user_id,
