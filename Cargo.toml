@@ -19,7 +19,7 @@ chatt-platform.path = "crates/platform"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 opus-codec = { path = "crates/opus-codec", features = ["dred"] }
-aws-lc-rs = { version = "1.18.0", default-features = false, features = [
+aws-lc-rs = { version = "1.18.1", default-features = false, features = [
     "alloc",
     "non-fips",
 ] }

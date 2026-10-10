@@ -17,7 +17,7 @@ chatt-message-format = { path = "../message-format", default-features = false }
 chatt-platform = { path = "../platform" }
 jsony = "0.1.10"
 mio = { version = "1.2.1", features = ["os-poll"] }
-aws-lc-rs = { version = "1.18.0", default-features = false, features = ["alloc", "non-fips"] }
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["alloc", "non-fips"] }
 unicode-width = { version = "0.2", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
