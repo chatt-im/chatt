@@ -5428,6 +5428,16 @@ mod tests {
         }
     }
 
+    fn drive_lane_closed(session: &mut VoiceSession) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while let Some(lane) = session.tcp_lane.as_mut() {
+            assert!(Instant::now() < deadline, "lane failed to close");
+            lane.readiness.mark_ready();
+            session.read_tcp_lane();
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn force_tcp_lane_skips_udp_and_authenticates_with_magic_then_bind() {
         let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
@@ -5529,11 +5539,8 @@ mod tests {
         let (server_end, _) = listener.accept().unwrap();
         drive_lane_active(&mut session);
         drop(server_end);
+        drive_lane_closed(&mut session);
 
-        session.tcp_lane.as_mut().unwrap().readiness.mark_ready();
-        session.read_tcp_lane();
-
-        assert!(session.tcp_lane.is_none());
         assert_eq!(session.tcp_backoff, TCP_LANE_BACKOFF_MIN * 8);
         assert!(!event_rx.try_iter().any(|event| matches!(
             event,
@@ -5848,15 +5855,7 @@ mod tests {
         )));
 
         drop(server_end);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while session.tcp_lane.is_some() {
-            assert!(Instant::now() < deadline, "drained lane failed to close");
-            if let Some(lane) = session.tcp_lane.as_mut() {
-                lane.readiness.mark_ready();
-            }
-            session.read_tcp_lane();
-            thread::sleep(Duration::from_millis(1));
-        }
+        drive_lane_closed(&mut session);
     }
 
     #[test]
@@ -5890,9 +5889,7 @@ mod tests {
         )));
 
         drop(server_end);
-        session.tcp_lane.as_mut().unwrap().readiness.mark_ready();
-        session.read_tcp_lane();
-        assert!(session.tcp_lane.is_none());
+        drive_lane_closed(&mut session);
         assert!(event_rx.try_iter().any(|event| matches!(
             event,
             crate::app::AppEvent::NetworkFor {

@@ -1750,12 +1750,14 @@ mod tests {
             "the hole never exercised DRED recovery"
         );
         // The DRED-to-real-decode boundary carries an inherent deep-PLC blend
-        // residual of ~0.0066 even under libopus's own `opus_demo` consumption
-        // pattern; the regressions this guards against (a 10 ms final DRED
-        // call, or a gap-starved feature parse) measure 0.019+. 0.009 separates
-        // the two with margin on both sides.
+        // residual inside libopus's own decode output: ~0.001 on x86-64 but
+        // ~0.010 on aarch64, where clang's FMA contraction and the platform
+        // libm steer the DNN differently while NetEQ's decisions stay
+        // identical. The regressions this guards against (a 10 ms final DRED
+        // call, or a gap-starved feature parse) measure 0.019+. 0.0135
+        // separates the two with margin on both sides.
         assert!(
-            residual < 0.009,
+            residual < 0.0135,
             "recovery splice injected a discontinuity: residual {residual:.5} \
              vs control {control_residual:.5} at block {peak_block} ({})",
             blocks[peak_block.saturating_sub(2)..(peak_block + 3).min(blocks.len())]
@@ -2814,12 +2816,14 @@ mod tests {
         // The shipped sender (30 ms preroll) flags max(preroll + 2, 10) = 10
         // packets. A 400 ms stall at the onset bunches all ten ahead of the
         // first decision: only the ~50 ms the preroll explains may be held,
-        // the stall is accelerated away as without a hold.
+        // the stall is accelerated away as without a hold. The settled check
+        // sits past the end of the catch-up, whose exact timing shifts with
+        // platform float rounding.
         let flagged = |k: u32| k < 10;
         let held = resume_latency_trace(true, 400, 10, flagged);
         let plain = resume_latency_trace(false, 400, 10, flagged);
         assert!(latency_at(&held, 2000) <= latency_at(&plain, 2000) + 50);
-        assert!(latency_at(&held, 4000) <= latency_at(&plain, 4000) + 20);
+        assert!(latency_at(&held, 5000) <= latency_at(&plain, 5000) + 20);
     }
 
     #[test]

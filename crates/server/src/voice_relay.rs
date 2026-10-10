@@ -2618,9 +2618,6 @@ mod tests {
         );
 
         let recipient_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
-        recipient_socket
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
         let mut recipient_bind =
             media::seal_media(&recipient_codec, 1, &MediaPayload::Bind).unwrap();
         direct
@@ -2645,10 +2642,17 @@ mod tests {
         let sealed_voice = media::seal_media(&sender_codec, 2, &voice).unwrap();
         send_frame(&mut client, &bind);
         send_frame(&mut client, &sealed_voice);
-        pump_lane(&mut direct, slot, lane_bound(slot));
-
+        recipient_socket.set_nonblocking(true).unwrap();
         let mut datagram = [0; 2048];
-        let (len, _) = recipient_socket.recv_from(&mut datagram).unwrap();
+        let mut len = 0;
+        pump_lane(&mut direct, slot, |_| {
+            let Ok((received, _)) = recipient_socket.recv_from(&mut datagram) else {
+                return false;
+            };
+            len = received;
+            true
+        });
+
         let mut replay = AntiReplay::new();
         let opened = media::open_media(&recipient_codec, &mut replay, &datagram[..len]).unwrap();
         assert_eq!(opened.payload, voice);

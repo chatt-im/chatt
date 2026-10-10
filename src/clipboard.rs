@@ -480,10 +480,10 @@ mod tests {
     fn failed_helper_falls_through_to_next_command() {
         static COMMANDS: &[ClipboardCommand] = &[
             ClipboardCommand {
-                program: "/bin/false",
+                program: "/bin/sh",
                 display: Display::Any,
-                clipboard_args: &[],
-                primary_args: Some(&[]),
+                clipboard_args: &["-c", "exit 1"],
+                primary_args: Some(&["-c", "exit 1"]),
             },
             ClipboardCommand {
                 program: "/bin/sleep",
@@ -494,7 +494,7 @@ mod tests {
         ];
 
         let startup = start_clipboard_owner(attempt(COMMANDS, "copied text"));
-        let Startup::Running(owner) = poll_past(startup, "/bin/false") else {
+        let Startup::Running(owner) = poll_past(startup, "/bin/sh") else {
             panic!("fallback helper should remain as the selection owner");
         };
         assert_eq!(owner.program, "/bin/sleep");
@@ -505,14 +505,14 @@ mod tests {
     #[test]
     fn failing_helper_is_reported_to_the_user() {
         static COMMANDS: &[ClipboardCommand] = &[ClipboardCommand {
-            program: "/bin/false",
+            program: "/bin/sh",
             display: Display::Any,
-            clipboard_args: &[],
-            primary_args: Some(&[]),
+            clipboard_args: &["-c", "exit 1"],
+            primary_args: Some(&["-c", "exit 1"]),
         }];
 
         let startup = start_clipboard_owner(attempt(COMMANDS, "copied text"));
-        let startup = poll_past(startup, "/bin/false");
+        let startup = poll_past(startup, "/bin/sh");
         assert!(matches!(startup, Startup::Failed(Failed::HelperFailed)));
         let mut clipboard = Clipboard::new();
         let failure = clipboard.settle(ClipboardSelection::Clipboard, startup);
